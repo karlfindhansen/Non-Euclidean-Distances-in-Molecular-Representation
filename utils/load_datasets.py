@@ -6,10 +6,18 @@ from collections import Counter
 from tqdm import tqdm
 from fairchem.core.datasets import AseDBDataset
 import h5py
+import socket
 
 class OMol25:
     def __init__(self, base_path="data/OMol25/", split="neutral_val"):
-        self.base_path = base_path
+
+        hostname = socket.gethostname() # Will be applicable once we have data on Niflheim
+        is_niflheim = "fysik.dtu.dk" in hostname or any(x in hostname for x in ["surt", "sylg", "slid", "svol"])
+        if is_niflheim:
+            self.base_path = base_path
+        else:
+            self.base_path = base_path
+
         self.split = split
         self.tar_path = os.path.join(self.base_path, f"{self.split}.tar")
         self.output_path = os.path.join(self.base_path, "output", self.split)
@@ -97,11 +105,23 @@ class OMol25:
 
 class MaterialsProject:
     def __init__(self, base_path="data/Materials Project/", file_name="data.hdf5"):
-        self.base_path = base_path
+
+        hostname = socket.gethostname() # Will be applicable once we have data on Niflheim
+        is_niflheim = "fysik.dtu.dk" in hostname or any(x in hostname for x in ["surt", "sylg", "slid", "svol"])
+        if is_niflheim:
+            self.base_path = base_path
+        else:
+            self.base_path = base_path
+
         self.file_path = os.path.join(self.base_path, file_name)
         self.df = pd.DataFrame()
 
     def load_data(self):
+
+        if "data.hdf5" not in os.listdir(self.base_path):
+            with tarfile.open(self.base_path+"materials-project.tar", "r") as tar:
+                tar.extractall(path=self.base_path)
+
         if not os.path.exists(self.file_path):
             logger.error(f"File not found: {self.file_path}")
             raise FileNotFoundError(f"Could not find HDF5 file at {self.file_path}")
