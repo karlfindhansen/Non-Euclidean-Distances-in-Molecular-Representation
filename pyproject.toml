@@ -1,0 +1,15 @@
+[project]
+name = "anomaly-detection-in-molecular-and-materials-datasets"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ase>=3.27.0",
+    "ase-db-backends>=0.11.0",
+    "fairchem-core>=2.7.1",
+    "ipykernel>=7.1.0",
+    "lmdb>=1.7.5",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.2",
+]
