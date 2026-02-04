@@ -8,6 +8,7 @@ from fairchem.core.datasets import AseDBDataset
 import h5py
 import glob
 import socket
+from mp_api.client import MPRester
 
 class OMol25Loader:
     def __init__(self, base_path="data/OMol25/", split="neutral_val"):
@@ -105,80 +106,72 @@ class OMol25Loader:
 
 
 class MaterialsProjectLoader:
-    def __init__(self, base_path="data/Materials Project/", file_name="data.hdf5"):
-
-        hostname = socket.gethostname() # Will be applicable once we have data on Niflheim
-        is_niflheim = "fysik.dtu.dk" in hostname or any(x in hostname for x in ["surt", "sylg", "slid", "svol"])
-        if is_niflheim:
-            self.base_path = base_path
-        else:
-            self.base_path = base_path
-
-        self.file_path = os.path.join(self.base_path, file_name)
+    def __init__(self, base_path="data/Materials Project/", file_name="comprehensive_mp_dataset.csv", api_key="XbTAm6OndiM15hj8OErnTmKHxHopX0AE"):
+        """
+        Initializes the Materials Project Loader.
+        :param base_path: Directory to store/load the CSV.
+        :param file_name: The name of the CSV file.
+        :param api_key: Your Materials Project API Key.
+        """
+        self.api_key = api_key
+        self.base_path = base_path
+        self.file_name = file_name
+        self.file_path = os.path.join(self.base_path, self.file_name)
         self.df = pd.DataFrame()
 
-    def load_data(self):
+        hostname = socket.gethostname()
+        self.is_niflheim = "fysik.dtu.dk" in hostname or any(x in hostname for x in ["surt", "sylg", "slid", "svol"])
+        
+        if not os.path.exists(self.base_path):
+            os.makedirs(self.base_path, exist_ok=True)
 
-        if "data.hdf5" not in os.listdir(self.base_path):
-            with tarfile.open(self.base_path+"materials-project.tar", "r") as tar:
-                tar.extractall(path=self.base_path)
+    def load_data(self, force_fetch=False):
+        """
+        Loads data from CSV if it exists, otherwise fetches from MPRester.
+        :param force_fetch: If True, ignores the CSV and fetches fresh data from the API.
+        """
+        if os.path.exists(self.file_path) and not force_fetch:
+            logger.info(f"Found existing dataset at {self.file_path}. Loading...")
+            self.df = pd.read_csv(self.file_path)
+        else:
+            if force_fetch:
+                logger.info("Force fetch requested. Connecting to Materials Project API...")
+            else:
+                logger.info(f"Dataset not found at {self.file_path}. Fetching from API...")
 
-        if not os.path.exists(self.file_path):
-            logger.error(f"File not found: {self.file_path}")
-            raise FileNotFoundError(f"Could not find HDF5 file at {self.file_path}")
+            try:
+                with MPRester(self.api_key) as mpr:
+                    # Get all available fields for comprehensiveness
+                    comprehensive_fields = mpr.materials.summary.available_fields
+                    
+                    # Search for all materials
+                    results = mpr.materials.summary.search(fields=comprehensive_fields)
+                    
+                    # Convert DataDoc objects to dictionaries
+                    data_list = [doc.dict() for doc in results]
+                    
+                    self.df = pd.DataFrame(data_list)
+                    
+                    # Save to CSV for the "second time" call
+                    self.df.to_csv(self.file_path, index=False)
+                    logger.info(f"Dataset saved to {self.file_path}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to fetch data from Materials Project: {e}")
+                raise
 
-        try:
-            with h5py.File(self.file_path, "r") as f:
-                keys = list(f.keys())
-                if not keys:
-                    return pd.DataFrame()
-
-                main_group_key = keys[0]
-                group_obj = f[main_group_key]
-
-                if not isinstance(group_obj, h5py.Group):
-                    return pd.DataFrame({main_group_key: group_obj[()]})
-
-                # 1. First pass: identify the most common array length
-                lengths = []
-                for member_name in group_obj.keys():
-                    ds = group_obj[member_name]
-                    if ds.ndim == 1:
-                        lengths.append(len(ds))
-                
-                if not lengths:
-                    logger.warning("No 1D datasets found.")
-                    return pd.DataFrame()
-
-                # Find the most frequent length (the number of materials)
-                primary_length = max(set(lengths), key=lengths.count)
-                logger.info(f"Detected primary dataset length: {primary_length}")
-
-                # 2. Second pass: only load datasets matching that length
-                data_dict = {}
-                for member_name in group_obj.keys():
-                    ds = group_obj[member_name]
-                    if ds.ndim == 1 and len(ds) == primary_length:
-                        data_dict[member_name] = ds[()]
-                    else:
-                        logger.debug(f"Skipping {member_name}: Length {len(ds)} != {primary_length}")
-
-                self.df = pd.DataFrame(data_dict)
-                logger.info(f"Successfully loaded {len(self.df.columns)} columns.")
-                
-            return self.df
-
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            raise
+        logger.info(f"Successfully loaded {len(self.df)} entries with {len(self.df.columns)} properties.")
+        return self.df
 
     def get_summary(self):
         if self.df.empty:
-            print("No data loaded.")
+            logger.warning("No data loaded. Call load_data() first.")
             return
-        print(f"\n--- Loaded {len(self.df)} Materials ---")
+        print(f"\n--- Materials Project Dataset Summary ---")
+        print(f"Total Materials: {len(self.df)}")
+        print(f"Total Properties: {len(self.df.columns)}")
         print(self.df.info())
-
+        
 class OMat24Loader:
     def __init__(self, base_path="data/OMat24/", split="train"):
         """
