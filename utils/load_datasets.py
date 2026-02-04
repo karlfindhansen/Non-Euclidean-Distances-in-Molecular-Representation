@@ -55,7 +55,7 @@ class OMol25Loader:
         if self.dataset is None:
             self._prepare_data()
 
-        total_to_process = sample_size if sample_size else len(self.dataset)
+        total_to_process = sample_size if sample_size and sample_size < len(self.dataset) else len(self.dataset)
         logger.info(f"Beginning data processing for {total_to_process} entries.")
         
         data_list = []
@@ -245,7 +245,7 @@ class OMat24Loader:
         if self.dataset is None:
             self._prepare_data()
 
-        total_to_process = sample_size if sample_size else len(self.dataset)
+        total_to_process = sample_size if sample_size and sample_size < len(self.dataset) else len(self.dataset)
         logger.info(f"Beginning data processing for {total_to_process} entries.")
         
         data_list = []
