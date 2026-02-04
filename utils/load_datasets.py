@@ -21,7 +21,7 @@ class OMol25Loader:
 
         self.split = split
         self.tar_path = os.path.join(self.base_path, f"{self.split}.tar")
-        self.output_path = os.path.join(self.base_path, "output", self.split)
+        self.output_path = os.path.join(self.base_path, self.split)
         self.dataset = None
 
     def _prepare_data(self):
@@ -180,7 +180,7 @@ class MaterialsProjectLoader:
         print(self.df.info())
 
 class OMat24Loader:
-    def __init__(self, base_path="../data/OMat24/", split="train"):
+    def __init__(self, base_path="data/OMat24/", split="train"):
         """
         Initializes the OMat24 Data Loader.
         :param base_path: Root directory containing the OMat24 tar file.
@@ -196,11 +196,7 @@ class OMat24Loader:
         else:
             self.base_path = base_path
 
-        #self.base_path = base_path
         self.split = split
-        # specific OMat24 filename from your script
-        #self.tar_path = os.path.join(self.base_path, "omat24_1M_251210.tar")
-        #self.output_root = os.path.join(self.base_path, "output")
         self.split_dir = os.path.join(self.base_path, self.split)
         
         self.sub_folders = [
@@ -219,7 +215,10 @@ class OMat24Loader:
         
         dataset_paths = []
         for sub in self.sub_folders:
-            target_dir = os.path.join(self.split_dir, sub, sub)
+            if self.is_niflheim:
+                target_dir = os.path.join(self.split_dir, sub, sub)
+            else:
+                target_dir = os.path.join(self.split_dir, sub)
             found_files = glob.glob(os.path.join(target_dir, "*.aselmdb"))
             
             if found_files:
