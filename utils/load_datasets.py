@@ -6,9 +6,10 @@ from collections import Counter
 from tqdm import tqdm
 from fairchem.core.datasets import AseDBDataset
 import h5py
+import glob
 import socket
 
-class OMol25:
+class OMol25Loader:
     def __init__(self, base_path="data/OMol25/", split="neutral_val"):
 
         hostname = socket.gethostname() # Will be applicable once we have data on Niflheim
@@ -103,7 +104,7 @@ class OMol25:
         return df, symbol_counts
 
 
-class MaterialsProject:
+class MaterialsProjectLoader:
     def __init__(self, base_path="data/Materials Project/", file_name="data.hdf5"):
 
         hostname = socket.gethostname() # Will be applicable once we have data on Niflheim
@@ -177,3 +178,109 @@ class MaterialsProject:
             return
         print(f"\n--- Loaded {len(self.df)} Materials ---")
         print(self.df.info())
+
+class OMat24Loader:
+    def __init__(self, base_path="../data/OMat24/", split="train"):
+        """
+        Initializes the OMat24 Data Loader.
+        :param base_path: Root directory containing the OMat24 tar file.
+        :param split: The dataset split to load ('train', 'val', or 'test'). (NIFLHEIM does not have test)
+        """
+
+        hostname = socket.gethostname() # Will be applicable once we have data on Niflheim
+        self.is_niflheim = "fysik.dtu.dk" in hostname or any(x in hostname for x in ["surt", "sylg", "slid", "svol"])
+        if self.is_niflheim:
+            self.base_path = "/home/scratch3/chipa/localDB/omat/OMat24_all/"
+            if split == "test":
+                logger.error("Niflheim does not have a test dataset!")
+        else:
+            self.base_path = base_path
+
+        #self.base_path = base_path
+        self.split = split
+        # specific OMat24 filename from your script
+        #self.tar_path = os.path.join(self.base_path, "omat24_1M_251210.tar")
+        #self.output_root = os.path.join(self.base_path, "output")
+        self.split_dir = os.path.join(self.base_path, self.split)
+        
+        self.sub_folders = [
+            "aimd-from-PBE-1000-npt", "aimd-from-PBE-1000-nvt",
+            "aimd-from-PBE-3000-npt", "aimd-from-PBE-3000-nvt",
+            "rattled-300-subsampled", "rattled-300",
+            "rattled-500-subsampled", "rattled-500",
+            "rattled-1000-subsampled", "rattled-1000",
+            "rattled-relax"
+        ]
+        self.dataset = None
+
+    def _prepare_data(self):
+        """Checks if data is extracted and initializes dataset."""
+        # (Extraction logic for local runs omitted for brevity)
+        
+        dataset_paths = []
+        for sub in self.sub_folders:
+            target_dir = os.path.join(self.split_dir, sub, sub)
+            found_files = glob.glob(os.path.join(target_dir, "*.aselmdb"))
+            
+            if found_files:
+                dataset_paths.extend(found_files)
+            else:
+                logger.warning(f"No .aselmdb files found in: {target_dir}")
+
+        try:
+            if not dataset_paths:
+                raise FileNotFoundError(f"No .aselmdb files found for split: {self.split}")
+                
+            # Fairchem's AseDBDataset handles a list of multiple file paths automatically
+            self.dataset = AseDBDataset(config={"src": dataset_paths})
+            logger.info(f"Loaded {len(dataset_paths)} files for split {self.split}")
+        except Exception as e:
+            logger.error(f"Error initializing AseDBDataset: {e}")
+            raise
+
+    def get_omat24(self, sample_size=None):
+        """
+        Processes the OMat24 dataset and returns a Pandas DataFrame and a Symbol Counter.
+        :param sample_size: Integer. If provided, only processes the first N entries.
+        """
+        if self.dataset is None:
+            self._prepare_data()
+
+        total_to_process = sample_size if sample_size else len(self.dataset)
+        logger.info(f"Beginning data processing for {total_to_process} entries.")
+        
+        data_list = []
+        symbol_counts = Counter()
+
+        for i in tqdm(range(total_to_process), desc=f"Extracting OMat24 {self.split} Properties"):
+            try:
+                atoms = self.dataset.get_atoms(i)
+                info = atoms.info
+                
+                # Update symbol counts
+                symbols = atoms.get_chemical_symbols()
+                symbol_counts.update(symbols)
+                
+                # Extracting specific OMat24 metadata from your script
+                entry = {
+                    "index": i,
+                    "atomic_numbers": atoms.get_atomic_numbers().tolist(),
+                    "symbols": symbols,
+                    "num_atoms": len(atoms),
+                    "calc_id": info.get("calc_id"),
+                    "task_type": info.get("task_type"),
+                    "prototype_label": info.get("prototype_label"),
+                    "energy_corrected_mp2020": info.get("energy_corrected_mp2020"),
+                }
+                
+                data_list.append(entry)
+            except Exception as e:
+                logger.warning(f"Error processing entry at index {i}: {e}")
+
+        logger.info("Data extraction finished. Creating DataFrame.")
+        df = pd.DataFrame(data_list)
+        
+        logger.info(f"DataFrame created with {len(df)} rows.")
+        logger.info(f"Detected elements: {list(symbol_counts.keys())}")
+        
+        return df, symbol_counts
