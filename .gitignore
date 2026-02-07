@@ -1,2 +1,4 @@
 /data*
+config/api_key.json
+/.venv*
 __pycache__/
