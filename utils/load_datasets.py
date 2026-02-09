@@ -11,8 +11,9 @@ from mp_api.client import MPRester
 from loguru import logger
 from ase import Atoms
 from ase.io import write, read
-
-
+import selfies as sf
+import torch
+from transformers import AutoTokenizer, AutoModel
 class DataLoaderBase:
     """Base class for data loaders with common utility methods."""
     
@@ -302,105 +303,169 @@ class QM9Loader(DataLoaderBase):
             logger.error(f"Failed to read stress test file: {e}")
             return []
 
-    def _generate_morgan_fingerprints(
-        self, 
-        radius: int = 3, 
-        fp_size: int = 2048, 
-        fp_filename: str = "morgan_fingerprints.parquet"
-    ) -> None:
+    def get_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> pl.DataFrame:
         """
-        Generates Morgan Fingerprints and saves them to a file.
+        Computes Morgan Fingerprints for the loaded QM9 dataset.
+        Generated on the fly every time (no caching).
         
         Args:
             radius: The radius of the fingerprint.
             fp_size: The bit-vector length.
-            fp_filename: Name of the file to save fingerprints to.
+            
+        Returns:
+            Polars DataFrame with an additional 'morgan_fingerprint' column.
         """
-        fp_path = os.path.join(self.root, fp_filename)
-        
         if self.df.is_empty():
             logger.warning("DataFrame is empty. Loading data first...")
             self.load_data()
 
-        # Initialize the modern Morgan Generator
-        # Note: Using AllChem.GetMorganGenerator as per RDKit modern API
-        try:
-            morgan_gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
-        except AttributeError:
-             # Fallback if specific RDKit version differs, but sticking to your provided syntax
-             morgan_gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
+        logger.info(f"Computing Morgan Fingerprints (Radius={radius}, Size={fp_size})...")
+
+        morgan_gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
 
         def _smiles_to_fp(smiles: str):
             if not smiles:
                 return None
             mol = Chem.MolFromSmiles(smiles)
             if mol:
-                # Returns a list of bits (0s and 1s)
                 return list(morgan_gen.GetFingerprint(mol))
             return None
 
-        logger.info(f"Computing Morgan Fingerprints (Radius={radius}, Size={fp_size})...")
-
-        # Compute fingerprints and select only necessary columns for the cache file
-        # We join on 'mol_id' later, so we must preserve it.
-        fp_df = self.df.select(["mol_id", "canonical_smiles"]).with_columns(
+        self.df = self.df.with_columns(
             pl.col("canonical_smiles")
             .map_elements(_smiles_to_fp, return_dtype=pl.List(pl.Int8))
             .alias("morgan_fingerprint")
-        ).select(["mol_id", "morgan_fingerprint"])
+        )
 
-        try:
-            # Parquet is chosen because it handles list columns (nested data) significantly 
-            # better than CSV and preserves data types.
-            fp_df.write_parquet(fp_path)
-            logger.success(f"Morgan fingerprints saved to {fp_path}")
-        except Exception as e:
-            logger.error(f"Failed to save Morgan fingerprints: {e}")
-            raise
+        return self.df
 
-    def get_morgan_fingerprints(
+    def _generate_selfies_onehot(self, selfies_list: List[str]) -> List[List[List[int]]]:
+        """
+        Helper method to generate One-Hot encodings from a list of SELFIES strings.
+        """
+        
+        # Filter valid selfies for vocabulary building
+        valid_selfies = [s for s in selfies_list if s is not None]
+        if not valid_selfies:
+            return [None] * len(selfies_list)
+
+        # Build Alphabet and Vocabulary
+        alphabet = sf.get_alphabet_from_selfies(valid_selfies)
+        alphabet.add("[nop]")  # Add padding token
+        vocab = {s: i for i, s in enumerate(sorted(list(alphabet)))}
+        
+        # Determine max length for padding
+        max_len = max(sf.len_selfies(s) for s in valid_selfies)
+        
+        embeddings = []
+        for s in selfies_list:
+            if s is None:
+                embeddings.append(None)
+                continue
+            
+            # Generate one-hot encoding (returned as list of lists)
+            encoding = sf.selfies_to_encoding(
+                s, 
+                vocab_stoi=vocab, 
+                pad_to_len=max_len, 
+                enc_type="one_hot"
+            )
+            embeddings.append(encoding)
+            
+        return embeddings
+
+    def _generate_selfies_transformer(self, selfies_list: List[str], model_name: str) -> List[List[float]]:
+        """
+        Helper method to generate Transformer embeddings from a list of SELFIES strings.
+        """
+
+        logger.info(f"Loading Transformer model: {model_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        model.eval()
+
+        embeddings = []
+        batch_size = 32
+        
+        # Replace None with padding token to keep alignment
+        clean_selfies_list = [s if s else "[nop]" for s in selfies_list]
+
+        # Process in batches
+        with torch.no_grad():
+            for i in range(0, len(clean_selfies_list), batch_size):
+                batch_selfies = clean_selfies_list[i : i + batch_size]
+                
+                inputs = tokenizer(
+                    batch_selfies, 
+                    padding=True, 
+                    truncation=True, 
+                    return_tensors="pt"
+                )
+                
+                outputs = model(**inputs)
+                
+                # Use mean of the last hidden state as the embedding
+                batch_embeddings = outputs.last_hidden_state.mean(dim=1)
+                embeddings.extend(batch_embeddings.tolist())
+                
+        return embeddings
+
+    def get_selfies_embeddings(
         self, 
-        radius: int = 3, 
-        fp_size: int = 2048,
-        fp_filename: str = "morgan_fingerprints.parquet"
+        model_name: str = "seyonec/ChemBERTa-zinc-base-v1"
     ) -> pl.DataFrame:
         """
-        Computes or loads Morgan Fingerprints for the loaded QM9 dataset.
+        Computes both One-Hot and Transformer embeddings for the loaded QM9 dataset using SELFIES.
+        Generated on the fly every time (no caching).
         
         Args:
-            radius: The radius of the fingerprin.
-            fp_size: The bit-vector length.
-            fp_filename: The filename to look for or create.
+            model_name: The Hugging Face model to use for the transformer embeddings.
             
         Returns:
-            Polars DataFrame with an additional 'morgan_fingerprint' column.
+            Polars DataFrame with additional 'selfies_onehot' and 'selfies_transformer' columns.
         """
-        fp_path = os.path.join(self.root, fp_filename)
-        
-        # Ensure the main dataframe is loaded so we can join to it
+        import selfies as sf
+
         if self.df.is_empty():
+            logger.warning("DataFrame is empty. Loading data first...")
             self.load_data()
 
-        # Check if the cache file exists
-        if not os.path.exists(fp_path):
-            logger.info(f"Fingerprint file {fp_filename} not found. Generating...")
-            self._generate_morgan_fingerprints(radius=radius, fp_size=fp_size, fp_filename=fp_filename)
-        
-        # Load the fingerprints
-        logger.info(f"Loading Morgan fingerprints from {fp_path}...")
-        try:
-            fp_df = pl.read_parquet(fp_path)
-            
-            # Check if we already have the column to avoid duplication errors
-            if "morgan_fingerprint" in self.df.columns:
-                return self.df
+        logger.info("Generating SELFIES strings...")
 
-            # Join the fingerprints to the main dataframe on mol_id
-            self.df = self.df.join(fp_df, on="mol_id", how="left")
-            
-        except Exception as e:
-            logger.error(f"Failed to load fingerprints from file: {e}")
-            raise
+        # 1. Generate SELFIES strings from SMILES
+        def _smiles_to_selfies(smiles):
+            try:
+                return sf.encoder(smiles)
+            except Exception:
+                return None
+
+        # Create temporary list of selfies strings
+        selfies_list = (
+            self.df["canonical_smiles"]
+            .map_elements(_smiles_to_selfies, return_dtype=pl.Utf8)
+            .to_list()
+        )
+        
+        # 2. Compute Embeddings using helper methods
+        logger.info("Computing One-Hot Encodings...")
+        onehot_embeddings = self._generate_selfies_onehot(selfies_list)
+
+        logger.info("Computing Transformer Embeddings...")
+        transformer_embeddings = self._generate_selfies_transformer(selfies_list, model_name)
+
+        # 3. Append to DataFrame
+        logger.info("Appending embeddings to DataFrame...")
+        
+        # Check and drop existing columns if re-running to avoid errors
+        if "selfies_onehot" in self.df.columns:
+            self.df = self.df.drop("selfies_onehot")
+        if "selfies_transformer" in self.df.columns:
+            self.df = self.df.drop("selfies_transformer")
+
+        self.df = self.df.with_columns([
+            pl.Series("selfies_onehot", onehot_embeddings),
+            pl.Series("selfies_transformer", transformer_embeddings)
+        ])
 
         return self.df
 
