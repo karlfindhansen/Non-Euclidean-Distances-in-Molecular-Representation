@@ -14,6 +14,7 @@ from ase.io import write, read
 import selfies as sf
 import torch
 from transformers import AutoTokenizer, AutoModel
+from scipy.spatial.distance import pdist, squareform
 class DataLoaderBase:
     """Base class for data loaders with common utility methods."""
     
@@ -468,6 +469,75 @@ class QM9Loader(DataLoaderBase):
         ])
 
         return self.df
+
+    def get_dist_matrix(self, distance_type: str = 'morgan') -> np.ndarray:
+        """
+        Retrieves or computes the pairwise distance matrix for the specified metric.
+        
+        Args:
+            distance_type: 'morgan' (Jaccard) or 'selfies' (Euclidean).
+            
+        Returns:
+            Numpy array of shape (N, N) containing pairwise distances.
+        """
+        # Configuration for each distance type
+        config = {
+            'morgan': {
+                'filename': "dist_matrix_morgan.npy",
+                'generate_fn': lambda: self.get_morgan_fingerprints(radius=3, fp_size=2048),
+                'col_name': "morgan_fingerprint",
+                'dtype': bool,
+                'metric': 'jaccard'
+            },
+            'selfies': {
+                'filename': "dist_matrix_selfies.npy",
+                'generate_fn': lambda: self.get_selfies_embeddings(),
+                'col_name': "selfies_transformer",
+                'dtype': np.float32,
+                'metric': 'euclidean'
+            }
+        }
+
+        if distance_type not in config:
+            raise ValueError(f"Unknown distance type: '{distance_type}'. Options: {list(config.keys())}")
+
+        cfg = config[distance_type]
+        file_path = os.path.join(self.root, cfg['filename'])
+
+        # 1. Load if exists
+        if os.path.exists(file_path):
+            logger.info(f"Loading existing {distance_type} distance matrix from {file_path}...")
+            return np.load(file_path)
+
+        # 2. Compute if missing
+        logger.info(f"Generating {distance_type} distance matrix...")
+
+        # Ensure embedding data is present in DataFrame
+        if self.df.is_empty() or cfg['col_name'] not in self.df.columns:
+            cfg['generate_fn']()
+
+        # Extract data and convert to appropriate numpy format
+        data_array = np.array(self.df[cfg['col_name']].to_list(), dtype=cfg['dtype'])
+
+        logger.info(f"Computing {cfg['metric']} distances for shape {data_array.shape}...")
+        
+        try:
+            # Calculate condensed distance matrix
+            condensed_dist = pdist(data_array, metric=cfg['metric'])
+            # Convert to square symmetric matrix
+            dist_matrix = squareform(condensed_dist)
+        except Exception as e:
+            logger.error(f"Failed to calculate distance matrix: {e}")
+            raise
+
+        # 3. Save and Return
+        try:
+            np.save(file_path, dist_matrix)
+            logger.success(f"Saved {cfg['filename']} (Shape: {dist_matrix.shape})")
+        except Exception as e:
+            logger.error(f"Failed to save distance matrix file: {e}")
+        
+        return dist_matrix
 
 class MaterialsProjectLoader(DataLoaderBase):
     """
