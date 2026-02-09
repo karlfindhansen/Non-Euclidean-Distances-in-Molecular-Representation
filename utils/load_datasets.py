@@ -302,6 +302,107 @@ class QM9Loader(DataLoaderBase):
             logger.error(f"Failed to read stress test file: {e}")
             return []
 
+    def _generate_morgan_fingerprints(
+        self, 
+        radius: int = 3, 
+        fp_size: int = 2048, 
+        fp_filename: str = "morgan_fingerprints.parquet"
+    ) -> None:
+        """
+        Generates Morgan Fingerprints and saves them to a file.
+        
+        Args:
+            radius: The radius of the fingerprint.
+            fp_size: The bit-vector length.
+            fp_filename: Name of the file to save fingerprints to.
+        """
+        fp_path = os.path.join(self.root, fp_filename)
+        
+        if self.df.is_empty():
+            logger.warning("DataFrame is empty. Loading data first...")
+            self.load_data()
+
+        # Initialize the modern Morgan Generator
+        # Note: Using AllChem.GetMorganGenerator as per RDKit modern API
+        try:
+            morgan_gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
+        except AttributeError:
+             # Fallback if specific RDKit version differs, but sticking to your provided syntax
+             morgan_gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
+
+        def _smiles_to_fp(smiles: str):
+            if not smiles:
+                return None
+            mol = Chem.MolFromSmiles(smiles)
+            if mol:
+                # Returns a list of bits (0s and 1s)
+                return list(morgan_gen.GetFingerprint(mol))
+            return None
+
+        logger.info(f"Computing Morgan Fingerprints (Radius={radius}, Size={fp_size})...")
+
+        # Compute fingerprints and select only necessary columns for the cache file
+        # We join on 'mol_id' later, so we must preserve it.
+        fp_df = self.df.select(["mol_id", "canonical_smiles"]).with_columns(
+            pl.col("canonical_smiles")
+            .map_elements(_smiles_to_fp, return_dtype=pl.List(pl.Int8))
+            .alias("morgan_fingerprint")
+        ).select(["mol_id", "morgan_fingerprint"])
+
+        try:
+            # Parquet is chosen because it handles list columns (nested data) significantly 
+            # better than CSV and preserves data types.
+            fp_df.write_parquet(fp_path)
+            logger.success(f"Morgan fingerprints saved to {fp_path}")
+        except Exception as e:
+            logger.error(f"Failed to save Morgan fingerprints: {e}")
+            raise
+
+    def get_morgan_fingerprints(
+        self, 
+        radius: int = 3, 
+        fp_size: int = 2048,
+        fp_filename: str = "morgan_fingerprints.parquet"
+    ) -> pl.DataFrame:
+        """
+        Computes or loads Morgan Fingerprints for the loaded QM9 dataset.
+        
+        Args:
+            radius: The radius of the fingerprin.
+            fp_size: The bit-vector length.
+            fp_filename: The filename to look for or create.
+            
+        Returns:
+            Polars DataFrame with an additional 'morgan_fingerprint' column.
+        """
+        fp_path = os.path.join(self.root, fp_filename)
+        
+        # Ensure the main dataframe is loaded so we can join to it
+        if self.df.is_empty():
+            self.load_data()
+
+        # Check if the cache file exists
+        if not os.path.exists(fp_path):
+            logger.info(f"Fingerprint file {fp_filename} not found. Generating...")
+            self._generate_morgan_fingerprints(radius=radius, fp_size=fp_size, fp_filename=fp_filename)
+        
+        # Load the fingerprints
+        logger.info(f"Loading Morgan fingerprints from {fp_path}...")
+        try:
+            fp_df = pl.read_parquet(fp_path)
+            
+            # Check if we already have the column to avoid duplication errors
+            if "morgan_fingerprint" in self.df.columns:
+                return self.df
+
+            # Join the fingerprints to the main dataframe on mol_id
+            self.df = self.df.join(fp_df, on="mol_id", how="left")
+            
+        except Exception as e:
+            logger.error(f"Failed to load fingerprints from file: {e}")
+            raise
+
+        return self.df
 
 class MaterialsProjectLoader(DataLoaderBase):
     """
@@ -310,7 +411,6 @@ class MaterialsProjectLoader(DataLoaderBase):
     Handles fetching and caching of stable oxide materials from the Materials Project API.
     """
     
-    # Required columns for validation
     REQUIRED_COLUMNS = {"material_id", "formula_pretty", "energy_per_atom"}
 
     def __init__(
