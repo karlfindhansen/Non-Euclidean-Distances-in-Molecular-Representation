@@ -15,6 +15,8 @@ import selfies as sf
 import torch
 from transformers import AutoTokenizer, AutoModel
 from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.transform import Rotation
+
 class DataLoaderBase:
     """Base class for data loaders with common utility methods."""
     
@@ -64,7 +66,7 @@ class QM9Loader(DataLoaderBase):
     ]
     
     # Required columns for validation
-    REQUIRED_COLUMNS = {"mol_id", "canonical_smiles", "num_atoms"}
+    REQUIRED_COLUMNS = {"mol_id", "canonical_smiles", "num_atoms", "selfies"}
 
     def __init__(
         self, 
@@ -159,6 +161,7 @@ class QM9Loader(DataLoaderBase):
                     continue
                 
                 canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
+                selfie_str = sf.encoder(canonical_smiles)
                 formula = CalcMolFormula(mol)
                 
                 mol_dict = {
@@ -166,6 +169,7 @@ class QM9Loader(DataLoaderBase):
                     "name": formula, 
                     "original_smiles": smiles,
                     "canonical_smiles": canonical_smiles,
+                    "selfies" : selfie_str, 
                     "num_atoms": int(data.num_nodes), 
                 }
                 
@@ -214,7 +218,8 @@ class QM9Loader(DataLoaderBase):
         logger.info(f"Generating Grassmann Stress Test (Seed={seed})...")
         
         if self.df.is_empty():
-            raise ValueError("Cannot generate stress test: QM9 DataFrame is empty")
+            self.df = self.load_data()
+            #raise ValueError("Cannot generate stress test: QM9 DataFrame is empty")
         
         # Adjust num_molecules if dataset is too small
         available_molecules = len(self.df)
@@ -256,10 +261,17 @@ class QM9Loader(DataLoaderBase):
 
                 # Generate perturbations
                 for i in range(perturbations):
+                    # Apply Gaussian Noise
                     pert_atoms = Atoms(symbols=symbols, positions=base_positions.copy())
                     noise = np.random.normal(0.0, stdev, base_positions.shape)
+                    #noise = np.random.uniform(0.0, stdev*2, base_positions.shape)
                     pert_atoms.positions += noise
                     
+                    # Apply random rotation
+                    r = Rotation.random()
+                    com = pert_atoms.get_center_of_mass()
+                    pert_atoms.positions = r.apply(pert_atoms.positions - com) + com
+
                     pert_atoms.info.update({
                         'mol_id': mol_id, 
                         'perturbation_idx': i, 
@@ -295,8 +307,8 @@ class QM9Loader(DataLoaderBase):
             List of ASE Atoms objects containing perturbed molecular geometries
         """
         if not os.path.exists(self.stress_test_path):
-            logger.warning("No stress test file found.")
-            return []
+            logger.info("No stress test file found. Generating stress test")
+            return self._generate_grassmann_stress_test()
         
         try:
             return read(self.stress_test_path, index=":")
@@ -425,27 +437,12 @@ class QM9Loader(DataLoaderBase):
         Returns:
             Polars DataFrame with additional 'selfies_onehot' and 'selfies_transformer' columns.
         """
-        import selfies as sf
 
         if self.df.is_empty():
             logger.warning("DataFrame is empty. Loading data first...")
             self.load_data()
 
-        logger.info("Generating SELFIES strings...")
-
-        # 1. Generate SELFIES strings from SMILES
-        def _smiles_to_selfies(smiles):
-            try:
-                return sf.encoder(smiles)
-            except Exception:
-                return None
-
-        # Create temporary list of selfies strings
-        selfies_list = (
-            self.df["canonical_smiles"]
-            .map_elements(_smiles_to_selfies, return_dtype=pl.Utf8)
-            .to_list()
-        )
+        selfies_list = self.df["selfies"].to_list()
         
         # 2. Compute Embeddings using helper methods
         logger.info("Computing One-Hot Encodings...")
