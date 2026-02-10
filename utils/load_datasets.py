@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from torch_geometric.datasets import QM9
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
@@ -163,14 +163,42 @@ class QM9Loader(DataLoaderBase):
                 canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
                 selfie_str = sf.encoder(canonical_smiles)
                 formula = CalcMolFormula(mol)
+
+                n_rings = rdMolDescriptors.CalcNumRings(mol)
+                n_arom = rdMolDescriptors.CalcNumAromaticRings(mol)
+                
+                # Determine Structure Class
+                if n_rings == 0:
+                    struct_class = "Acyclic"
+                elif n_arom > 0:
+                    struct_class = "Aromatic"
+                else:
+                    struct_class = "Aliphatic Ring"
                 
                 mol_dict = {
                     "mol_id": f"qm9_{i}",
                     "name": formula, 
                     "original_smiles": smiles,
                     "canonical_smiles": canonical_smiles,
-                    "selfies" : selfie_str, 
-                    "num_atoms": int(data.num_nodes), 
+                    "selfies": selfie_str, 
+                    "num_atoms": int(data.num_nodes),
+                    "structure_class": struct_class,
+                    
+                    # Physical Properties
+                    "mol_weight": Descriptors.MolWt(mol),        # Molecular Weight
+                    "logp": Descriptors.MolLogP(mol),            # Lipophilicity
+                    "tpsa": Descriptors.TPSA(mol),               # Polar Surface Area
+                    
+                    # Structural/Complexity Descriptors
+                    "num_heavy_atoms": mol.GetNumHeavyAtoms(),
+                    "num_rings": rdMolDescriptors.CalcNumRings(mol),
+                    "num_aromatic_rings": rdMolDescriptors.CalcNumAromaticRings(mol),
+                    
+                    # Flexibility Descriptors (Crucial for your Stress Test context)
+                    "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
+                    "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol), # 3D complexity
+                    "h_bond_donors": Descriptors.NumHDonors(mol),
+                    "h_bond_acceptors": Descriptors.NumHAcceptors(mol),
                 }
                 
                 # Add QM9 target properties
@@ -267,10 +295,10 @@ class QM9Loader(DataLoaderBase):
                     #noise = np.random.uniform(0.0, stdev*2, base_positions.shape)
                     pert_atoms.positions += noise
                     
-                    # Apply random rotation
-                    r = Rotation.random()
-                    com = pert_atoms.get_center_of_mass()
-                    pert_atoms.positions = r.apply(pert_atoms.positions - com) + com
+                    # Apply random rotation (this ensures that the clusters are random for a flattened array)
+                    #r = Rotation.random()
+                    #com = pert_atoms.get_center_of_mass()
+                    #pert_atoms.positions = r.apply(pert_atoms.positions - com) + com
 
                     pert_atoms.info.update({
                         'mol_id': mol_id, 
