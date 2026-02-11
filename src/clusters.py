@@ -1,180 +1,270 @@
 import numpy as np
-import pandas as pd
+import polars as pl
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import (
-    silhouette_score, 
-    calinski_harabasz_score, 
-    davies_bouldin_score,
-    adjusted_rand_score, 
-    normalized_mutual_info_score, 
-    confusion_matrix,
-    silhouette_samples
-)
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-import matplotlib.cm as cm
+from sklearn.metrics import adjusted_rand_score, silhouette_score, calinski_harabasz_score, silhouette_samples
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 
-class ClusterEvaluator:
-    """
-    A class to evaluate and visualize clustering results.
-    
-    Attributes:
-        X (array-like): The feature matrix used for clustering.
-        labels_pred (array-like): The cluster labels predicted by the algorithm.
-        labels_true (array-like, optional): The ground truth labels (if available).
-    """
-    
-    def __init__(self, X, labels_pred, labels_true=None):
-        self.X = X
-        self.labels_pred = labels_pred
-        self.labels_true = labels_true
-        self.n_clusters = len(set(labels_pred)) - (1 if -1 in labels_pred else 0)
-        
-        # Set style for plots
-        sns.set_theme(style="whitegrid")
-
-    def print_metrics(self):
-        """Prints standard clustering metrics to the console."""
-        print(f"--- Clustering Performance (n_clusters={self.n_clusters}) ---")
-        
-        # 1. Internal Validation (No Ground Truth needed)
-        # Note: These fail if only 1 cluster exists
-        if self.n_clusters > 1:
-            sil = silhouette_score(self.X, self.labels_pred)
-            ch = calinski_harabasz_score(self.X, self.labels_pred)
-            db = davies_bouldin_score(self.X, self.labels_pred)
-            
-            print(f"Silhouette Score:       {sil:.4f} (Higher is better, -1 to 1)")
-            print(f"Calinski-Harabasz:    {ch:.1f}  (Higher is better)")
-            print(f"Davies-Bouldin:       {db:.4f} (Lower is better)")
-        else:
-            print("Skipping internal metrics (need > 1 cluster).")
-
-        # 2. External Validation (Requires Ground Truth)
-        if self.labels_true is not None:
-            ari = adjusted_rand_score(self.labels_true, self.labels_pred)
-            nmi = normalized_mutual_info_score(self.labels_true, self.labels_pred)
-            
-            print(f"Adjusted Rand Index:    {ari:.4f} (1.0 is perfect match)")
-            print(f"Normalized Mutual Info: {nmi:.4f} (1.0 is perfect match)")
-        else:
-            print("External metrics skipped (no ground truth provided).")
-        print("-" * 50)
-
-    def plot_dimensionality_reduction(self, method='pca', title=None):
+class ClusterAnalysis:
+    def __init__(self, X, true_labels=None, meta_df=None):
         """
-        Visualizes clusters using PCA or t-SNE.
+        Initialize the analysis with a feature matrix.
         
         Args:
-            method (str): 'pca' or 'tsne'.
+            X (np.array): Feature matrix (n_samples, n_features).
+            true_labels (list/array, optional): Ground truth labels for external evaluation.
+            meta_df (pl.DataFrame, optional): Metadata (smiles, ids) for reporting.
         """
-        if method.lower() == 'pca':
-            reducer = PCA(n_components=2)
-            title = title or "Cluster Visualization (PCA)"
-        elif method.lower() == 'tsne':
-            reducer = TSNE(n_components=2, random_state=42)
-            title = title or "Cluster Visualization (t-SNE)"
-        else:
-            raise ValueError("Method must be 'pca' or 'tsne'")
+        self.X = X
+        self.true_labels = true_labels
+        self.meta_df = meta_df
+        self.labels_ = None
+        self.model_ = None
+        self.method_name_ = ""
 
-        # Reduce dimensions
-        X_embedded = reducer.fit_transform(self.X)
+    def run(self, method='kmeans', **kwargs):
+        """
+        Run a specific clustering algorithm.
+        """
+        self.method_name_ = method.lower()
+        print(f"--- Running {self.method_name_.upper()} ---")
+
+        if self.method_name_ == 'kmeans':
+            n_clusters = kwargs.get('n_clusters', 5)
+            self.model_ = KMeans(n_clusters=n_clusters, 
+                                 random_state=kwargs.get('random_state', 42),
+                                 n_init=kwargs.get('n_init', 10))
+            self.labels_ = self.model_.fit_predict(self.X)
+            
+        elif self.method_name_ == 'dbscan':
+            eps = kwargs.get('eps', 0.5)
+            min_samples = kwargs.get('min_samples', 5)
+            self.model_ = DBSCAN(eps=eps, min_samples=min_samples)
+            self.labels_ = self.model_.fit_predict(self.X)
+            
+        elif self.method_name_ == 'hierarchical':
+            n_clusters = kwargs.get('n_clusters', 5)
+            linkage = kwargs.get('linkage', 'ward')
+            self.model_ = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
+            self.labels_ = self.model_.fit_predict(self.X)
         
-        plt.figure(figsize=(10, 6))
-        sns.scatterplot(
-            x=X_embedded[:, 0], 
-            y=X_embedded[:, 1], 
-            hue=self.labels_pred, 
-            palette='viridis', 
-            s=60, 
-            legend='full'
-        )
-        plt.title(title)
-        plt.xlabel("Component 1")
-        plt.ylabel("Component 2")
-        plt.legend(title='Cluster')
-        plt.show()
+        else:
+            raise ValueError(f"Unknown method: {method}. Choose 'kmeans', 'dbscan', or 'hierarchical'.")
+        
+        return self.labels_
 
-    def plot_silhouette_analysis(self):
+    def evaluate(self):
         """
-        Plots the silhouette coefficient for each sample to visualize cluster tightness.
+        Calculates and prints internal and external clustering metrics.
         """
-        if self.n_clusters < 2:
-            print("Silhouette plot requires at least 2 clusters.")
+        if self.labels_ is None:
+            print("Run clustering first.")
             return
 
-        silhouette_avg = silhouette_score(self.X, self.labels_pred)
-        sample_silhouette_values = silhouette_samples(self.X, self.labels_pred)
+        unique_labels = set(self.labels_)
+        n_clusters = len(unique_labels) - (1 if -1 in self.labels_ else 0)
+        print(f"Found {n_clusters} clusters (excluding noise).")
 
-        plt.figure(figsize=(10, 6))
-        y_lower = 10
+        metrics = {}
         
-        # Iterate over clusters to draw the silhouette "knife shapes"
-        unique_labels = sorted(set(self.labels_pred))
-        for i in unique_labels:
-            if i == -1: continue # Skip noise in DBSCAN
+        # 1. External Metrics (Requires Ground Truth)
+        if self.true_labels is not None:
+            ari = adjusted_rand_score(self.true_labels, self.labels_)
+            metrics['ARI'] = ari
+            print(f"Adjusted Rand Index (Ground Truth): {ari:.4f}")
+
+        # 2. Internal Metrics
+        if n_clusters > 1:
+            sil = silhouette_score(self.X, self.labels_)
+            ch = calinski_harabasz_score(self.X, self.labels_)
+            metrics['Silhouette'] = sil
+            print(f"Silhouette Score: {sil:.4f}")
+            print(f"Calinski-Harabasz Score: {ch:.4f}")
+        else:
+            print("Not enough clusters for internal metrics.")
+
+        return metrics
+
+    def analyze_mismatches(self):
+        """
+        Identifies molecules that appear to be in the wrong cluster 
+        (Visual, Mathematical, or Label mismatch).
+        
+        Returns:
+            visual_mismatch, math_mismatch, label_mismatch (Polars DataFrames)
+        """
+        if self.labels_ is None:
+            print("Run clustering first.")
+            return None, None, None
+
+        # 1. Prepare Data
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(self.X)
+        
+        # Start with meta_df if exists, else create empty
+        if self.meta_df is not None:
+            results = self.meta_df.clone()
+        else:
+            results = pl.DataFrame()
+
+        # 2. Calculate Metrics
+        # A. Visual Neighbors (KNN)
+        knn = KNeighborsClassifier(n_neighbors=5)
+        knn.fit(X_pca, self.labels_)
+        visual_pred = knn.predict(X_pca)
+        
+        # B. Silhouette Scores per sample
+        sil_scores = silhouette_samples(self.X, self.labels_)
+        
+        # Combine into DataFrame
+        results = results.with_columns([
+            pl.Series("cluster", self.labels_),
+            pl.Series("visual_neighbor_cluster", visual_pred),
+            pl.Series("silhouette_score", sil_scores),
+            pl.Series("pca_x", X_pca[:,0]),
+            pl.Series("pca_y", X_pca[:,1])
+        ])
+        
+        if self.true_labels is not None:
+             results = results.with_columns(pl.Series("true_label", self.true_labels))
+
+        print("\n--- Mismatch Analysis ---")
+        
+        # 3. Filter Results
+        vis_err = results.filter(pl.col("cluster") != pl.col("visual_neighbor_cluster"))
+        print(f"Visual Intruders: {len(vis_err)} (Look like they belong elsewhere)")
+
+        math_err = results.filter(pl.col("silhouette_score") < 0)
+        print(f"Silhouette Outliers: {len(math_err)} (Ambiguous assignment)")
+
+        chem_err = None
+        if self.true_labels is not None:
+            dom_classes = (
+                results.group_by("cluster")
+                .agg(pl.col("true_label").mode().first().alias("dominant_class"))
+            )
+            chem_err = (
+                results.join(dom_classes, on="cluster")
+                .filter(pl.col("true_label") != pl.col("dominant_class"))
+                .sort("silhouette_score")
+            )
+            print(f"Label Mismatches: {len(chem_err)} (Don't match cluster's dominant class)")
             
-            ith_cluster_values = sample_silhouette_values[self.labels_pred == i]
-            ith_cluster_values.sort()
+        return vis_err, math_err, chem_err
+    
+    def get_misclassification_report(self, n_neighbors=3, id_col='mol_id', smiles_col='canonical_smiles'):
+        """
+        Generates a detailed report of misplaced molecules, including SMILES
+        for visual comparison with neighbors.
+        """
+        if self.labels_ is None or self.meta_df is None:
+            print("Error: Run clustering first and ensure meta_df was provided.")
+            return None
 
-            size_cluster_i = ith_cluster_values.shape[0]
-            y_upper = y_lower + size_cluster_i
+        # 1. Setup Data
+        report = self.meta_df.clone()
+        
+        # Add Clustering Info
+        report = report.with_columns([
+            pl.Series("Assigned_Cluster", self.labels_),
+        ])
+        
+        if self.true_labels is not None:
+            report = report.with_columns(pl.Series("True_Class", self.true_labels))
 
-            color = cm.nipy_spectral(float(i) / self.n_clusters)
-            plt.fill_betweenx(
-                np.arange(y_lower, y_upper),
-                0,
-                ith_cluster_values,
-                facecolor=color,
-                edgecolor=color,
-                alpha=0.7
+        # 2. Find Neighbors
+        print(f"Finding top {n_neighbors} neighbors for every molecule...")
+        nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(self.X)
+        distances, indices = nbrs.kneighbors(self.X)
+        
+        # 3. Retrieve IDs and SMILES for lookup
+        try:
+            ids = self.meta_df[id_col].to_list()
+            smiles_list = self.meta_df[smiles_col].to_list()
+        except Exception as e:
+            print(f"Error accessing columns: {e}. Check if '{id_col}' and '{smiles_col}' exist in your DF.")
+            return None
+
+        # 4. format Neighbor Strings
+        neighbor_info = []
+        
+        for row_idx in range(len(indices)):
+            neighbor_idxs = indices[row_idx, 1:]
+            
+            info_parts = []
+            for i in neighbor_idxs:
+                n_id = str(ids[i])
+                n_smiles = str(smiles_list[i])
+                info_parts.append(f"{n_id} ({n_smiles})")
+                
+            neighbor_info.append(" || ".join(info_parts))
+            
+        report = report.with_columns(pl.Series("Closest_Neighbors_Info", neighbor_info))
+
+        # 5. Filter for Mismatches
+        if self.true_labels is not None:
+            dom_classes = (
+                report.group_by("Assigned_Cluster")
+                .agg(pl.col("True_Class").mode().first().alias("Cluster_Dominant_Class"))
             )
             
-            # Label the cluster numbers
-            plt.text(-0.05, y_lower + 0.5 * size_cluster_i, str(i))
-            y_lower = y_upper + 10  # Add space between plots
-
-        plt.title("Silhouette Plot for Various Clusters")
-        plt.xlabel("The silhouette coefficient values")
-        plt.ylabel("Cluster label")
+            mismatches = (
+                report.join(dom_classes, on="Assigned_Cluster")
+                .filter(pl.col("True_Class") != pl.col("Cluster_Dominant_Class"))
+                .select([
+                    id_col,
+                    smiles_col,         
+                    "True_Class", 
+                    "Assigned_Cluster", 
+                    "Cluster_Dominant_Class", 
+                    "Closest_Neighbors_Info"
+                ])
+                .sort("Assigned_Cluster")
+            )
+            
+            print(f"Found {len(mismatches)} mismatches.")
+            return mismatches
         
-        # The vertical line for average silhouette score of all the values
-        plt.axvline(x=silhouette_avg, color="red", linestyle="--")
-        plt.yticks([])  # Clear the yaxis labels / ticks
-        plt.show()
-
-    def plot_confusion_matrix(self, title="Cluster vs. Structure Class"):
+        return report
+    
+    def plot_pca(self, show=False, title_suffix=""):
         """
-        Shows exactly which chemical classes (Aromatic, Acyclic) 
-        are being grouped into which cluster ID.
+        Visualizes the clustering using PCA (2D).
         """
-        if self.labels_true is None:
-            print("Error: Ground truth labels (structure_class) required.")
+        if self.labels_ is None:
+            print("Run clustering first.")
             return
 
-        # Create cross-tabulation
-        data = pd.DataFrame({'Predicted': self.labels_pred, 'True': self.labels_true})
-        cm = pd.crosstab(data['True'], data['Predicted'])
-
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(self.X)
+        
         plt.figure(figsize=(10, 7))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='YlGnBu')
-        plt.title(title, fontweight='bold')
-        plt.ylabel('Actual Structure Class')
-        plt.xlabel('Cluster ID')
-        plt.show()
+        
+        unique_labels = np.unique(self.labels_)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+        
+        for k, col in zip(unique_labels, colors):
+            if k == -1:
+                col = 'k'; marker = 'x'; label = 'Noise'; alpha = 0.3
+            else:
+                marker = 'o'; label = f'Cluster {k}'; alpha = 0.7
+            
+            mask = (self.labels_ == k)
+            plt.scatter(X_pca[mask, 0], X_pca[mask, 1], c=[col], label=label, marker=marker, alpha=alpha, s=70)
 
-    def plot_cluster_purity(self):
-        """
-        Visualizes the 'Concentration' of structure classes per cluster.
-        Perfect for seeing if Cluster 2 is 'The Aromatic Cluster'.
-        """
-        data = pd.DataFrame({'Cluster': self.labels_pred, 'Class': self.labels_true})
-        counts = data.groupby(['Cluster', 'Class']).size().unstack(fill_value=0)
-        purity = counts.div(counts.sum(axis=1), axis=0) * 100
-
-        purity.plot(kind='bar', stacked=True, colormap='Set3', figsize=(10, 6))
-        plt.title("Cluster Composition Purity (%)", fontweight='bold')
-        plt.ylabel("Percentage of Molecules")
+        plt.title(f"{self.method_name_.upper()} Clustering (PCA)\n{title_suffix}")
+        plt.xlabel("PCA Component 1")
+        plt.ylabel("PCA Component 2")
+        plt.grid(True, alpha=0.3)
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.show()
+        plt.tight_layout()
+        if show:
+            plt.show()
+
+    def get_summary_df(self):
+        """Returns summary dataframe."""
+        if self.meta_df is None:
+            return pl.DataFrame({"cluster": self.labels_})

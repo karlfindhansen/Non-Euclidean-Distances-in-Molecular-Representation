@@ -16,6 +16,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 from scipy.spatial.distance import pdist, squareform
 from scipy.spatial.transform import Rotation
+from sklearn.preprocessing import StandardScaler
 
 import os
 import polars as pl
@@ -51,6 +52,8 @@ class QM9Dataset:
         self.file_path = os.path.join(root, filename)
         self.subset_size = subset_size
         self.df = pl.DataFrame()
+        self.scaler = StandardScaler()
+        self.is_scaled = False
         
         ensure_directory(self.root)
         
@@ -135,8 +138,6 @@ class QM9Dataset:
         self.df.write_csv(self.file_path)
         logger.success(f"Saved processed dataset to {self.file_path}")
 
-    # --- Delegated Methods ---
-
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
         """Adds 'morgan_fingerprint' column to the dataframe in-place."""
         if "morgan_fingerprint" in self.df.columns: return
@@ -205,6 +206,29 @@ class QM9Dataset:
         return self.geometry_engine.generate_stress_test(
             self.df, num_molecules=num_molecules
         )
+    
+    def apply_scaling(self, columns, mode="fit_transform"):
+        """
+        Standardizes specific numeric columns.
+        Modes: 
+          'fit_transform' -> Use for Training data
+          'transform'     -> Use for Test/Validation data
+        """
+        if self.df.is_empty():
+            logger.error("No data to scale!")
+            return
+
+        if mode == "fit_transform":
+            logger.info(f"Fitting and transforming columns: {columns}")
+            scaled_values = self.scaler.fit_transform(self.df.select(columns).to_numpy())
+            self.is_scaled = True
+        else:
+            logger.info(f"Transforming columns using existing parameters: {columns}")
+            scaled_values = self.scaler.transform(self.df.select(columns).to_numpy())
+
+        scaled_df = pl.DataFrame(scaled_values, schema=columns)
+        self.df = self.df.with_columns([scaled_df[col] for col in columns])
+    
 
 class MaterialsProjectLoader():
     """

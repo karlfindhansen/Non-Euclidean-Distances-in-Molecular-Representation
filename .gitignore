@@ -2,3 +2,4 @@
 config/api_key.json
 /.venv*
 __pycache__/
+*.csv
