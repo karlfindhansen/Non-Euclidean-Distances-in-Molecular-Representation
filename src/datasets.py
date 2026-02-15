@@ -92,8 +92,9 @@ class QM9Dataset:
             raise RuntimeError(f"QM9 download failed: {e}")
 
         data_list = []
+        buffer_size = int(self.subset_size * 1.1)
         for i, data in enumerate(dataset):
-            if len(data_list) >= self.subset_size: break
+            if len(data_list) >= buffer_size: break
             
             smiles = getattr(data, 'smiles', None)
             if not smiles: continue
@@ -137,7 +138,6 @@ class QM9Dataset:
                 "h_bond_donors": Descriptors.NumHDonors(mol),
                 "h_bond_acceptors": Descriptors.NumHAcceptors(mol),
 
-                # --- NEW: Functional Groups & Fragments ---
                 # These count specific chemical motifs
                 "fr_benzene": Fragments.fr_benzene(mol),           # Benzene rings
                 "fr_alcohol": Fragments.fr_Al_OH(mol),             # Aliphatic alcohols
@@ -156,6 +156,25 @@ class QM9Dataset:
             data_list.append(mol_dict)
 
         self.df = pl.DataFrame(data_list)
+
+        self.add_soap()
+        self.add_acsf()
+
+        valid_mask = (
+            pl.col("soap_embedding").is_not_null() & 
+            pl.col("acsf_embedding").is_not_null()
+        )
+        
+        valid_count = self.df.filter(valid_mask).height
+        logger.info(f"Valid molecules (SOAP+ACSF success): {valid_count}")
+
+        self.df = (
+            self.df
+            .filter(valid_mask)         
+            .head(self.subset_size)     
+            .drop(["soap_embedding", "acsf_embedding"])
+        )
+
         self.df.write_csv(self.file_path)
         logger.success(f"Saved processed dataset to {self.file_path}")
 

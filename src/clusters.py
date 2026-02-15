@@ -7,6 +7,7 @@ from sklearn.metrics import adjusted_rand_score, silhouette_score, calinski_hara
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from collections import Counter
 
 class ClusterAnalysis:
     def __init__(self, X, true_labels=None, meta_df=None):
@@ -88,36 +89,71 @@ class ClusterAnalysis:
 
         return metrics
     
-    def calculate_overlap(self, k=20):
+    def calculate_overlap_detailed(self, k=20, use_pca=False):
         """
-        Calculates how much a point overlaps with different classes.
-        Returns: (overlap_scores, is_overlapping_flag)
+        Calculates overlap score and identifies the specific interfering cluster.
+        
+        Args:
+            k (int): Number of neighbors to check.
+            use_pca (bool): 
+                - True: Checks overlap in 2D PCA space (evaluates the PLOT).
+                - False: Checks overlap in original High-D space (evaluates the EMBEDDING).
+        
+        Returns:
+            overlap_scores (np.array): 0.0 to 1.0 score of how "misplaced" the point is.
+            dominant_neighbors (list): The class label of the cluster this point is overlapping with.
         """
         if self.true_labels is None:
             return None, None
 
-        # Use PCA for the neighborhood check (standard practice for high-dim data)
-        pca = PCA(n_components=2)
-        X_pca = pca.fit_transform(self.X)
+        # 1. Choose Space
+        if use_pca:
+            # Evaluates the visualization artifacts
+            pca = PCA(n_components=2)
+            X_space = pca.fit_transform(self.X)
+        else:
+            # Evaluates the actual chemical descriptor quality
+            X_space = self.X
 
-        nbrs = NearestNeighbors(n_neighbors=k + 1).fit(X_pca)
-        _, indices = nbrs.kneighbors(X_pca)
+        # 2. Find Neighbors
+        nbrs = NearestNeighbors(n_neighbors=k + 1).fit(X_space)
+        _, indices = nbrs.kneighbors(X_space)
 
         overlap_scores = []
+        dominant_neighbors = []
         
+        # Handle Polars vs Numpy input
+        true_labels_np = self.true_labels.to_numpy() if isinstance(self.true_labels, pl.Series) else np.array(self.true_labels)
+
         for i, neighbor_indices in enumerate(indices):
+            # neighbor_indices[0] is the point itself; skip it
             others = neighbor_indices[1:]
             
-            own_class = self.true_labels[i]
-            neighbor_classes = self.true_labels[others]
+            own_class = true_labels_np[i]
+            neighbor_classes = true_labels_np[others]
             
+            # A. Calculate Score (% mismatch)
+            # 0.0 = Perfect cluster, 1.0 = Completely surrounded by enemies
             score = np.mean(neighbor_classes != own_class)
             overlap_scores.append(score)
+            
+            # B. Identify Dominant Neighbor (The "Who")
+            if score > 0: 
+                # Find which class is invading this neighborhood most often
+                counts = Counter(neighbor_classes)
+                # Remove own class from counts to find the *interfering* class
+                if own_class in counts:
+                    del counts[own_class]
+                
+                if counts:
+                    most_common_invader = counts.most_common(1)[0][0]
+                    dominant_neighbors.append(most_common_invader)
+                else:
+                    dominant_neighbors.append(None) # Only neighbors were own class (score was 0)
+            else:
+                dominant_neighbors.append(None)
 
-        overlap_scores = np.array(overlap_scores)
-        is_overlapping = overlap_scores > 0.3 
-        
-        return overlap_scores, is_overlapping
+        return np.array(overlap_scores), dominant_neighbors
 
     def analyze_mismatches(self):
         """
@@ -261,37 +297,100 @@ class ClusterAnalysis:
         
         return report
     
-    def plot_pca(self, show=False, title_suffix=""):
+    def plot_pca(self, show=False, title_suffix="", highlight_top_overlaps=5, use_pca=False):
         """
-        Visualizes the clustering using PCA (2D).
+        Visualizes the clustering using PCA (2D) with overlap highlighting.
+        Labels clusters by their dominant true class and purity percentage.
         """
         if self.labels_ is None:
             print("Run clustering first.")
             return
 
+        # 1. Generate PCA coordinates
         pca = PCA(n_components=2)
         X_pca = pca.fit_transform(self.X)
         
-        plt.figure(figsize=(10, 7))
+        plt.figure(figsize=(12, 8))
         
+        # 2. Prepare True Labels for fast indexing
+        # Convert to numpy array once to avoid Polars indexing issues inside the loop
+        if self.true_labels is not None:
+            if hasattr(self.true_labels, 'to_numpy'):
+                true_labels_np = self.true_labels.to_numpy()
+            else:
+                true_labels_np = np.array(self.true_labels)
+        else:
+            true_labels_np = None
+
+        # 3. Plot Each Cluster
         unique_labels = np.unique(self.labels_)
-        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
         
-        for k, col in zip(unique_labels, colors):
+        # Create a colormap
+        cmap = plt.get_cmap('tab10') if len(unique_labels) <= 10 else plt.get_cmap('viridis')
+        
+        for i, k in enumerate(unique_labels):
+            # Create a mask for points in this cluster
+            mask = (self.labels_ == k)
+            
+            # --- NEW: Calculate Dominant Class Logic ---
             if k == -1:
                 col = 'k'; marker = 'x'; label = 'Noise'; alpha = 0.3
             else:
-                marker = 'o'; label = f'Cluster {k}'; alpha = 0.7
+                col = cmap(i % 10); marker = 'o'; alpha = 0.6
+                
+                if true_labels_np is not None:
+                    # Get the true labels for points in THIS cluster
+                    cluster_true_labels = true_labels_np[mask]
+                    
+                    # Find dominant class
+                    counts = Counter(cluster_true_labels)
+                    dominant_class, count = counts.most_common(1)[0]
+                    total = len(cluster_true_labels)
+                    percentage = (count / total) * 100
+                    
+                    # Set the label
+                    label = f"{dominant_class} ({percentage:.1f}%)"
+                else:
+                    label = f"Cluster {k}"
+            # -------------------------------------------
+
+            plt.scatter(X_pca[mask, 0], X_pca[mask, 1], color=[col], label=label, marker=marker, alpha=alpha, s=60)
+
+        # 4. Highlight Top Overlaps
+        if true_labels_np is not None and highlight_top_overlaps > 0:
+            scores, _ = self.calculate_overlap_detailed(k=20, use_pca=use_pca)
+            top_indices = np.argsort(-scores)[:highlight_top_overlaps]
             
-            mask = (self.labels_ == k)
-            plt.scatter(X_pca[mask, 0], X_pca[mask, 1], c=[col], label=label, marker=marker, alpha=alpha, s=70)
+            print(f"\n--- Highlighting Top {highlight_top_overlaps} Overlapping Molecules ---")
+            
+            for idx in top_indices:
+                score = scores[idx]
+                if score == 0: continue 
+                
+                # FIX: Cast numpy int64 to python int
+                py_idx = int(idx)
+                
+                x_coord, y_coord = X_pca[py_idx, 0], X_pca[py_idx, 1]
+                
+                # Retrieve Label/ID for annotation
+                mol_id = "Unknown"
+                if self.meta_df is not None and "mol_id" in self.meta_df.columns:
+                    mol_id = self.meta_df["canonical_smiles"][py_idx]
+                
+                true_lbl = true_labels_np[py_idx]
+                
+                print(f"ID: {mol_id} | True: {true_lbl} | Overlap Score: {score:.2f}")
+
+                plt.scatter(x_coord, y_coord, facecolors='none', edgecolors='red', s=200, linewidth=2, zorder=10)
+                plt.text(x_coord + 0.05, y_coord + 0.05, f"{mol_id}\n({score:.2f})", fontsize=9, color='darkred', weight='bold', zorder=11)
 
         plt.title(f"{self.method_name_.upper()} Clustering (PCA)\n{title_suffix}")
         plt.xlabel("PCA Component 1")
         plt.ylabel("PCA Component 2")
         plt.grid(True, alpha=0.3)
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Cluster (Dominant Class)")
         plt.tight_layout()
+        
         if show:
             plt.show()
 
