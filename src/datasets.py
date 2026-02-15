@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from torch_geometric.datasets import QM9
 from rdkit import Chem
-from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors
+from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
@@ -26,6 +26,13 @@ from rdkit.Chem import Descriptors, rdMolDescriptors
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 import selfies as sf
 from loguru import logger
+
+from transformers import logging as tf_log
+tf_log.set_verbosity_error()
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["REPORT_TO"] = "none"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 #Import the refactored modules
 from utils.file_ops import ensure_directory, validate_columns, validate_size
@@ -115,20 +122,34 @@ class QM9Dataset:
                 "structure_class": struct_class,
 
                 # Physical Properties
-                "mol_weight": Descriptors.MolWt(mol),        # Molecular Weight
-                "logp": Descriptors.MolLogP(mol),            # Lipophilicity
-                "tpsa": Descriptors.TPSA(mol),               # Polar Surface Area
+                "mol_weight": Descriptors.MolWt(mol),        
+                "logp": Descriptors.MolLogP(mol),            
+                "tpsa": Descriptors.TPSA(mol),               
                 
                 # Structural/Complexity Descriptors
                 "num_heavy_atoms": mol.GetNumHeavyAtoms(),
                 "num_rings": rdMolDescriptors.CalcNumRings(mol),
                 "num_aromatic_rings": rdMolDescriptors.CalcNumAromaticRings(mol),
                 
-                # Flexibility Descriptors (Crucial for your Stress Test context)
+                # Flexibility/Complexity
                 "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
-                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol), # 3D complexity
+                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol), 
                 "h_bond_donors": Descriptors.NumHDonors(mol),
                 "h_bond_acceptors": Descriptors.NumHAcceptors(mol),
+
+                # --- NEW: Functional Groups & Fragments ---
+                # These count specific chemical motifs
+                "fr_benzene": Fragments.fr_benzene(mol),           # Benzene rings
+                "fr_alcohol": Fragments.fr_Al_OH(mol),             # Aliphatic alcohols
+                "fr_phenol": Fragments.fr_Ar_OH(mol),              # Aromatic alcohols
+                "fr_amine": Fragments.fr_NH2(mol),                 # Primary amines
+                "fr_amide": Fragments.fr_amide(mol),               # Amide groups
+                "fr_carboxylic_acid": Fragments.fr_COO(mol),       # Carboxylic acids
+                "fr_ester": Fragments.fr_ester(mol),               # Ester groups
+                "fr_ketone": Fragments.fr_ketone(mol),             # Ketones
+                "fr_ether": Fragments.fr_ether(mol),               # Ether linkages
+                "fr_nitro": Fragments.fr_nitro(mol),               # Nitro groups
+                "fr_halogen": rdMolDescriptors.CalcNumHeteroatoms(mol), # Simple heteroatom count
             }
 
             mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
@@ -139,30 +160,48 @@ class QM9Dataset:
         logger.success(f"Saved processed dataset to {self.file_path}")
 
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
-        """Adds 'morgan_fingerprint' column to the dataframe in-place."""
         if "morgan_fingerprint" in self.df.columns: return
-
-        fp_series = MolecularFeaturizer.compute_morgan_fingerprints(
-            self.df["canonical_smiles"], radius, fp_size
+        self.df = self.df.with_columns(
+            MolecularFeaturizer.compute_morgan_fingerprints(
+                self.df["canonical_smiles"], radius, fp_size
+            ).alias("morgan_fingerprint")
         )
-        self.df = self.df.with_columns(fp_series.alias("morgan_fingerprint"))
 
     def add_selfies_transformer(self, model_name: str = "seyonec/ChemBERTa-zinc-base-v1") -> None:
-        """Adds transformer embeddings to the dataframe in-place."""
         if "selfies_transformer" in self.df.columns: return
-        
-        emb_series = MolecularFeaturizer.compute_selfies_transformer(
-            self.df["selfies"], model_name
+        self.df = self.df.with_columns(
+            MolecularFeaturizer.compute_selfies_transformer(
+                self.df["selfies"], model_name
+            )
         )
-        self.df = self.df.with_columns(emb_series)
 
     def add_selfies_onehot(self) -> None:
-        """Adds 'selfies_onehot' column to the dataframe."""
         if "selfies_onehot" in self.df.columns: return
-            
-        onehot_series = MolecularFeaturizer.compute_selfies_onehot(self.df["selfies"])
-        self.df = self.df.with_columns(onehot_series)
-        logger.success("Added One-Hot embeddings to DataFrame.")
+        self.df = self.df.with_columns(
+            MolecularFeaturizer.compute_selfies_onehot(self.df["selfies"])
+        )
+
+    def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
+        """Adds SOAP descriptors to the dataframe."""
+        if "soap_embedding" in self.df.columns: return
+        
+        soap_series = MolecularFeaturizer.compute_soap(
+            self.df["canonical_smiles"], 
+            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma
+        )
+        self.df = self.df.with_columns(soap_series.alias("soap_embedding"))
+        logger.success("Added SOAP embeddings.")
+
+    def add_acsf(self, r_cut=6.0) -> None:
+        """Adds ACSF descriptors to the dataframe."""
+        if "acsf_embedding" in self.df.columns: return
+        
+        acsf_series = MolecularFeaturizer.compute_acsf(
+            self.df["canonical_smiles"], r_cut=r_cut
+        )
+        self.df = self.df.with_columns(acsf_series.alias("acsf_embedding"))
+        logger.success("Added ACSF embeddings.")
+    
 
     def get_distance_matrix(self, metric: str = 'morgan', dist_type: str = 'jaccard') -> 'np.ndarray':
         """Calculates distance matrix using the distance engine."""

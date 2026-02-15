@@ -87,6 +87,37 @@ class ClusterAnalysis:
             print("Not enough clusters for internal metrics.")
 
         return metrics
+    
+    def calculate_overlap(self, k=20):
+        """
+        Calculates how much a point overlaps with different classes.
+        Returns: (overlap_scores, is_overlapping_flag)
+        """
+        if self.true_labels is None:
+            return None, None
+
+        # Use PCA for the neighborhood check (standard practice for high-dim data)
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(self.X)
+
+        nbrs = NearestNeighbors(n_neighbors=k + 1).fit(X_pca)
+        _, indices = nbrs.kneighbors(X_pca)
+
+        overlap_scores = []
+        
+        for i, neighbor_indices in enumerate(indices):
+            others = neighbor_indices[1:]
+            
+            own_class = self.true_labels[i]
+            neighbor_classes = self.true_labels[others]
+            
+            score = np.mean(neighbor_classes != own_class)
+            overlap_scores.append(score)
+
+        overlap_scores = np.array(overlap_scores)
+        is_overlapping = overlap_scores > 0.3 
+        
+        return overlap_scores, is_overlapping
 
     def analyze_mismatches(self):
         """
