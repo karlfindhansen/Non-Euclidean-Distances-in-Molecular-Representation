@@ -181,9 +181,7 @@ class MolecularFeaturizer:
         # 1. LOAD OR INITIALIZE MODEL
         if model_path is not None:
             logger.info(f"Loading trained model from {model_path}...")
-            # Load the full predictor (MPNN + FFN)
             predictor = models.load_model(model_path)
-            # We only want the encoder (MPNN) part, not the final prediction head
             model = predictor.encoder
         else:
             logger.warning("No model_path provided. Using RANDOM (untrained) MPNN weights.")
@@ -213,7 +211,6 @@ class MolecularFeaturizer:
         
         datapoints = [data.MoleculeDatapoint.from_smi(s) for s in valid_smiles]
         
-        # Create Dataset and Loader
         dset = data.MoleculeDataset(datapoints, featurizer=featurizer)
         loader = data.build_dataloader(dset, batch_size=batch_size, shuffle=False, num_workers=0)
 
@@ -229,18 +226,13 @@ class MolecularFeaturizer:
                 if features is not None:
                     features = features.to(device)
                     
-                # 3. Get Atom Descriptors (V_d)
                 atom_descriptors = batch.V_d
                 if atom_descriptors is not None:
                     atom_descriptors = atom_descriptors.to(device)
 
-                # 4. Compute Fingerprint
-                # We pass the unpacked components to the model
                 if hasattr(model, "fingerprint"):
                     batch_vecs = model.fingerprint(batch_graph, V_d=atom_descriptors, X_d=features)
                 else:
-                    # Fallback: Manually run encoder if fingerprint isn't exposed
-                    # (This runs MP + Aggregation)
                     H_v = model.message_passing(batch_graph, V_d=atom_descriptors)
                     batch_vecs = model.aggregator(H_v, batch_graph)
 
