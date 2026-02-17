@@ -99,6 +99,26 @@ def finger_prints():
     
     logger.success("Generated fingerprint cluster reports")
 
+def interactive_clustering(clustering_method, embedding_type):
+    qm9 = QM9Dataset()
+    qm9.load()
+    qm9.add_morgan_fingerprints()
+
+    true_labels = qm9.df['structure_class']
+    num_clusters = len(set(true_labels))
+
+    X = np.array(qm9.df["morgan_fingerprint"].to_list(), dtype=np.float32)
+    analyzer = ClusterAnalysis(X, true_labels=true_labels, meta_df=qm9.df) 
+    _ = analyzer.run(method='kmeans', n_clusters=num_clusters)
+    analyzer.plot_interactive(method='tsne', perplexity=30)
+
+    
+
 if __name__ == "__main__":
-    descriptors()
-    finger_prints()
+    #descriptors()
+    #finger_prints()
+
+    clustering_method = 'kmeans'
+    embedding_type = 'morgan_fingerprint'
+    interactive_clustering(clustering_method, embedding_type)
+    

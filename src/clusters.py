@@ -1,6 +1,7 @@
 import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
+from loguru import logger
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.decomposition import PCA
 from sklearn.metrics import adjusted_rand_score, silhouette_score, calinski_harabasz_score, silhouette_samples
@@ -8,6 +9,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from collections import Counter
+import plotly.express as px
+from sklearn.manifold import TSNE
 
 class ClusterAnalysis:
     def __init__(self, X, true_labels=None, meta_df=None):
@@ -393,6 +396,163 @@ class ClusterAnalysis:
         
         if show:
             plt.show()
+
+    def plot_tsne(self, show=False, title_suffix="", perplexity=30, n_iter=1000, highlight_top_overlaps=5):
+        """
+        Visualizes the clustering using t-SNE (Non-linear embedding).
+        
+        Args:
+            perplexity (int): Balance between local and global structure (5-50).
+            highlight_borderline (int): Highlights correct but visually stranded points.
+        """
+        if self.labels_ is None:
+            print("Run clustering first.")
+            return
+
+        print(f"--- Running t-SNE (Perplexity={perplexity})... ---")
+        
+        # 1. OPTIMIZATION: Reduce to 50 dims with PCA first if data is huge
+        # This is standard practice to remove noise and speed up t-SNE
+        if self.X.shape[1] > 50:
+            logger.info(f"Reducing dimensions from {self.X.shape[1]} to 50 via PCA before t-SNE...")
+            X_pre = PCA(n_components=50).fit_transform(self.X)
+        else:
+            X_pre = self.X
+
+        # 2. Run t-SNE
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca', learning_rate='auto')
+        X_tsne = tsne.fit_transform(X_pre)
+        
+        plt.figure(figsize=(12, 8))
+        
+        # 3. Prepare True Labels
+        if self.true_labels is not None:
+            true_labels_np = np.array(self.true_labels) if not hasattr(self.true_labels, 'to_numpy') else self.true_labels.to_numpy()
+        else:
+            true_labels_np = None
+
+        # 4. Plot Clusters
+        unique_labels = np.unique(self.labels_)
+        cmap = plt.get_cmap('tab10') if len(unique_labels) <= 10 else plt.get_cmap('viridis')
+
+        for i, k in enumerate(unique_labels):
+            # Create a mask for points in this cluster
+            mask = (self.labels_ == k)
+            
+            # --- NEW: Calculate Dominant Class Logic ---
+            if k == -1:
+                col = 'k'; marker = 'x'; label = 'Noise'; alpha = 0.3
+            else:
+                col = cmap(i % 10); marker = 'o'; alpha = 0.6
+                
+                if true_labels_np is not None:
+                    # Get the true labels for points in THIS cluster
+                    cluster_true_labels = true_labels_np[mask]
+                    
+                    # Find dominant class
+                    counts = Counter(cluster_true_labels)
+                    dominant_class, count = counts.most_common(1)[0]
+                    total = len(cluster_true_labels)
+                    percentage = (count / total) * 100
+                    
+                    # Set the label
+                    label = f"{dominant_class} ({percentage:.1f}%)"
+                else:
+                    label = f"Cluster {k}"
+            # -------------------------------------------
+
+            plt.scatter(X_tsne[mask, 0], X_tsne[mask, 1], color=[col], label=label, marker=marker, alpha=alpha, s=60)
+
+        # 4. Highlight Top Overlaps
+        if true_labels_np is not None and highlight_top_overlaps > 0:
+            scores, _ = self.calculate_overlap_detailed(k=20)
+            top_indices = np.argsort(-scores)[:highlight_top_overlaps]
+            
+            print(f"\n--- Highlighting Top {highlight_top_overlaps} Overlapping Molecules ---")
+            
+            for idx in top_indices:
+                score = scores[idx]
+                if score == 0: continue 
+                
+                # FIX: Cast numpy int64 to python int
+                py_idx = int(idx)
+                
+                x_coord, y_coord = X_tsne[py_idx, 0], X_tsne[py_idx, 1]
+                
+                # Retrieve Label/ID for annotation
+                mol_id = "Unknown"
+                if self.meta_df is not None and "mol_id" in self.meta_df.columns:
+                    mol_id = self.meta_df["canonical_smiles"][py_idx]
+                
+                true_lbl = true_labels_np[py_idx]
+                
+                print(f"ID: {mol_id} | True: {true_lbl} | Overlap Score: {score:.2f}")
+
+                plt.scatter(x_coord, y_coord, facecolors='none', edgecolors='red', s=200, linewidth=2, zorder=10)
+                plt.text(x_coord + 0.05, y_coord + 0.05, f"{mol_id}\n({score:.2f})", fontsize=9, color='darkred', weight='bold', zorder=11)
+
+        plt.title(f"{self.method_name_.upper()} Clustering (t-SNE Visualization)\n{title_suffix}")
+        plt.xlabel("t-SNE Dimension 1")
+        plt.ylabel("t-SNE Dimension 2")
+        plt.grid(True, alpha=0.3)
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Cluster (Dominant Class)")
+        plt.tight_layout()
+        
+        if show:
+            plt.show()
+
+    def plot_interactive(self, method='tsne', perplexity=30):
+        """
+        Generates an interactive HTML plot using Plotly.
+        Allows hovering to see SMILES, ID, and detailed info.
+        """
+        if self.labels_ is None:
+            print("Run clustering first.")
+            return
+
+        print(f"Generating interactive {method.upper()} plot...")
+        
+        # 1. Prepare Data Projection
+        if method == 'tsne':
+            from sklearn.manifold import TSNE
+            # Use PCA first if needed for speed
+            X_in = PCA(n_components=50).fit_transform(self.X) if self.X.shape[1] > 50 else self.X
+            projections = TSNE(n_components=2, perplexity=perplexity, random_state=42).fit_transform(X_in)
+            x_col, y_col = "t-SNE 1", "t-SNE 2"
+        else:
+            projections = PCA(n_components=2).fit_transform(self.X)
+            x_col, y_col = "PCA 1", "PCA 2"
+
+        # 2. Build a Temporary DataFrame for Plotting
+        # We need everything in one place for Plotly to read it
+        plot_df = pl.DataFrame({
+            x_col: projections[:, 0],
+            y_col: projections[:, 1],
+            "Cluster": [f"Cluster {l}" for l in self.labels_],
+            "True_Class": self.true_labels if self.true_labels is not None else ["Unknown"]*len(self.labels_)
+        })
+        
+        # Add Metadata (SMILES/IDs) if available
+        if self.meta_df is not None:
+            if "mol_id" in self.meta_df.columns:
+                plot_df = plot_df.with_columns(self.meta_df["mol_id"])
+            if "canonical_smiles" in self.meta_df.columns:
+                plot_df = plot_df.with_columns(self.meta_df["canonical_smiles"])
+
+        # 3. Create Plot
+        fig = px.scatter(
+            plot_df.to_pandas(), # Plotly likes Pandas better
+            x=x_col, y=y_col,
+            color="Cluster",
+            symbol="True_Class", # Different shapes for True Classes
+            hover_data=["mol_id", "canonical_smiles", "True_Class"], # <--- The Magic
+            title=f"Interactive {method.upper()} Clustering",
+            template="plotly_white",
+            width=1000, height=800
+        )
+        
+        fig.update_traces(marker=dict(size=8, opacity=0.7, line=dict(width=0.5, color='DarkSlateGrey')))
+        fig.show()
 
     def get_summary_df(self):
         """Returns summary dataframe."""

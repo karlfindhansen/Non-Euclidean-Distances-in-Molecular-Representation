@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "altair>=6.0.0",
     "ase>=3.27.0",
     "ase-db-backends>=0.11.0",
     "dscribe>=2.1.2",
@@ -14,6 +15,7 @@ dependencies = [
     "lmdb>=1.7.5",
     "loguru>=0.7.3",
     "mp-api>=0.46.0",
+    "nbformat>=5.10.4",
     "numba>=0.63.1",
     "polars>=1.38.0",
     "pyarrow>=23.0.0",
