@@ -1,3 +1,8 @@
+from utils.file_ops import ensure_directory, validate_columns, validate_size
+from src.features import MolecularFeaturizer
+from src.geometry import GeometryPerturber
+from src.distance import DistanceCalculator
+
 import os
 import polars as pl
 import numpy as np
@@ -18,27 +23,12 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.spatial.transform import Rotation
 from sklearn.preprocessing import StandardScaler
 
-import os
-import polars as pl
-from torch_geometric.datasets import QM9
-from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors
-from rdkit.Chem.rdMolDescriptors import CalcMolFormula
-import selfies as sf
-from loguru import logger
-
 from transformers import logging as tf_log
 tf_log.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["REPORT_TO"] = "none"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-
-#Import the refactored modules
-from utils.file_ops import ensure_directory, validate_columns, validate_size
-from src.features import MolecularFeaturizer
-from src.geometry import GeometryPerturber
-from src.distance import DistanceCalculator
 
 class QM9Dataset:
     """
@@ -220,6 +210,23 @@ class QM9Dataset:
         )
         self.df = self.df.with_columns(acsf_series.alias("acsf_embedding"))
         logger.success("Added ACSF embeddings.")
+
+    def add_chemprop(
+        self,
+        model_path: str | None = None,
+        batch_size: int = 64
+    ) -> None:
+
+        if "chemprop_embedding" in self.df.columns:
+            return
+
+        self.df = self.df.with_columns(
+            MolecularFeaturizer.compute_chemprop_embeddings(
+                self.df["canonical_smiles"],
+                model_path=model_path,
+                batch_size=batch_size
+            ).alias("chemprop_embedding")
+        )
     
 
     def get_distance_matrix(self, metric: str = 'morgan', dist_type: str = 'jaccard') -> 'np.ndarray':

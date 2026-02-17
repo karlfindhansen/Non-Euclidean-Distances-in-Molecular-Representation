@@ -102,23 +102,35 @@ def finger_prints():
 def interactive_clustering(clustering_method, embedding_type):
     qm9 = QM9Dataset()
     qm9.load()
-    qm9.add_morgan_fingerprints()
+    if embedding_type == 'soap_embedding':
+        qm9.add_soap()
+    elif embedding_type == 'acsf_embedding':
+        qm9.add_acsf()
+    elif embedding_type == 'chemprop_embedding':
+        qm9.add_chemprop()
+    elif embedding_type == 'morgan_fingerprint':
+        qm9.add_morgan_fingerprints()
+    elif embedding_type == 'selfies_transformer':
+        qm9.add_selfies_transformer()
+    elif embedding_type == 'selfies_onehot':
+        qm9.add_selfies_onehot()
+    else:
+        raise ValueError(f"Unknown embedding type: {embedding_type}")
 
     true_labels = qm9.df['structure_class']
     num_clusters = len(set(true_labels))
 
-    X = np.array(qm9.df["morgan_fingerprint"].to_list(), dtype=np.float32)
+    X = np.array(qm9.df[embedding_type].to_list(), dtype=np.float32)
     analyzer = ClusterAnalysis(X, true_labels=true_labels, meta_df=qm9.df) 
-    _ = analyzer.run(method='kmeans', n_clusters=num_clusters)
+    _ = analyzer.run(method=clustering_method, n_clusters=num_clusters)
     analyzer.plot_interactive(method='tsne', perplexity=30)
 
-    
 
 if __name__ == "__main__":
     #descriptors()
     #finger_prints()
 
     clustering_method = 'kmeans'
-    embedding_type = 'morgan_fingerprint'
+    embedding_type = 'chemprop_embedding'
     interactive_clustering(clustering_method, embedding_type)
     

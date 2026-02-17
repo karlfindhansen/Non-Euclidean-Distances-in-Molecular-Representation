@@ -8,6 +8,7 @@ dependencies = [
     "altair>=6.0.0",
     "ase>=3.27.0",
     "ase-db-backends>=0.11.0",
+    "chemprop>=2.2.2",
     "dscribe>=2.1.2",
     "fairchem-core>=2.7.1",
     "h5py>=3.15.1",
