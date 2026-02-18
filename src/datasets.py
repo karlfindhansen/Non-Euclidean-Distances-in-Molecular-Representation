@@ -18,6 +18,7 @@ from ase import Atoms
 from ase.io import write, read
 import selfies as sf
 import torch
+from tqdm import tqdm 
 from transformers import AutoTokenizer, AutoModel
 from scipy.spatial.distance import pdist, squareform
 from scipy.spatial.transform import Rotation
@@ -41,7 +42,7 @@ class QM9Dataset:
         "u", "h", "g", "cv", "u0_atom", "u_atom", "h_atom", "g_atom", 
         "A", "B", "C"
     ]
-    REQUIRED_COLUMNS = {"mol_id", "canonical_smiles", "num_atoms", "selfies"}
+    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies"}
 
     def __init__(self, root: str = "data/QM9", filename: str = "dataset_cleaned.csv", subset_size: int = 2000):
         self.root = root
@@ -104,9 +105,12 @@ class QM9Dataset:
                 struct_class = "Aliphatic Ring"
             
             # Basic Featurization
+            smiles = Chem.MolToSmiles(mol, canonical=False)
             canonical = Chem.MolToSmiles(mol, canonical=True)
+
             mol_dict = {
                 "mol_id": f"qm9_{i}",
+                "smiles": smiles, 
                 "canonical_smiles": canonical,
                 "selfies": sf.encoder(canonical),
                 "num_atoms": int(data.num_nodes),
@@ -161,7 +165,8 @@ class QM9Dataset:
         self.df = (
             self.df
             .filter(valid_mask)         
-            .head(self.subset_size)     
+            .unique(subset=["canonical_smiles"], keep="first")     
+            .head(self.subset_size)
             .drop(["soap_embedding", "acsf_embedding"])
         )
 
@@ -295,157 +300,179 @@ class QM9Dataset:
         self.df = self.df.with_columns([scaled_df[col] for col in columns])
     
 
-class MaterialsProjectLoader():
-    """
-    Loader for Materials Project crystallographic data.
-    
-    Handles fetching and caching of stable oxide materials from the Materials Project API.
-    """
-    
-    REQUIRED_COLUMNS = {"material_id", "formula_pretty", "energy_per_atom"}
+# TODO: Refractor and Rewrite...
+import json
+from pymatgen.core import Structure
+from tqdm import tqdm
+import polars as pl
+import numpy as np
+from mp_api.client import MPRester
+from loguru import logger
+from pymatgen.io.ase import AseAtomsAdaptor
+from dscribe.descriptors import SOAP, ACSF
 
+class MaterialsProject:
     def __init__(
         self, 
         base_path: str = "data/Materials Project/", 
-        file_name: str = "stable_oxides.csv",
+        file_name: str = "stable_oxides.parquet",
         config_path: str = "config/api_key.json"
     ) -> None:
-        """
-        Initialize Materials Project data loader.
-        
-        Args:
-            base_path: Base directory for Materials Project data storage
-            file_name: Name of the processed CSV file
-            config_path: Path to API key configuration file
-        """
-        self.api_key = self._load_api_key(config_path)
         self.base_path = base_path
         self.file_name = file_name
         self.file_path = os.path.join(self.base_path, self.file_name)
+        self.api_key = self._load_api_key(config_path)
         self.df = pl.DataFrame()
+        os.makedirs(self.base_path, exist_ok=True)
 
-        self._ensure_directory(self.base_path)
-
-    @staticmethod
-    def _load_api_key(config_path: str) -> Optional[str]:
-        """
-        Load API key from configuration file.
-        
-        Args:
-            config_path: Path to JSON config file containing API key
-            
-        Returns:
-            API key string or None if loading fails
-        """
+    def _load_api_key(self, path):
         try:
-            config = pl.read_json(config_path)
-            api_key = config['key'][0]
-            logger.success("Successfully loaded Materials Project API key")
-            return api_key
-        except (FileNotFoundError, KeyError, IndexError, pl.exceptions.ComputeError) as e:
-            logger.warning(f"Could not load API key from {config_path}: {e}")
+            config = pl.read_json(path)
+            # Handle both list and single value formats
+            return config['key'][0] if isinstance(config['key'], (list, pl.Series)) else config['key']
+        except Exception:
             return None
 
-    def load_data(self, force_fetch: bool = False, limit: int = 1000) -> pl.DataFrame:
-        """
-        Load Materials Project data, fetching from API if necessary.
-        
-        Args:
-            force_fetch: If True, fetch fresh data from API regardless of cached file
-            limit: Maximum number of materials to fetch
-            
-        Returns:
-            Polars DataFrame containing materials data
-            
-        Raises:
-            ValueError: If API key is missing or no materials are found
-        """
+    def load(self, force_fetch: bool = False, limit: int = 1000) -> pl.DataFrame:
         if os.path.exists(self.file_path) and not force_fetch:
-            logger.info(f"Found existing cleaned dataset at {self.file_path}. Loading...")
-            try:
-                self.df = pl.read_csv(self.file_path)
-                self._validate_dataframe_columns(self.df, self.REQUIRED_COLUMNS)
-                return self.df
-            except (pl.exceptions.ComputeError, ValueError) as e:
-                logger.error(f"Failed to load or validate existing dataset: {e}")
-                logger.info("Attempting to fetch fresh data from API...")
-        
+            logger.info(f"Loading cached Parquet data from {self.file_path}...")
+            self.df = pl.read_parquet(self.file_path)
+            return self.df
         return self._fetch_from_api(limit)
     
     def _fetch_from_api(self, limit: int) -> pl.DataFrame:
-        """
-        Fetch materials data from Materials Project API.
-        
-        Args:
-            limit: Maximum number of materials to fetch
-            
-        Returns:
-            Polars DataFrame containing materials data
-            
-        Raises:
-            ValueError: If API key is missing
-            RuntimeError: If API request fails
-        """
-        logger.info(f"Fetching up to {limit} stable oxides from Materials Project...")
-        
+        logger.info(f"Fetching {limit} stable oxides from API...")
         if not self.api_key:
-            raise ValueError(
-                "Materials Project API key is missing. "
-                "Please provide valid API key in config file."
+            raise ValueError("API Key not found. Check your config path.")
+
+        with MPRester(self.api_key) as mpr:
+            # Added formation_energy and density for better physical context
+            docs = mpr.materials.summary.search(
+                is_stable=True, 
+                elements=["O"],
+                fields=[
+                    "material_id", "formula_pretty", "structure", 
+                    "symmetry", "energy_per_atom", "formation_energy_per_atom",
+                    "density"
+                ]
             )
-
-        try:
-            with MPRester(self.api_key) as mpr:
-                docs = mpr.materials.summary.search(
-                    is_stable=True,
-                    elements=["O"],
-                    fields=[
-                        "material_id", 
-                        "formula_pretty", 
-                        "structure", 
-                        "symmetry", 
-                        "energy_per_atom", 
-                        "formation_energy_per_atom"
-                    ]
-                )
+            docs = docs[:limit]
+            
+            data_list = []
+            for d in docs:
+                struct = d.structure
+                lat = struct.lattice
                 
-                if not docs:
-                    logger.warning("No materials found matching criteria.")
-                    return pl.DataFrame()
-
-                # Limit results
-                docs = docs[:limit]
-                logger.info(f"Retrieved {len(docs)} materials from API")
-
-                # Convert to dictionaries
-                raw_data = [doc.dict() for doc in docs]
-                raw_df = pl.DataFrame(raw_data)
-
-                logger.info("Flattening nested crystal structures...")
+                struct_json = json.dumps(struct.as_dict())
                 
-                # Extract nested fields
-                self.df = raw_df.with_columns([
-                    pl.col("symmetry").struct.field("crystal_system").alias("crystal_system"),
-                    pl.col("symmetry").struct.field("symbol").alias("space_group"),
-                    
-                    pl.col("structure").struct.field("lattice").struct.field("a").alias("a"),
-                    pl.col("structure").struct.field("lattice").struct.field("b").alias("b"),
-                    pl.col("structure").struct.field("lattice").struct.field("c").alias("c"),
-                    pl.col("structure").struct.field("lattice").struct.field("alpha").alias("alpha"),
-                    pl.col("structure").struct.field("lattice").struct.field("beta").alias("beta"),
-                    pl.col("structure").struct.field("lattice").struct.field("gamma").alias("gamma"),
-                    pl.col("structure").struct.field("lattice").struct.field("volume").alias("volume"),
-                ]).drop(["symmetry", "structure", "fields_not_requested"], strict=False) 
+                data_list.append({
+                    "material_id": str(d.material_id),
+                    "formula_pretty": str(d.formula_pretty),
+                    "energy_per_atom": float(d.energy_per_atom),
+                    "formation_energy_per_atom": float(d.formation_energy_per_atom),
+                    "raw_structure": struct_json,
+                    "crystal_system": str(d.symmetry.crystal_system),
+                    "space_group": str(d.symmetry.symbol),
+                    "density": float(d.density),
+                    # --- GEOMETRIC SUFFICIENCY ---
+                    "a": float(lat.a),
+                    "b": float(lat.b),
+                    "c": float(lat.c),
+                    "alpha": float(lat.alpha),
+                    "beta": float(lat.beta),
+                    "gamma": float(lat.gamma),
+                    "volume": float(struct.volume),
+                    "num_sites": int(len(struct))
+                })
 
-                # Save to file
-                self.df.write_csv(self.file_path)
-                logger.success(f"Cleaned materials dataset saved to {self.file_path}")
-                
-        except ValueError as e:
-            # Re-raise ValueError (e.g., from missing API key)
-            raise
-        except Exception as e:
-            logger.error(f"Materials Project API request failed: {e}")
-            raise RuntimeError(f"Failed to fetch data from Materials Project API: {e}") from e
-
+            self.df = pl.DataFrame(data_list)
+            
+            # Cast to ensure consistency
+            self.df = self.df.with_columns([
+                pl.col("raw_structure").cast(pl.String)
+            ])
+            
+            self.df.write_parquet(self.file_path)
+            logger.success(f"Dataset saved with {len(self.df)} entries.")
+            
         return self.df
+
+    def _get_structures(self):
+        """Reconstructs Pymatgen structures from JSON strings."""
+        logger.info("Reconstructing Pymatgen structures from JSON...")
+        struct_strings = self.df["raw_structure"].to_list()
+        return [Structure.from_dict(json.loads(s)) for s in struct_strings]
+
+    def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
+        """Computes SOAP embeddings and updates the Parquet file."""
+        if "soap_embedding" in self.df.columns:
+            logger.info("SOAP embeddings already exist. Skipping.")
+            return
+        
+        structures = self._get_structures()
+        
+        # Get unique species for the descriptor environment
+        unique_elements = set()
+        for s in structures:
+            unique_elements.update([e.symbol for e in s.composition.elements])
+        species_list = sorted(list(unique_elements))
+        
+        logger.info(f"Computing Periodic SOAP for {len(structures)} structures...")
+        soap_engine = SOAP(
+            species=species_list, 
+            periodic=True,
+            r_cut=r_cut, 
+            n_max=n_max, 
+            l_max=l_max, 
+            sigma=sigma
+        )
+
+        features = []
+        for struct in tqdm(structures, desc="SOAP progress"):
+            try:
+                atoms = AseAtomsAdaptor.get_atoms(struct)
+                # create() returns (n_atoms, n_features), we mean-pool to (n_features,)
+                vec = np.mean(soap_engine.create(atoms), axis=0).tolist()
+                features.append(vec)
+            except Exception as e:
+                logger.warning(f"SOAP failed: {e}")
+                features.append(None)
+
+        self.df = self.df.with_columns(pl.Series("soap_embedding", features))
+        self.df.write_parquet(self.file_path)
+        logger.success("SOAP embeddings added and Parquet updated.")
+
+    def add_acsf(self, r_cut=6.0) -> None:
+        """Computes ACSF embeddings and updates the Parquet file."""
+        if "acsf_embedding" in self.df.columns:
+            logger.info("ACSF embeddings already exist. Skipping.")
+            return
+            
+        structures = self._get_structures()
+        unique_elements = set()
+        for s in structures:
+            unique_elements.update([e.symbol for e in s.composition.elements])
+        species_list = sorted(list(unique_elements))
+
+        logger.info(f"Computing Periodic ACSF for {len(structures)} structures...")
+        acsf_engine = ACSF(
+            species=species_list, 
+            periodic=True, 
+            r_cut=r_cut,
+            g2_params=[[1, 1], [1, 2], [1, 3]],
+            g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]]
+        )
+
+        features = []
+        for struct in tqdm(structures, desc="ACSF progress"):
+            try:
+                atoms = AseAtomsAdaptor.get_atoms(struct)
+                vec = np.mean(acsf_engine.create(atoms), axis=0).tolist()
+                features.append(vec)
+            except Exception as e:
+                logger.warning(f"ACSF failed: {e}")
+                features.append(None)
+
+        self.df = self.df.with_columns(pl.Series("acsf_embedding", features))
+        self.df.write_parquet(self.file_path)
+        logger.success("ACSF embeddings added and Parquet updated.")

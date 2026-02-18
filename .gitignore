@@ -1,5 +1,7 @@
 /data*
 config/api_key.json
+/config*
+*.json
 /.venv*
 __pycache__/
 *.csv
