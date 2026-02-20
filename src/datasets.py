@@ -86,17 +86,19 @@ class QM9Dataset:
         buffer_size = int(self.subset_size * 1.1)
         for i, data in enumerate(dataset):
             if len(data_list) >= buffer_size: break
-            
             smiles = getattr(data, 'smiles', None)
             if not smiles: continue
 
             mol = Chem.MolFromSmiles(smiles)
             if not mol: continue
 
+            mol = Chem.AddHs(mol)
+            res = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            if res != 0: continue
+
             n_rings = rdMolDescriptors.CalcNumRings(mol)
             n_arom = rdMolDescriptors.CalcNumAromaticRings(mol)
 
-            # Determine Structure Class
             if n_rings == 0:
                 struct_class = "Acyclic"
             elif n_arom > 0:
@@ -104,15 +106,16 @@ class QM9Dataset:
             else:
                 struct_class = "Aliphatic Ring"
             
-            # Basic Featurization
-            smiles = Chem.MolToSmiles(mol, canonical=False)
             canonical = Chem.MolToSmiles(mol, canonical=True)
+            selfies_str = sf.encoder(canonical)
+
+            dist_matrix = Chem.GetDistanceMatrix(mol)
 
             mol_dict = {
                 "mol_id": f"qm9_{i}",
                 "smiles": smiles, 
                 "canonical_smiles": canonical,
-                "selfies": sf.encoder(canonical),
+                "selfies": selfies_str,
                 "num_atoms": int(data.num_nodes),
                 "structure_class": struct_class,
 
@@ -126,11 +129,17 @@ class QM9Dataset:
                 "num_rings": rdMolDescriptors.CalcNumRings(mol),
                 "num_aromatic_rings": rdMolDescriptors.CalcNumAromaticRings(mol),
                 
-                # Flexibility/Complexity
+                # Flexibility/Complexity & newly added string/graph complexity metrics
                 "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
-                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol), 
+                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol), # Already captures sp3 fraction
                 "h_bond_donors": Descriptors.NumHDonors(mol),
                 "h_bond_acceptors": Descriptors.NumHAcceptors(mol),
+                
+                # Syntactic and Complexity Descriptors
+                "branching_index": sum(1 for atom in mol.GetAtoms() if atom.GetDegree() > 2),
+                "num_sp_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP),
+                "main_chain_length":  int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
+                "raw_token_count": selfies_str.count('['),
 
                 # These count specific chemical motifs
                 "fr_benzene": Fragments.fr_benzene(mol),           # Benzene rings

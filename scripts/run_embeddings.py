@@ -2,9 +2,6 @@ import sys
 import os
 import torch
 
-# Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from src.datasets import QM9Dataset
 from utils.file_ops import get_device
 from loguru import logger
@@ -14,7 +11,7 @@ def main():
     logger.info(f"Running on device: {device}")
 
     # 1. Initialize
-    loader = QM9Dataset(root="data/QM9", subset_size=100)
+    loader = QM9Dataset()
     loader.load()
 
     # 2. Define Model

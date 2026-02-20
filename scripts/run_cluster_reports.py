@@ -132,5 +132,5 @@ if __name__ == "__main__":
 
     clustering_method = 'kmeans'
     embedding_type = 'morgan_fingerprint'
-    interactive_clustering(clustering_method, embedding_type)
+    #interactive_clustering(clustering_method, embedding_type)
     
