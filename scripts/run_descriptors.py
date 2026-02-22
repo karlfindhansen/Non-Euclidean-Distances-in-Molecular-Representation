@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 from loguru import logger
 
-from src.datasets import QM9Dataset
+from src.datasets import QM9Dataset, MaterialsProject
 from src.descriptors import SOAPDescriptor, ACSFDescriptor
 
 def descriptors_deliverable():
@@ -30,5 +30,14 @@ def descriptors_deliverable():
 
     logger.success(f"Generated descriptor features, with dimensions: SOAP: {soap_matrix.shape}, ACSF: {acsf_matrix.shape}")
 
+def descriptors_mp():
+
+    mp = MaterialsProject()
+    mp.load()
+
+
+
+
 if __name__ == "__main__":
-    descriptors_deliverable()
+    #descriptors_deliverable()
+    descriptors_mp()

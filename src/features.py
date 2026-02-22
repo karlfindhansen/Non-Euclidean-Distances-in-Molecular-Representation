@@ -64,27 +64,47 @@ class MolecularFeaturizer:
         return smiles_series.map_elements(_compute, return_dtype=pl.List(pl.Int8))
 
     @staticmethod
-    def compute_selfies_transformer(selfies_series: pl.Series, model_name: str = "seyonec/ChemBERTa-zinc-base-v1", batch_size: int = 32) -> pl.Series:
-        logger.info(f"Computing Transformer Embeddings ({model_name})...")
+    def compute_selfies_transformer(selfies_series: pl.Series, model_name: str = "ibm-research/materials.selfies-ted", batch_size: int = 32) -> pl.Series:
+        logger.info(f"Computing SELFIES-TED Embeddings ({model_name})...")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModel.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name).to(device)
             model.eval()
         except Exception as e:
             logger.error(f"Model load failed: {e}")
             raise
 
-        # Pre-process inputs
-        clean_selfies = [s if s else "[nop]" for s in selfies_series.to_list()]
+        clean_selfies = [s.replace("][", "] [") if s else "[nop]" for s in selfies_series.to_list()]
         embeddings = []
         
         with torch.no_grad():
             for i in range(0, len(clean_selfies), batch_size):
                 batch = clean_selfies[i : i + batch_size]
-                inputs = tokenizer(batch, padding=True, truncation=True, return_tensors="pt")
-                output = model(**inputs)
-                # Mean pooling over tokens
-                embeddings.extend(output.last_hidden_state.mean(dim=1).tolist())
+                
+                inputs = tokenizer(
+                    batch, 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=128, 
+                    return_tensors="pt"
+                ).to(device)
+                
+                outputs = model.encoder(
+                    input_ids=inputs["input_ids"], 
+                    attention_mask=inputs["attention_mask"]
+                )
+                
+                hidden_states = outputs.last_hidden_state
+                
+                attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(hidden_states.size()).float()
+                sum_embeddings = torch.sum(hidden_states * attention_mask, dim=1)
+                sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
+                mean_pooled = sum_embeddings / sum_mask
+                
+                embeddings.extend(mean_pooled.cpu().tolist())
 
         return pl.Series("selfies_transformer", embeddings)
 
@@ -283,6 +303,9 @@ def get_raw_xyz_features(frames):
     # 1. Get flattened coordinates for all frames
     flat_coords_list = [f.get_positions().flatten() for f in frames]
     
+    print('flat list 1:', flat_coords_list[0])
+    print('flat list 2:', flat_coords_list[1])
+
     # 2. Find the maximum length (3 * max_num_atoms)
     max_len = max(len(c) for c in flat_coords_list)
     

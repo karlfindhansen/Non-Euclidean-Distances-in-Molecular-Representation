@@ -7,22 +7,19 @@ import os
 import polars as pl
 import numpy as np
 from typing import Optional, List, Dict, Any
-from pathlib import Path
 from torch_geometric.datasets import QM9
 from rdkit import Chem
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
-from ase import Atoms
-from ase.io import write, read
-import selfies as sf
-import torch
+import json
 from tqdm import tqdm 
-from transformers import AutoTokenizer, AutoModel
-from scipy.spatial.distance import pdist, squareform
-from scipy.spatial.transform import Rotation
+import selfies as sf
 from sklearn.preprocessing import StandardScaler
+from pymatgen.core import Structure
+from dscribe.descriptors import SOAP, ACSF
+from pymatgen.io.ase import AseAtomsAdaptor
 
 from transformers import logging as tf_log
 tf_log.set_verbosity_error()
@@ -190,7 +187,7 @@ class QM9Dataset:
             ).alias("morgan_fingerprint")
         )
 
-    def add_selfies_transformer(self, model_name: str = "seyonec/ChemBERTa-zinc-base-v1") -> None:
+    def add_selfies_transformer(self, model_name: str = "ibm-research/materials.selfies-ted") -> None:
         if "selfies_transformer" in self.df.columns: return
         self.df = self.df.with_columns(
             MolecularFeaturizer.compute_selfies_transformer(
@@ -277,13 +274,23 @@ class QM9Dataset:
         else:
             raise ValueError(f"Unknown metric: {metric}")
 
-    def run_stress_test(self, num_molecules: int = 10) -> list:
+    def run_stress_test(self, num_molecules: int = 10, rotated: bool = False) -> list:
         """Runs the geometry stress test using the geometry engine."""
-        if os.path.exists(self.geometry_engine.save_path):
-            return self.geometry_engine.load_stress_test()
+        default_path = self.geometry_engine.save_path
+        target_path = (
+            os.path.join(self.root, "stress_test_rotated.xyz")
+            if rotated
+            else default_path
+        )
+
+        if os.path.exists(target_path):
+            return self.geometry_engine.load_stress_test(save_path=target_path)
         
         return self.geometry_engine.generate_stress_test(
-            self.df, num_molecules=num_molecules
+            self.df,
+            num_molecules=num_molecules,
+            rotated=rotated,
+            save_path=target_path
         )
     
     def apply_scaling(self, columns, mode="fit_transform"):
@@ -309,23 +316,12 @@ class QM9Dataset:
         self.df = self.df.with_columns([scaled_df[col] for col in columns])
     
 
-# TODO: Refractor and Rewrite...
-import json
-from pymatgen.core import Structure
-from tqdm import tqdm
-import polars as pl
-import numpy as np
-from mp_api.client import MPRester
-from loguru import logger
-from pymatgen.io.ase import AseAtomsAdaptor
-from dscribe.descriptors import SOAP, ACSF
-
 class MaterialsProject:
     def __init__(
-        self, 
-        base_path: str = "data/Materials Project/", 
+        self,
+        base_path: str = "data/Materials Project/",
         file_name: str = "stable_oxides.parquet",
-        config_path: str = "config/api_key.json"
+        config_path: str = "config/api_key.json",
     ) -> None:
         self.base_path = base_path
         self.file_name = file_name
@@ -334,154 +330,150 @@ class MaterialsProject:
         self.df = pl.DataFrame()
         os.makedirs(self.base_path, exist_ok=True)
 
-    def _load_api_key(self, path):
+    def _load_api_key(self, path: str) -> Optional[str]:
         try:
-            config = pl.read_json(path)
-            # Handle both list and single value formats
-            return config['key'][0] if isinstance(config['key'], (list, pl.Series)) else config['key']
-        except Exception:
+            with open(path, 'r') as f:
+                config = json.load(f)
+            return config.get("key")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Could not load API key from {path}: {e}")
             return None
 
     def load(self, force_fetch: bool = False, limit: int = 1000) -> pl.DataFrame:
         if os.path.exists(self.file_path) and not force_fetch:
             logger.info(f"Loading cached Parquet data from {self.file_path}...")
             self.df = pl.read_parquet(self.file_path)
+            if "soap_embedding" not in self.df.columns or "acsf_embedding" not in self.df.columns:
+                logger.info("Descriptors not found in cached data, computing them now.")
+                self._add_descriptors()
+                self.df.write_parquet(self.file_path)
+                logger.success("Descriptors added and Parquet updated.")
             return self.df
         return self._fetch_from_api(limit)
-    
+
     def _fetch_from_api(self, limit: int) -> pl.DataFrame:
         logger.info(f"Fetching {limit} stable oxides from API...")
         if not self.api_key:
             raise ValueError("API Key not found. Check your config path.")
 
         with MPRester(self.api_key) as mpr:
-            # Added formation_energy and density for better physical context
             docs = mpr.materials.summary.search(
-                is_stable=True, 
+                is_stable=True,
                 elements=["O"],
                 fields=[
-                    "material_id", "formula_pretty", "structure", 
+                    "material_id", "formula_pretty", "structure",
                     "symmetry", "energy_per_atom", "formation_energy_per_atom",
                     "density"
                 ]
             )
-            docs = docs[:limit]
-            
-            data_list = []
-            for d in docs:
-                struct = d.structure
-                lat = struct.lattice
-                
-                struct_json = json.dumps(struct.as_dict())
-                
-                data_list.append({
-                    "material_id": str(d.material_id),
-                    "formula_pretty": str(d.formula_pretty),
-                    "energy_per_atom": float(d.energy_per_atom),
-                    "formation_energy_per_atom": float(d.formation_energy_per_atom),
-                    "raw_structure": struct_json,
-                    "crystal_system": str(d.symmetry.crystal_system),
-                    "space_group": str(d.symmetry.symbol),
-                    "density": float(d.density),
-                    # --- GEOMETRIC SUFFICIENCY ---
-                    "a": float(lat.a),
-                    "b": float(lat.b),
-                    "c": float(lat.c),
-                    "alpha": float(lat.alpha),
-                    "beta": float(lat.beta),
-                    "gamma": float(lat.gamma),
-                    "volume": float(struct.volume),
-                    "num_sites": int(len(struct))
-                })
+            docs = list(mpr.listen(docs, limit=limit))
+
+            data_list = [
+                self._process_doc(d)
+                for d in tqdm(docs, desc="Processing materials")
+            ]
 
             self.df = pl.DataFrame(data_list)
-            
-            # Cast to ensure consistency
-            self.df = self.df.with_columns([
-                pl.col("raw_structure").cast(pl.String)
-            ])
-            
+            self._add_descriptors()
+
             self.df.write_parquet(self.file_path)
             logger.success(f"Dataset saved with {len(self.df)} entries.")
-            
+
         return self.df
 
-    def _get_structures(self):
+    def _process_doc(self, d) -> Dict[str, Any]:
+        struct = d.structure
+        lat = struct.lattice
+        return {
+            "material_id": str(d.material_id),
+            "formula_pretty": str(d.formula_pretty),
+            "energy_per_atom": float(d.energy_per_atom),
+            "formation_energy_per_atom": float(d.formation_energy_per_atom),
+            "raw_structure": json.dumps(struct.as_dict()),
+            "crystal_system": str(d.symmetry.crystal_system),
+            "space_group": str(d.symmetry.symbol),
+            "density": float(d.density),
+            "a": float(lat.a),
+            "b": float(lat.b),
+            "c": float(lat.c),
+            "alpha": float(lat.alpha),
+            "beta": float(lat.beta),
+            "gamma": float(lat.gamma),
+            "volume": float(struct.volume),
+            "num_sites": int(len(struct))
+        }
+
+    def _get_structures(self) -> List[Structure]:
         """Reconstructs Pymatgen structures from JSON strings."""
         logger.info("Reconstructing Pymatgen structures from JSON...")
         struct_strings = self.df["raw_structure"].to_list()
-        return [Structure.from_dict(json.loads(s)) for s in struct_strings]
+        return [Structure.from_dict(json.loads(s)) for s in tqdm(struct_strings, desc="Reconstructing structures")]
 
-    def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
-        """Computes SOAP embeddings and updates the Parquet file."""
-        if "soap_embedding" in self.df.columns:
-            logger.info("SOAP embeddings already exist. Skipping.")
-            return
-        
+    def _add_descriptors(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
+        """Computes and adds SOAP and ACSF descriptors to the DataFrame."""
         structures = self._get_structures()
         
-        # Get unique species for the descriptor environment
-        unique_elements = set()
-        for s in structures:
-            unique_elements.update([e.symbol for e in s.composition.elements])
-        species_list = sorted(list(unique_elements))
+        unique_elements = sorted(list(set(el.symbol for s in structures for el in s.composition.elements)))
         
-        logger.info(f"Computing Periodic SOAP for {len(structures)} structures...")
-        soap_engine = SOAP(
-            species=species_list, 
-            periodic=True,
-            r_cut=r_cut, 
-            n_max=n_max, 
-            l_max=l_max, 
-            sigma=sigma
-        )
+        # Compute SOAP
+        if "soap_embedding" not in self.df.columns:
+            logger.info(f"Computing Periodic SOAP for {len(structures)} structures...")
+            soap_engine = SOAP(species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, sparse=True)
+            soap_features = self._compute_feature(structures, soap_engine, "SOAP")
+            # print the size of the soap features
+            print(f"SOAP features shape: {len(soap_features)} x {len(soap_features[0]) if soap_features else 0}")
+            self.df = self.df.with_columns(pl.Series("soap_embedding", soap_features)) # the problem is here...
+            logger.success("SOAP embeddings added.")
+
+        # Compute ACSF
+        if "acsf_embedding" not in self.df.columns:
+            logger.info(f"Computing Periodic ACSF for {len(structures)} structures...")
+            acsf_engine = ACSF(
+                species=unique_elements, periodic=True, r_cut=r_cut,
+                g2_params=[[1, 1], [1, 2], [1, 3]],
+                g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]]
+            )
+            acsf_features = self._compute_feature(structures, acsf_engine, "ACSF")
+            self.df = self.df.with_columns(pl.Series("acsf_embedding", acsf_features))
+            logger.success("ACSF embeddings added.")
+
+    def _compute_feature(
+        self,
+        structures: List[Structure],
+        engine,
+        desc_name: str,
+        batch_size: int = 32,
+    ) -> List[Optional[List[float]]]:
+        """Compute features in batches for better performance and fewer overhead calls."""
 
         features = []
-        for struct in tqdm(structures, desc="SOAP progress"):
+
+        for i in tqdm(
+            range(0, len(structures), batch_size),
+            desc=f"{desc_name} progress",
+        ):
+            batch_structs = structures[i : i + batch_size]
+
             try:
-                atoms = AseAtomsAdaptor.get_atoms(struct)
-                # create() returns (n_atoms, n_features), we mean-pool to (n_features,)
-                vec = np.mean(soap_engine.create(atoms), axis=0).tolist()
-                features.append(vec)
+                batch_atoms = [
+                    AseAtomsAdaptor.get_atoms(s) for s in batch_structs
+                ]
+
+                batch_out = engine.create(batch_atoms, n_jobs=1)
+
+                for vec in batch_out:
+                    features.append(np.mean(vec, axis=0).tolist())
+
             except Exception as e:
-                logger.warning(f"SOAP failed: {e}")
-                features.append(None)
+                logger.warning(f"{desc_name} batch failed: {e}")
 
-        self.df = self.df.with_columns(pl.Series("soap_embedding", features))
-        self.df.write_parquet(self.file_path)
-        logger.success("SOAP embeddings added and Parquet updated.")
+                for s in batch_structs:
+                    try:
+                        atoms = AseAtomsAdaptor.get_atoms(s)
+                        vec = np.mean(engine.create(atoms, n_jobs=1), axis=0).tolist()
+                        features.append(vec)
+                    except Exception as e2:
+                        logger.warning(f"{desc_name} failed for a structure: {e2}")
+                        features.append(None)
 
-    def add_acsf(self, r_cut=6.0) -> None:
-        """Computes ACSF embeddings and updates the Parquet file."""
-        if "acsf_embedding" in self.df.columns:
-            logger.info("ACSF embeddings already exist. Skipping.")
-            return
-            
-        structures = self._get_structures()
-        unique_elements = set()
-        for s in structures:
-            unique_elements.update([e.symbol for e in s.composition.elements])
-        species_list = sorted(list(unique_elements))
-
-        logger.info(f"Computing Periodic ACSF for {len(structures)} structures...")
-        acsf_engine = ACSF(
-            species=species_list, 
-            periodic=True, 
-            r_cut=r_cut,
-            g2_params=[[1, 1], [1, 2], [1, 3]],
-            g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]]
-        )
-
-        features = []
-        for struct in tqdm(structures, desc="ACSF progress"):
-            try:
-                atoms = AseAtomsAdaptor.get_atoms(struct)
-                vec = np.mean(acsf_engine.create(atoms), axis=0).tolist()
-                features.append(vec)
-            except Exception as e:
-                logger.warning(f"ACSF failed: {e}")
-                features.append(None)
-
-        self.df = self.df.with_columns(pl.Series("acsf_embedding", features))
-        self.df.write_parquet(self.file_path)
-        logger.success("ACSF embeddings added and Parquet updated.")
+        return features

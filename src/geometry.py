@@ -15,13 +15,14 @@ class GeometryPerturber:
     def __init__(self, save_path: str):
         self.save_path = save_path
 
-    def load_stress_test(self) -> List[Atoms]:
+    def load_stress_test(self, save_path: str | None = None) -> List[Atoms]:
         """Loads existing stress test data."""
-        if not os.path.exists(self.save_path):
+        target_path = save_path or self.save_path
+        if not os.path.exists(target_path):
             logger.warning("No stress test file found at path.")
             return []
         try:
-            return read(self.save_path, index=":")
+            return read(target_path, index=":")
         except Exception as e:
             logger.error(f"Failed to read stress test file: {e}")
             return []
@@ -31,20 +32,23 @@ class GeometryPerturber:
         dataframe: pl.DataFrame, 
         num_molecules: int = 10, 
         perturbations: int = 20, 
-        stdev: float = 0.1, 
-        seed: int = 40
+        stdev: float = 0.5, 
+        seed: int = 40,
+        rotated: bool = False,
+        save_path: str | None = None,
     ) -> List[Atoms]:
         """Generates perturbed geometries and saves them."""
-        logger.info(f"Generating Grassmann Stress Test (Seed={seed})...")
+        logger.info(f"Generating Grassmann Stress Test (Seed={seed}, Rotated={rotated})...")
         
         if dataframe.is_empty():
             raise ValueError("DataFrame provided for geometry generation is empty.")
 
+        target_path = save_path or self.save_path
         available = len(dataframe)
         n_sample = min(available, num_molecules)
         
         sample_df = dataframe.sample(n=n_sample, seed=seed)
-        np.random.seed(seed)
+        rng = np.random.default_rng(seed)
         
         all_frames = []
         failed_count = 0
@@ -66,17 +70,24 @@ class GeometryPerturber:
                 
                 base_pos = mol.GetConformer().GetPositions()
                 symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
-
+                
                 for i in range(perturbations):
                     # Create new Atom object for this perturbation
                     pert_atoms = Atoms(symbols=symbols, positions=base_pos.copy())
-                    noise = np.random.normal(0.0, stdev, base_pos.shape)
+                    noise = rng.uniform(0.0, stdev, base_pos.shape)
                     pert_atoms.positions += noise
+                    
+                    if rotated:
+                        angle = rng.uniform(0.0, 360.0)
+                        axis = rng.normal(size=3)
+                        axis /= np.linalg.norm(axis)
+                        pert_atoms.rotate(angle, axis)
                     
                     pert_atoms.info.update({
                         'mol_id': mol_id, 
                         'perturbation_idx': i, 
-                        'smiles': smiles
+                        'smiles': smiles,
+                        'rotated': rotated
                     })
                     all_frames.append(pert_atoms)
 
@@ -88,8 +99,8 @@ class GeometryPerturber:
         logger.info(f"Generated {len(all_frames)} frames. Failed molecules: {failed_count}")
         
         try:
-            write(self.save_path, all_frames)
-            logger.success(f"Saved stress test to {self.save_path}")
+            write(target_path, all_frames)
+            logger.success(f"Saved stress test to {target_path}")
         except Exception as e:
             logger.error(f"Failed to save .xyz file: {e}")
             
