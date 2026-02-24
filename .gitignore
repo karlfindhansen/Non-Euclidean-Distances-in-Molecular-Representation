@@ -8,3 +8,4 @@ __pycache__/
 *.npy
 *.gz
 *.png
+.DS_Store

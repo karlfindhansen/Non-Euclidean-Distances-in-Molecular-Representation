@@ -128,13 +128,15 @@ class QM9Dataset:
                 
                 # Flexibility/Complexity & newly added string/graph complexity metrics
                 "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
-                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol), # Already captures sp3 fraction
+                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol),
                 "h_bond_donors": Descriptors.NumHDonors(mol),
                 "h_bond_acceptors": Descriptors.NumHAcceptors(mol),
                 
                 # Syntactic and Complexity Descriptors
                 "branching_index": sum(1 for atom in mol.GetAtoms() if atom.GetDegree() > 2),
                 "num_sp_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP),
+                "num_sp2_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP2),
+                "num_sp3_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP3),
                 "main_chain_length":  int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
                 "raw_token_count": selfies_str.count('['),
 
@@ -187,7 +189,7 @@ class QM9Dataset:
             ).alias("morgan_fingerprint")
         )
 
-    def add_selfies_transformer(self, model_name: str = "ibm-research/materials.selfies-ted") -> None:
+    def add_selfies_transformer(self, model_name: str = "HUBioDataLab/SELFormer") -> None:
         if "selfies_transformer" in self.df.columns: return
         self.df = self.df.with_columns(
             MolecularFeaturizer.compute_selfies_transformer(
@@ -357,16 +359,32 @@ class MaterialsProject:
             raise ValueError("API Key not found. Check your config path.")
 
         with MPRester(self.api_key) as mpr:
-            docs = mpr.materials.summary.search(
+            query_kwargs = dict(
                 is_stable=True,
                 elements=["O"],
                 fields=[
                     "material_id", "formula_pretty", "structure",
                     "symmetry", "energy_per_atom", "formation_energy_per_atom",
                     "density"
-                ]
+                ],
             )
-            docs = list(mpr.listen(docs, limit=limit))
+
+            # mp-api versions no longer expose mpr.listen; paginate via search instead.
+            chunk_size = min(max(limit, 1), 1000)
+            num_chunks = max((limit + chunk_size - 1) // chunk_size, 1)
+            try:
+                docs = mpr.materials.summary.search(
+                    **query_kwargs,
+                    chunk_size=chunk_size,
+                    num_chunks=num_chunks,
+                )
+            except TypeError:
+                try:
+                    docs = mpr.materials.summary.search(**query_kwargs, limit=limit)
+                except TypeError:
+                    docs = mpr.materials.summary.search(**query_kwargs)
+
+            docs = list(docs)[:limit]
 
             data_list = [
                 self._process_doc(d)

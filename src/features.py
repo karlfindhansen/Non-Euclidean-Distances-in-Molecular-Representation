@@ -64,17 +64,22 @@ class MolecularFeaturizer:
         return smiles_series.map_elements(_compute, return_dtype=pl.List(pl.Int8))
 
     @staticmethod
-    def compute_selfies_transformer(selfies_series: pl.Series, model_name: str = "ibm-research/materials.selfies-ted", batch_size: int = 32) -> pl.Series:
-        logger.info(f"Computing SELFIES-TED Embeddings ({model_name})...")
+    def compute_selfies_transformer(selfies_series: pl.Series, 
+                                    model_name: str = "HUBioDataLab/SELFormer", 
+                                    batch_size: int = 32) -> pl.Series:
+        """
+        Computes molecular embeddings using the SELFormer encoder-only architecture.
+        """
+        logger.info(f"Computing SELFormer Embeddings using {model_name}...")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModel.from_pretrained(model_name).to(device)
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
             model.eval()
         except Exception as e:
-            logger.error(f"Model load failed: {e}")
+            logger.error(f"SELFormer load failed: {e}")
             raise
 
         clean_selfies = [s.replace("][", "] [") if s else "[nop]" for s in selfies_series.to_list()]
@@ -88,20 +93,17 @@ class MolecularFeaturizer:
                     batch, 
                     padding=True, 
                     truncation=True, 
-                    max_length=128, 
+                    max_length=256,
                     return_tensors="pt"
                 ).to(device)
                 
-                outputs = model.encoder(
-                    input_ids=inputs["input_ids"], 
-                    attention_mask=inputs["attention_mask"]
-                )
+                outputs = model(**inputs)
                 
-                hidden_states = outputs.last_hidden_state
+                hidden_states = outputs.last_hidden_state 
                 
-                attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(hidden_states.size()).float()
-                sum_embeddings = torch.sum(hidden_states * attention_mask, dim=1)
-                sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
+                mask = inputs["attention_mask"].unsqueeze(-1).expand(hidden_states.size()).float()
+                sum_embeddings = torch.sum(hidden_states * mask, dim=1)
+                sum_mask = torch.clamp(mask.sum(dim=1), min=1e-9)
                 mean_pooled = sum_embeddings / sum_mask
                 
                 embeddings.extend(mean_pooled.cpu().tolist())
