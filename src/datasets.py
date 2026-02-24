@@ -276,7 +276,12 @@ class QM9Dataset:
         else:
             raise ValueError(f"Unknown metric: {metric}")
 
-    def run_stress_test(self, num_molecules: int = 10, rotated: bool = False) -> list:
+    def run_stress_test(
+        self,
+        num_molecules: int = 10,
+        mol_ids: Optional[List[str]] = None,
+        rotated: bool = False
+    ) -> list:
         """Runs the geometry stress test using the geometry engine."""
         default_path = self.geometry_engine.save_path
         target_path = (
@@ -285,12 +290,16 @@ class QM9Dataset:
             else default_path
         )
 
-        if os.path.exists(target_path):
-            return self.geometry_engine.load_stress_test(save_path=target_path)
+        if os.path.exists(target_path) and mol_ids is None:
+            return self.geometry_engine.load_stress_test(
+                save_path=target_path,
+                mol_ids=mol_ids
+            )
         
         return self.geometry_engine.generate_stress_test(
             self.df,
             num_molecules=num_molecules,
+            mol_ids=mol_ids,
             rotated=rotated,
             save_path=target_path
         )

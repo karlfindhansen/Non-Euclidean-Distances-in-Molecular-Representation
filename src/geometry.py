@@ -4,7 +4,7 @@ from ase import Atoms
 from ase.io import write, read
 from rdkit import Chem
 from rdkit.Chem import AllChem
-from typing import List
+from typing import List, Sequence
 from loguru import logger
 import polars as pl
 
@@ -15,14 +15,28 @@ class GeometryPerturber:
     def __init__(self, save_path: str):
         self.save_path = save_path
 
-    def load_stress_test(self, save_path: str | None = None) -> List[Atoms]:
+    def load_stress_test(
+        self,
+        save_path: str | None = None,
+        mol_ids: Sequence[str] = ["qm9_1237", "qm9_1244", "qm9_1246", "qm9_1248", "qm9_1474", "qm9_1476", "qm9_1478", "qm9_1486", "qm9_1447", "qm9_1449"],
+    ) -> List[Atoms]:
         """Loads existing stress test data."""
         target_path = save_path or self.save_path
         if not os.path.exists(target_path):
             logger.warning("No stress test file found at path.")
             return []
         try:
-            return read(target_path, index=":")
+            frames = read(target_path, index=":")
+            if mol_ids is None:
+                return frames
+
+            wanted_ids = set(mol_ids)
+            filtered_frames = [frame for frame in frames if frame.info.get("mol_id") in wanted_ids]
+            logger.info(
+                f"Loaded {len(filtered_frames)} filtered frames "
+                f"(requested mol_ids={len(wanted_ids)})."
+            )
+            return filtered_frames
         except Exception as e:
             logger.error(f"Failed to read stress test file: {e}")
             return []
@@ -31,6 +45,7 @@ class GeometryPerturber:
         self, 
         dataframe: pl.DataFrame, 
         num_molecules: int = 10, 
+        mol_ids: Sequence[str] | None = None,
         perturbations: int = 20, 
         stdev: float = 0.5, 
         seed: int = 40,
@@ -44,10 +59,19 @@ class GeometryPerturber:
             raise ValueError("DataFrame provided for geometry generation is empty.")
 
         target_path = save_path or self.save_path
-        available = len(dataframe)
-        n_sample = min(available, num_molecules)
-        
-        sample_df = dataframe.sample(n=n_sample, seed=seed)
+        if mol_ids is not None:
+            requested_ids = list(dict.fromkeys(mol_ids))
+            sample_df = dataframe.filter(pl.col("mol_id").is_in(requested_ids))
+            if sample_df.is_empty():
+                raise ValueError("None of the provided mol_ids were found in the dataframe.")
+            missing = sorted(set(requested_ids) - set(sample_df["mol_id"].to_list()))
+            if missing:
+                logger.warning(f"Ignoring {len(missing)} missing mol_ids: {missing}")
+        else:
+            available = len(dataframe)
+            n_sample = min(available, num_molecules)
+            sample_df = dataframe.sample(n=n_sample, seed=seed)
+
         rng = np.random.default_rng(seed)
         
         all_frames = []
