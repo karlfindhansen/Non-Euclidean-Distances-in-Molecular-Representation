@@ -279,6 +279,9 @@ class QM9Dataset:
     def run_stress_test(
         self,
         num_molecules: int = 10,
+        perturbations: int = 20,
+        include_base: bool = True,
+        max_rattle : float = 0.5,
         mol_ids: Optional[List[str]] = None,
         rotated: bool = False
     ) -> list:
@@ -290,7 +293,7 @@ class QM9Dataset:
             else default_path
         )
 
-        if os.path.exists(target_path) and mol_ids is None:
+        if os.path.exists(target_path) and mol_ids is None and not include_base and not max_rattle > 0:
             return self.geometry_engine.load_stress_test(
                 save_path=target_path,
                 mol_ids=mol_ids
@@ -300,9 +303,18 @@ class QM9Dataset:
             self.df,
             num_molecules=num_molecules,
             mol_ids=mol_ids,
+            perturbations=perturbations,
+            include_base=include_base,
             rotated=rotated,
-            save_path=target_path
+            save_path=target_path,
+            max_rattle=max_rattle
         )
+
+    def get_grassmann_distance_matrix(self, frames: List) -> np.ndarray:
+        """
+        Computes a Grassmann distance matrix using only ASE frames as input.
+        """
+        return self.geometry_engine.get_grassmann_distance_matrix(frames)
     
     def apply_scaling(self, columns, mode="fit_transform"):
         """

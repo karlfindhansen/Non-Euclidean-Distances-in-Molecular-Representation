@@ -12,6 +12,8 @@ from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
 from dscribe.descriptors import SOAP, ACSF
+from typing import Sequence
+
 class MolecularFeaturizer:
     """
     Responsible for converting SMILES/SELFIES into vector representations.
@@ -72,7 +74,7 @@ class MolecularFeaturizer:
         """
         logger.info(f"Computing SELFormer Embeddings using {model_name}...")
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
         
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -321,3 +323,74 @@ def get_raw_xyz_features(frames):
         padded_features.append(vec)
         
     return np.array(padded_features)
+
+class Grassmann:
+    
+    @staticmethod
+    def subspace_features(frames: Sequence[Atoms]) -> np.ndarray:
+        if not frames:
+            raise ValueError("`frames` must contain at least one ASE Atoms object.")
+
+        coords_list = [frame.get_positions() for frame in frames]
+        max_atoms = max(len(coords) for coords in coords_list)
+
+        padded_matrices = []
+        for coords in coords_list:
+            centroid = np.mean(coords, axis=0)
+            centered_coords = coords - centroid
+
+            mat = np.zeros((max_atoms, 3))
+            mat[:len(centered_coords), :] = centered_coords
+            padded_matrices.append(mat)
+
+        return np.array(padded_matrices)
+
+    @staticmethod
+    def bases(matrices: np.ndarray) -> np.ndarray:
+        bases = []
+        for mat in matrices:
+            Q, _ = np.linalg.qr(mat)
+            bases.append(Q)
+        return np.array(bases)
+
+    @staticmethod
+    def distance(Y1: np.ndarray, Y2: np.ndarray) -> float:
+        svd_vals = np.linalg.svd(Y1.T @ Y2, compute_uv=False)
+        svd_vals = np.clip(svd_vals, -1.0, 1.0)
+        angles = np.arccos(svd_vals)
+        return float(np.linalg.norm(angles))
+
+    @classmethod
+    def distance_matrix_from_bases(cls, bases: np.ndarray) -> np.ndarray:
+        num_frames = len(bases)
+        dist_matrix = np.zeros((num_frames, num_frames))
+
+        for i in range(num_frames):
+            for j in range(i + 1, num_frames):
+                dist = cls.distance(bases[i], bases[j])
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+
+        return dist_matrix
+
+    @classmethod
+    def distance_matrix(cls, frames: Sequence[Atoms]) -> np.ndarray:
+        matrices = cls.subspace_features(frames)
+        frame_bases = cls.bases(matrices)
+        return cls.distance_matrix_from_bases(frame_bases)
+
+
+def get_subspace_features(frames):
+    return Grassmann.subspace_features(frames)
+
+
+def get_grassmann_bases(matrices):
+    return Grassmann.bases(matrices)
+
+
+def grassmann_distance(Y1, Y2):
+    return Grassmann.distance(Y1, Y2)
+
+
+def build_distance_matrix(bases):
+    return Grassmann.distance_matrix_from_bases(bases)
