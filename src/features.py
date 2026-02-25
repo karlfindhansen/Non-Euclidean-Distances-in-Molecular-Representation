@@ -325,7 +325,7 @@ def get_raw_xyz_features(frames):
     return np.array(padded_features)
 
 class Grassmann:
-    
+
     @staticmethod
     def subspace_features(frames: Sequence[Atoms]) -> np.ndarray:
         if not frames:
@@ -394,3 +394,99 @@ def grassmann_distance(Y1, Y2):
 
 def build_distance_matrix(bases):
     return Grassmann.distance_matrix_from_bases(bases)
+
+class Riemann:
+    """Riemannian (Shape Space) utilities for molecular frame comparisons."""
+
+    @staticmethod
+    def preshape_features(frames: Sequence['Atoms']) -> np.ndarray:
+        """
+        Returns mean-centered, scale-normalized, padded (N_atoms, 3) matrices.
+        This projects the coordinates onto the "preshape sphere".
+        """
+        if not frames:
+            raise ValueError("`frames` must contain at least one ASE Atoms object.")
+
+        coords_list = [frame.get_positions() for frame in frames]
+        max_atoms = max(len(coords) for coords in coords_list)
+
+        padded_matrices = []
+        for coords in coords_list:
+            # 1. Translation invariance (Mean-centering)
+            centroid = np.mean(coords, axis=0)
+            centered_coords = coords - centroid
+
+            # 2. Scale invariance (Normalize to unit Frobenius norm)
+            # This is standard for Riemannian shape space to ensure all shapes
+            # exist on the same mathematical hypersphere.
+            norm = np.linalg.norm(centered_coords, ord='fro')
+            if norm > 1e-12:
+                centered_coords = centered_coords / norm
+
+            # 3. Padding to ensure equal matrix dimensions
+            mat = np.zeros((max_atoms, 3))
+            mat[:len(centered_coords), :] = centered_coords
+            padded_matrices.append(mat)
+
+        return np.array(padded_matrices)
+
+    @staticmethod
+    def distance(Z1: np.ndarray, Z2: np.ndarray) -> float:
+        """
+        Computes the Riemannian shape distance (Procrustes distance)
+        between two preshape matrices.
+        """
+        # Calculate the inner product matrix of the two shapes
+        M = Z1.T @ Z2
+        
+        # SVD extracts the singular values to find the optimal rotation alignment
+        U, S, Vt = np.linalg.svd(M)
+
+        # Strictly ensure pure rotation (no reflection)
+        # If the determinant is negative, we flip the sign of the smallest singular value
+        det = np.linalg.det(U @ Vt)
+        if det < 0:
+            S[-1] = -S[-1]
+
+        # The trace of the optimal alignment represents the cosine of the geodesic distance
+        trace_val = np.sum(S)
+        
+        # Clip to [-1.0, 1.0] to prevent floating-point errors in arccos
+        trace_val = np.clip(trace_val, -1.0, 1.0)
+
+        # Return the Riemannian geodesic distance on the shape manifold
+        return float(np.arccos(trace_val))
+
+    @classmethod
+    def distance_matrix_from_preshapes(cls, preshapes: np.ndarray) -> np.ndarray:
+        """Builds a symmetric pairwise distance matrix from preshape matrices."""
+        num_frames = len(preshapes)
+        dist_matrix = np.zeros((num_frames, num_frames))
+
+        for i in range(num_frames):
+            for j in range(i + 1, num_frames):
+                dist = cls.distance(preshapes[i], preshapes[j])
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+
+        return dist_matrix
+
+    @classmethod
+    def distance_matrix(cls, frames: Sequence['Atoms']) -> np.ndarray:
+        """
+        Public API: compute Riemannian distance matrix directly from frames.
+        """
+        preshapes = cls.preshape_features(frames)
+        return cls.distance_matrix_from_preshapes(preshapes)
+
+
+# --- Helper functions mirroring your setup ---
+
+def get_preshape_features(frames):
+    return Riemann.preshape_features(frames)
+
+def riemann_distance(Z1, Z2):
+    return Riemann.distance(Z1, Z2)
+
+def build_riemann_distance_matrix(preshapes):
+    return Riemann.distance_matrix_from_preshapes(preshapes)
