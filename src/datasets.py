@@ -6,7 +6,7 @@ from src.distance import DistanceCalculator
 import os
 import polars as pl
 import numpy as np
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from torch_geometric.datasets import QM9
 from rdkit import Chem
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
@@ -41,11 +41,18 @@ class QM9Dataset:
     ]
     REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies"}
 
-    def __init__(self, root: str = "data/QM9", filename: str = "dataset_cleaned.csv", subset_size: int = 2000):
+    def __init__(
+        self,
+        root: str = "data/QM9",
+        filename: str = "dataset_cleaned.csv",
+        subset_size: int = 2000,
+        required_mol_ids: Optional[List[str]] = None,
+    ):
         self.root = root
         self.filename = filename
         self.file_path = os.path.join(root, filename)
         self.subset_size = subset_size
+        self.required_mol_ids = required_mol_ids or []
         self.df = pl.DataFrame()
         self.scaler = StandardScaler()
         self.is_scaled = False
@@ -64,6 +71,13 @@ class QM9Dataset:
                 self.df = pl.read_csv(self.file_path)
                 validate_columns(self.df, self.REQUIRED_COLUMNS)
                 validate_size(self.df, self.subset_size)
+                if self.required_mol_ids:
+                    existing_ids = set(self.df["mol_id"].to_list())
+                    missing_cached = sorted(set(self.required_mol_ids) - existing_ids)
+                    if missing_cached:
+                        raise ValueError(
+                            f"Cached dataset is missing required mol_id(s): {missing_cached}"
+                        )
                 return self.df
             except Exception as e:
                 logger.error(f"Load failed ({e}). Reprocessing...")
@@ -79,10 +93,21 @@ class QM9Dataset:
         except Exception as e:
             raise RuntimeError(f"QM9 download failed: {e}")
 
+        required_set: Set[str] = set(self.required_mol_ids)
+        required_indices = []
+        for mol_id in required_set:
+            if mol_id.startswith("qm9_"):
+                suffix = mol_id.split("qm9_", 1)[1]
+                if suffix.isdigit():
+                    required_indices.append(int(suffix))
+
+        max_required_index = max(required_indices) if required_indices else -1
         data_list = []
         buffer_size = int(self.subset_size * 1.1)
         for i, data in enumerate(dataset):
-            if len(data_list) >= buffer_size: break
+            # Keep iterating until we both have enough candidates and have passed required indices.
+            if len(data_list) >= buffer_size and i >= max_required_index:
+                break
             smiles = getattr(data, 'smiles', None)
             if not smiles: continue
 
@@ -177,12 +202,47 @@ class QM9Dataset:
         
         valid_count = self.df.filter(valid_mask).height
         logger.info(f"Valid molecules (SOAP+ACSF success): {valid_count}")
+        required_df = (
+            self.df.filter(pl.col("mol_id").is_in(list(required_set)))
+            if required_set
+            else pl.DataFrame(schema=self.df.schema)
+        )
+        if required_set:
+            present_required = set(required_df["mol_id"].to_list())
+            missing_required = sorted(required_set - present_required)
+            if missing_required:
+                logger.warning(f"Requested mol_id(s) were not found in processed candidates: {missing_required}")
 
+        non_required_valid = (
+            self.df
+            .filter(valid_mask & ~pl.col("mol_id").is_in(list(required_set)))
+        )
+        if required_df.height > 0:
+            required_canon = set(required_df["canonical_smiles"].to_list())
+            non_required_valid = non_required_valid.filter(
+                ~pl.col("canonical_smiles").is_in(list(required_canon))
+            )
+
+        deduped_non_required = non_required_valid.unique(subset=["canonical_smiles"], keep="first")
+        slots_for_non_required = max(self.subset_size - required_df.height, 0)
+        selected_non_required = deduped_non_required.head(slots_for_non_required)
+
+        if required_df.height > 0:
+            self.df = pl.concat([required_df, selected_non_required], how="vertical_relaxed")
+        else:
+            self.df = selected_non_required
+
+        # Keep deterministic order by QM9 numeric index.
         self.df = (
             self.df
-            .filter(valid_mask)         
-            .unique(subset=["canonical_smiles"], keep="first")     
-            .head(self.subset_size)
+            .with_columns(
+                pl.col("mol_id")
+                .str.replace("qm9_", "")
+                .cast(pl.Int64, strict=False)
+                .alias("_qm9_idx")
+            )
+            .sort("_qm9_idx")
+            .drop("_qm9_idx")
             .drop(["soap_embedding", "acsf_embedding"])
         )
 
