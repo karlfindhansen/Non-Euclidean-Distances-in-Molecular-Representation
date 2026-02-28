@@ -307,9 +307,6 @@ def get_raw_xyz_features(frames):
     # 1. Get flattened coordinates for all frames
     flat_coords_list = [f.get_positions().flatten() for f in frames]
     
-    print('flat list 1:', flat_coords_list[0])
-    print('flat list 2:', flat_coords_list[1])
-
     # 2. Find the maximum length (3 * max_num_atoms)
     max_len = max(len(c) for c in flat_coords_list)
     
@@ -338,7 +335,7 @@ class Grassmann:
         for coords in coords_list:
             centroid = np.mean(coords, axis=0)
             centered_coords = coords - centroid
-
+ 
             mat = np.zeros((max_atoms, 3))
             mat[:len(centered_coords), :] = centered_coords
             padded_matrices.append(mat)
@@ -412,18 +409,13 @@ class Riemann:
 
         padded_matrices = []
         for coords in coords_list:
-            # 1. Translation invariance (Mean-centering)
             centroid = np.mean(coords, axis=0)
             centered_coords = coords - centroid
 
-            # 2. Scale invariance (Normalize to unit Frobenius norm)
-            # This is standard for Riemannian shape space to ensure all shapes
-            # exist on the same mathematical hypersphere.
             norm = np.linalg.norm(centered_coords, ord='fro')
             if norm > 1e-12:
                 centered_coords = centered_coords / norm
 
-            # 3. Padding to ensure equal matrix dimensions
             mat = np.zeros((max_atoms, 3))
             mat[:len(centered_coords), :] = centered_coords
             padded_matrices.append(mat)
@@ -436,25 +428,18 @@ class Riemann:
         Computes the Riemannian shape distance (Procrustes distance)
         between two preshape matrices.
         """
-        # Calculate the inner product matrix of the two shapes
         M = Z1.T @ Z2
         
-        # SVD extracts the singular values to find the optimal rotation alignment
         U, S, Vt = np.linalg.svd(M)
 
-        # Strictly ensure pure rotation (no reflection)
-        # If the determinant is negative, we flip the sign of the smallest singular value
         det = np.linalg.det(U @ Vt)
         if det < 0:
             S[-1] = -S[-1]
 
-        # The trace of the optimal alignment represents the cosine of the geodesic distance
         trace_val = np.sum(S)
         
-        # Clip to [-1.0, 1.0] to prevent floating-point errors in arccos
         trace_val = np.clip(trace_val, -1.0, 1.0)
 
-        # Return the Riemannian geodesic distance on the shape manifold
         return float(np.arccos(trace_val))
 
     @classmethod
@@ -478,9 +463,6 @@ class Riemann:
         """
         preshapes = cls.preshape_features(frames)
         return cls.distance_matrix_from_preshapes(preshapes)
-
-
-# --- Helper functions mirroring your setup ---
 
 def get_preshape_features(frames):
     return Riemann.preshape_features(frames)

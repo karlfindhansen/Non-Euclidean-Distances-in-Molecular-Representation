@@ -117,20 +117,20 @@ class QM9Dataset:
                 "structure_class": struct_class,
 
                 # Physical Properties
-                "mol_weight": Descriptors.MolWt(mol),        
-                "logp": Descriptors.MolLogP(mol),            
-                "tpsa": Descriptors.TPSA(mol),               
+                "mol_weight": int(Descriptors.MolWt(mol)),        
+                "logp": int(Descriptors.MolLogP(mol)),            
+                "tpsa": int(Descriptors.TPSA(mol)),               
                 
                 # Structural/Complexity Descriptors
-                "num_heavy_atoms": mol.GetNumHeavyAtoms(),
-                "num_rings": rdMolDescriptors.CalcNumRings(mol),
-                "num_aromatic_rings": rdMolDescriptors.CalcNumAromaticRings(mol),
+                "num_heavy_atoms": int(mol.GetNumHeavyAtoms()),
+                "num_rings": int(rdMolDescriptors.CalcNumRings(mol)),
+                "num_aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(mol)),
                 
                 # Flexibility/Complexity & newly added string/graph complexity metrics
-                "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
+                "num_rotatable_bonds": int(Descriptors.NumRotatableBonds(mol)),
                 "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol),
-                "h_bond_donors": Descriptors.NumHDonors(mol),
-                "h_bond_acceptors": Descriptors.NumHAcceptors(mol),
+                "h_bond_donors": int(Descriptors.NumHDonors(mol)),
+                "h_bond_acceptors": int(Descriptors.NumHAcceptors(mol)),
                 
                 # Syntactic and Complexity Descriptors
                 "branching_index": sum(1 for atom in mol.GetAtoms() if atom.GetDegree() > 2),
@@ -138,20 +138,20 @@ class QM9Dataset:
                 "num_sp2_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP2),
                 "num_sp3_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP3),
                 "main_chain_length":  int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
-                "raw_token_count": selfies_str.count('['),
+                "raw_token_count": int(selfies_str.count('[')),
 
                 # These count specific chemical motifs
-                "fr_benzene": Fragments.fr_benzene(mol),           # Benzene rings
-                "fr_alcohol": Fragments.fr_Al_OH(mol),             # Aliphatic alcohols
-                "fr_phenol": Fragments.fr_Ar_OH(mol),              # Aromatic alcohols
-                "fr_amine": Fragments.fr_NH2(mol),                 # Primary amines
-                "fr_amide": Fragments.fr_amide(mol),               # Amide groups
-                "fr_carboxylic_acid": Fragments.fr_COO(mol),       # Carboxylic acids
-                "fr_ester": Fragments.fr_ester(mol),               # Ester groups
-                "fr_ketone": Fragments.fr_ketone(mol),             # Ketones
-                "fr_ether": Fragments.fr_ether(mol),               # Ether linkages
-                "fr_nitro": Fragments.fr_nitro(mol),               # Nitro groups
-                "fr_halogen": rdMolDescriptors.CalcNumHeteroatoms(mol), # Simple heteroatom count
+                "fr_benzene": int(Fragments.fr_benzene(mol)),           # Benzene rings
+                "fr_alcohol": int(Fragments.fr_Al_OH(mol)),             # Aliphatic alcohols
+                "fr_phenol": int(Fragments.fr_Ar_OH(mol)),              # Aromatic alcohols
+                "fr_amine": int(Fragments.fr_NH2(mol)),                 # Primary amines
+                "fr_amide": int(Fragments.fr_amide(mol)),               # Amide groups
+                "fr_carboxylic_acid": int(Fragments.fr_COO(mol)),       # Carboxylic acids
+                "fr_ester": int(Fragments.fr_ester(mol)),               # Ester groups
+                "fr_ketone": int(Fragments.fr_ketone(mol)),             # Ketones
+                "fr_ether": int(Fragments.fr_ether(mol)),               # Ether linkages
+                "fr_nitro": int(Fragments.fr_nitro(mol)),               # Nitro groups
+                "fr_halogen": int(rdMolDescriptors.CalcNumHeteroatoms(mol)), # Simple heteroatom count
             }
 
             mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
@@ -166,6 +166,14 @@ class QM9Dataset:
             pl.col("soap_embedding").is_not_null() & 
             pl.col("acsf_embedding").is_not_null()
         )
+
+        invalid_mask = (
+            pl.col("soap_embedding").is_null() | 
+            pl.col("acsf_embedding").is_null()
+        )
+
+        failed_molecules = self.df.filter(invalid_mask)
+        logger.warning(f"Invalid molecules (SOAP+ACSF failure): {failed_molecules.select('mol_id').to_series().to_list()}")
         
         valid_count = self.df.filter(valid_mask).height
         logger.info(f"Valid molecules (SOAP+ACSF success): {valid_count}")
@@ -240,6 +248,41 @@ class QM9Dataset:
                 batch_size=batch_size
             ).alias("chemprop_embedding")
         )
+
+    def add_all_descriptors(
+        self,
+        radius: int = 3,
+        fp_size: int = 2048,
+        model_name: str = "HUBioDataLab/SELFormer",
+        r_cut: float = 6.0,
+        n_max: int = 8,
+        l_max: int = 6,
+        sigma: float = 0.5,
+        include_chemprop: bool = True,
+        chemprop_model_path: str | None = None,
+        chemprop_batch_size: int = 64,
+    ) -> None:
+        """
+        Adds all available QM9 descriptor columns in one call.
+        Existing columns are skipped by each add_* method.
+        """
+        if self.df.is_empty():
+            raise ValueError("Dataset is empty. Call `load()` before adding descriptors.")
+
+        logger.info("Adding all descriptors to QM9 dataframe...")
+        self.add_morgan_fingerprints(radius=radius, fp_size=fp_size)
+        self.add_selfies_transformer(model_name=model_name)
+        self.add_selfies_onehot()
+        self.add_soap(r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma)
+        self.add_acsf(r_cut=r_cut)
+
+        if include_chemprop:
+            self.add_chemprop(
+                model_path=chemprop_model_path,
+                batch_size=chemprop_batch_size
+            )
+
+        logger.success("Finished adding all requested descriptors.")
     
 
     def get_distance_matrix(self, metric: str = 'morgan', dist_type: str = 'jaccard') -> 'np.ndarray':
