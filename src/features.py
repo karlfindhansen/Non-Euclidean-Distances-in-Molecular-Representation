@@ -13,6 +13,9 @@ from chemprop import data, featurizers, models, nn
 from ase import Atoms
 from dscribe.descriptors import SOAP, ACSF
 from typing import Sequence
+from scipy.linalg import subspace_angles
+import geomstats.geometry.spd_matrices as spd
+from pyriemann.utils.distance import distance_riemann, distance_logeuclid
 
 class MolecularFeaturizer:
     """
@@ -322,153 +325,86 @@ def get_raw_xyz_features(frames):
     return np.array(padded_features)
 
 class Grassmann:
-
+    """
+    Task 7.1: Grassmann Manifold (Subspaces)
+    Represents molecules as k-dimensional planes.
+    """
     @staticmethod
-    def subspace_features(frames: Sequence[Atoms]) -> np.ndarray:
-        if not frames:
-            raise ValueError("`frames` must contain at least one ASE Atoms object.")
-
-        coords_list = [frame.get_positions() for frame in frames]
-        max_atoms = max(len(coords) for coords in coords_list)
-
-        padded_matrices = []
-        for coords in coords_list:
-            centroid = np.mean(coords, axis=0)
-            centered_coords = coords - centroid
- 
-            mat = np.zeros((max_atoms, 3))
-            mat[:len(centered_coords), :] = centered_coords
-            padded_matrices.append(mat)
-
-        return np.array(padded_matrices)
-
-    @staticmethod
-    def bases(matrices: np.ndarray) -> np.ndarray:
+    def get_uk_bases(frames: Sequence[Atoms], k: int = 3) -> np.ndarray:
+        """
+        Step A & B: Center coordinates and perform SVD to get 
+        the top-k Left Singular Vectors (Uk).
+        """
         bases = []
-        for mat in matrices:
-            Q, _ = np.linalg.qr(mat)
-            bases.append(Q)
+        for frame in frames:
+            coords = frame.get_positions()
+            centered = coords - np.mean(coords, axis=0)
+            
+            u, s, vh = np.linalg.svd(centered, full_matrices=False)
+            bases.append(u[:, :k])
         return np.array(bases)
 
     @staticmethod
-    def distance(Y1: np.ndarray, Y2: np.ndarray) -> float:
-        svd_vals = np.linalg.svd(Y1.T @ Y2, compute_uv=False)
-        svd_vals = np.clip(svd_vals, -1.0, 1.0)
-        angles = np.arccos(svd_vals)
+    def distance(U1: np.ndarray, U2: np.ndarray) -> float:
+        """
+        Step C: Compute Grassmann Distance using Principal Angles.
+        Note: distance = sqrt(sum(theta_i^2))
+        """
+        angles = subspace_angles(U1, U2)
         return float(np.linalg.norm(angles))
 
     @classmethod
-    def distance_matrix_from_bases(cls, bases: np.ndarray) -> np.ndarray:
+    def distance_matrix(cls, frames: Sequence[Atoms], k: int = 3) -> np.ndarray:
+        bases = cls.get_uk_bases(frames, k=k)
         num_frames = len(bases)
         dist_matrix = np.zeros((num_frames, num_frames))
 
         for i in range(num_frames):
             for j in range(i + 1, num_frames):
                 dist = cls.distance(bases[i], bases[j])
-                dist_matrix[i, j] = dist
-                dist_matrix[j, i] = dist
-
+                dist_matrix[i, j] = dist_matrix[j, i] = dist
         return dist_matrix
-
-    @classmethod
-    def distance_matrix(cls, frames: Sequence[Atoms]) -> np.ndarray:
-        matrices = cls.subspace_features(frames)
-        frame_bases = cls.bases(matrices)
-        return cls.distance_matrix_from_bases(frame_bases)
-
-
-def get_subspace_features(frames):
-    return Grassmann.subspace_features(frames)
-
-
-def get_grassmann_bases(matrices):
-    return Grassmann.bases(matrices)
-
-
-def grassmann_distance(Y1, Y2):
-    return Grassmann.distance(Y1, Y2)
-
-
-def build_distance_matrix(bases):
-    return Grassmann.distance_matrix_from_bases(bases)
 
 class Riemann:
-    """Riemannian (Shape Space) utilities for molecular frame comparisons."""
+
+    _METRICS = {
+        "log-euclidean":    distance_logeuclid,
+        "affine-invariant": distance_riemann,
+    }
 
     @staticmethod
-    def preshape_features(frames: Sequence['Atoms']) -> np.ndarray:
-        """
-        Returns mean-centered, scale-normalized, padded (N_atoms, 3) matrices.
-        This projects the coordinates onto the "preshape sphere".
-        """
-        if not frames:
-            raise ValueError("`frames` must contain at least one ASE Atoms object.")
+    def compute_covariance_matrices(frames: Sequence[Atoms]) -> np.ndarray:
 
-        coords_list = [frame.get_positions() for frame in frames]
-        max_atoms = max(len(coords) for coords in coords_list)
-
-        padded_matrices = []
-        for coords in coords_list:
-            centroid = np.mean(coords, axis=0)
-            centered_coords = coords - centroid
-
-            norm = np.linalg.norm(centered_coords, ord='fro')
-            if norm > 1e-12:
-                centered_coords = centered_coords / norm
-
-            mat = np.zeros((max_atoms, 3))
-            mat[:len(centered_coords), :] = centered_coords
-            padded_matrices.append(mat)
-
-        return np.array(padded_matrices)
-
-    @staticmethod
-    def distance(Z1: np.ndarray, Z2: np.ndarray) -> float:
-        """
-        Computes the Riemannian shape distance (Procrustes distance)
-        between two preshape matrices.
-        """
-        M = Z1.T @ Z2
-        
-        U, S, Vt = np.linalg.svd(M)
-
-        det = np.linalg.det(U @ Vt)
-        if det < 0:
-            S[-1] = -S[-1]
-
-        trace_val = np.sum(S)
-        
-        trace_val = np.clip(trace_val, -1.0, 1.0)
-
-        return float(np.arccos(trace_val))
+        covs = []
+        for frame in frames:
+            positions = frame.get_positions()       
+            cov = np.cov(positions, rowvar=False)   
+            cov += np.eye(cov.shape[0]) * 1e-6     
+            covs.append(cov)
+        return np.array(covs)
 
     @classmethod
-    def distance_matrix_from_preshapes(cls, preshapes: np.ndarray) -> np.ndarray:
-        """Builds a symmetric pairwise distance matrix from preshape matrices."""
-        num_frames = len(preshapes)
-        dist_matrix = np.zeros((num_frames, num_frames))
+    def distance_matrix(
+        cls,
+        frames: Sequence[Atoms],
+        metric_type: str = "log-euclidean",
+    ) -> np.ndarray:
 
-        for i in range(num_frames):
-            for j in range(i + 1, num_frames):
-                dist = cls.distance(preshapes[i], preshapes[j])
-                dist_matrix[i, j] = dist
-                dist_matrix[j, i] = dist
+        key = metric_type.strip().lower().replace("_", "-").replace(" ", "-")
+        metric_fn = cls._METRICS.get(key)
+        if metric_fn is None:
+            raise ValueError(
+                f"Unknown metric_type '{metric_type}'. "
+                f"Choose from: {list(cls._METRICS)}."
+            )
+
+        covs = cls.compute_covariance_matrices(frames)
+        n = len(covs)
+        dist_matrix = np.zeros((n, n))
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = metric_fn(covs[i], covs[j])
+                dist_matrix[i, j] = dist_matrix[j, i] = d
 
         return dist_matrix
-
-    @classmethod
-    def distance_matrix(cls, frames: Sequence['Atoms']) -> np.ndarray:
-        """
-        Public API: compute Riemannian distance matrix directly from frames.
-        """
-        preshapes = cls.preshape_features(frames)
-        return cls.distance_matrix_from_preshapes(preshapes)
-
-def get_preshape_features(frames):
-    return Riemann.preshape_features(frames)
-
-def riemann_distance(Z1, Z2):
-    return Riemann.distance(Z1, Z2)
-
-def build_riemann_distance_matrix(preshapes):
-    return Riemann.distance_matrix_from_preshapes(preshapes)

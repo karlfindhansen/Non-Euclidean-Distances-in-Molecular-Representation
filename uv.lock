@@ -184,6 +184,7 @@ dependencies = [
     { name = "chemprop" },
     { name = "dscribe" },
     { name = "fairchem-core" },
+    { name = "geomstats" },
     { name = "h5py" },
     { name = "ipykernel" },
     { name = "kmedoids" },
@@ -195,6 +196,7 @@ dependencies = [
     { name = "polars" },
     { name = "pyarrow" },
     { name = "pymatgen" },
+    { name = "pyriemann" },
     { name = "pytest" },
     { name = "rdkit" },
     { name = "seaborn" },
@@ -214,6 +216,7 @@ requires-dist = [
     { name = "chemprop", specifier = ">=2.2.2" },
     { name = "dscribe", specifier = ">=2.1.2" },
     { name = "fairchem-core", specifier = ">=2.7.1" },
+    { name = "geomstats", specifier = ">=2.8.0" },
     { name = "h5py", specifier = ">=3.15.1" },
     { name = "ipykernel", specifier = ">=7.1.0" },
     { name = "kmedoids", specifier = ">=0.5.4" },
@@ -225,6 +228,7 @@ requires-dist = [
     { name = "polars", specifier = ">=1.38.0" },
     { name = "pyarrow", specifier = ">=23.0.0" },
     { name = "pymatgen", specifier = ">=2025.10.7" },
+    { name = "pyriemann", specifier = ">=0.10" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "rdkit", specifier = ">=2025.9.4" },
     { name = "seaborn", specifier = ">=0.13.2" },
@@ -1109,6 +1113,24 @@ wheels = [
 [package.optional-dependencies]
 http = [
     { name = "aiohttp" },
+]
+
+[[package]]
+name = "geomstats"
+version = "2.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "joblib" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
+    { name = "pandas", version = "3.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cc/d9/a99cd1b545d0ac3117bc6246e144755559a9a2fed734137db6ec214a083b/geomstats-2.8.0.tar.gz", hash = "sha256:d34df1ed96354859f694dfea2f58080d34f6e82bb0a5e49061d49ec213ef48a0", size = 9887212, upload-time = "2024-09-09T17:41:44.859Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/16/2e/b8e0c53367d4a55338a4dd4e55cfcd560f5a5441f3906a106cee7cf9f1fb/geomstats-2.8.0-py3-none-any.whl", hash = "sha256:bd167c944586cb822c4cd6466fd70fc0819f6eb9a8c0e3de4971de4033ff4276", size = 10467124, upload-time = "2024-09-09T17:41:39.168Z" },
 ]
 
 [[package]]
@@ -3133,6 +3155,22 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a7/53/5bc2532536e921c48366ad1047c1344ccef6afa5e84053f0f6e20a453767/pyre_extensions-0.0.32.tar.gz", hash = "sha256:5396715f14ea56c4d5fd0a88c57ca7e44faa468f905909edd7de4ad90ed85e55", size = 10852, upload-time = "2024-11-22T19:26:44.152Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/7a/9812cb8be9828ab688203c5ac5f743c60652887f0c00995a6f6f19f912bd/pyre_extensions-0.0.32-py3-none-any.whl", hash = "sha256:a63ba6883ab02f4b1a9f372ed4eb4a2f4c6f3d74879aa2725186fdfcfe3e5c68", size = 12766, upload-time = "2024-11-22T19:26:42.465Z" },
+]
+
+[[package]]
+name = "pyriemann"
+version = "0.10"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "joblib" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/13/54/fd13222a054b7ef3f5cb8331bafaf22ea5e46fe3d11227a4cd9b419ac1f3/pyriemann-0.10.tar.gz", hash = "sha256:6debfa8cb58677ea3812f250cb50f6ef194f67b109eda19797467fbcecca9c0a", size = 148576, upload-time = "2026-01-06T07:25:59.899Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/1f/3aaabc8e8eacf5fb00230ae395669a52dce3d9e97877469d31d707fcefc1/pyriemann-0.10-py2.py3-none-any.whl", hash = "sha256:db6411df50d7c1f2d9d7e22fa1c512f892b66226cdaf656cc94c4b67d4b3c20d", size = 132324, upload-time = "2026-01-06T07:25:58.519Z" },
 ]
 
 [[package]]
