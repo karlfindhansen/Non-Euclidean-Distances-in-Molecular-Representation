@@ -87,6 +87,8 @@ class GeometryPerturber:
                 if not mol: raise ValueError("Invalid SMILES")
                 
                 mol = Chem.AddHs(mol)
+                AllChem.ComputeGasteigerCharges(mol)
+                charges = [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()]
                 params = AllChem.ETKDG()
                 params.randomSeed = seed
                 
@@ -97,7 +99,7 @@ class GeometryPerturber:
                 symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
 
                 if include_base:
-                    base_atoms = Atoms(symbols=symbols, positions=base_pos.copy())
+                    base_atoms = Atoms(symbols=symbols, positions=base_pos.copy(), charges=charges)
                     base_atoms.info.update({
                         'mol_id': mol_id,
                         'perturbation_idx': -1,
@@ -109,7 +111,7 @@ class GeometryPerturber:
                 
                 for i in range(perturbations):
                     # Create new Atom object for this perturbation
-                    pert_atoms = Atoms(symbols=symbols, positions=base_pos.copy())
+                    pert_atoms = Atoms(symbols=symbols, positions=base_pos.copy(), charges=charges)
                     noise = rng.uniform(low=-max_rattle, high=max_rattle, size=base_pos.shape)
                     pert_atoms.positions += noise
                     

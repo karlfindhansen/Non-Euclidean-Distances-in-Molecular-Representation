@@ -24,6 +24,7 @@ dependencies = [
     "numba>=0.63.1",
     "persim>=0.3.8",
     "polars>=1.38.0",
+    "pot>=0.9.6.post1",
     "pyarrow>=23.0.0",
     "pymatgen>=2025.10.7",
     "pyriemann>=0.10",
