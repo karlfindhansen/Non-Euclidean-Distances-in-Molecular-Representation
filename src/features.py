@@ -12,10 +12,6 @@ from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
 from dscribe.descriptors import SOAP, ACSF
-from typing import Sequence
-from scipy.linalg import subspace_angles
-import geomstats.geometry.spd_matrices as spd
-from pyriemann.utils.distance import distance_riemann, distance_logeuclid
 
 class MolecularFeaturizer:
     """
@@ -324,87 +320,3 @@ def get_raw_xyz_features(frames):
         
     return np.array(padded_features)
 
-class Grassmann:
-    """
-    Task 7.1: Grassmann Manifold (Subspaces)
-    Represents molecules as k-dimensional planes.
-    """
-    @staticmethod
-    def get_uk_bases(frames: Sequence[Atoms], k: int = 3) -> np.ndarray:
-        """
-        Step A & B: Center coordinates and perform SVD to get 
-        the top-k Left Singular Vectors (Uk).
-        """
-        bases = []
-        for frame in frames:
-            coords = frame.get_positions()
-            centered = coords - np.mean(coords, axis=0)
-            
-            u, s, vh = np.linalg.svd(centered, full_matrices=False)
-            bases.append(u[:, :k])
-        return np.array(bases)
-
-    @staticmethod
-    def distance(U1: np.ndarray, U2: np.ndarray) -> float:
-        """
-        Step C: Compute Grassmann Distance using Principal Angles.
-        Note: distance = sqrt(sum(theta_i^2))
-        """
-        angles = subspace_angles(U1, U2)
-        return float(np.linalg.norm(angles))
-
-    @classmethod
-    def distance_matrix(cls, frames: Sequence[Atoms], k: int = 3) -> np.ndarray:
-        bases = cls.get_uk_bases(frames, k=k)
-        num_frames = len(bases)
-        dist_matrix = np.zeros((num_frames, num_frames))
-
-        for i in range(num_frames):
-            for j in range(i + 1, num_frames):
-                dist = cls.distance(bases[i], bases[j])
-                dist_matrix[i, j] = dist_matrix[j, i] = dist
-        return dist_matrix
-
-class Riemann:
-
-    _METRICS = {
-        "log-euclidean":    distance_logeuclid,
-        "affine-invariant": distance_riemann,
-    }
-
-    @staticmethod
-    def compute_covariance_matrices(frames: Sequence[Atoms]) -> np.ndarray:
-
-        covs = []
-        for frame in frames:
-            positions = frame.get_positions()       
-            cov = np.cov(positions, rowvar=False)   
-            cov += np.eye(cov.shape[0]) * 1e-6     
-            covs.append(cov)
-        return np.array(covs)
-
-    @classmethod
-    def distance_matrix(
-        cls,
-        frames: Sequence[Atoms],
-        metric_type: str = "log-euclidean",
-    ) -> np.ndarray:
-
-        key = metric_type.strip().lower().replace("_", "-").replace(" ", "-")
-        metric_fn = cls._METRICS.get(key)
-        if metric_fn is None:
-            raise ValueError(
-                f"Unknown metric_type '{metric_type}'. "
-                f"Choose from: {list(cls._METRICS)}."
-            )
-
-        covs = cls.compute_covariance_matrices(frames)
-        n = len(covs)
-        dist_matrix = np.zeros((n, n))
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = metric_fn(covs[i], covs[j])
-                dist_matrix[i, j] = dist_matrix[j, i] = d
-
-        return dist_matrix
