@@ -75,8 +75,6 @@ if __name__ == "__main__":
     dist_matrix_xyz = pairwise_distances(xyz_features, metric='euclidean')
     dist_matrix_point_cloud = pairwise_distances(point_clouds, metric='euclidean')
 
-
-
     wasserstein_dist_matrix = Wasserstein.distance_matrix(frames)
 
     persistence_diagrams = PersistentHomology.compute_persistence_diagrams(frames, max_homology_dim=2)
