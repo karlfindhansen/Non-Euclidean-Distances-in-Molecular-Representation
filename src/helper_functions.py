@@ -2,6 +2,13 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from ase import Atoms
 import polars as pl
+import numpy as np
+from typing import Sequence, Optional
+from loguru import logger
+import os
+
+from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
+
 
 def get_structures(df, mol_id_list = None):
     # Extract both the IDs and the SMILES strings
@@ -42,3 +49,90 @@ def get_structures(df, mol_id_list = None):
         valid_indices.append(i)
         
     return structures, valid_indices
+
+
+def align_frames_to_dist_matrix(
+    frames: Sequence[Atoms],
+    dist_matrix: Optional[np.ndarray] = None,
+) -> list[Atoms]:
+    """
+    Ensures frames match a precomputed pairwise distance matrix size.
+    If more frames are provided than the matrix size, truncate deterministically.
+    """
+    aligned_frames = list(frames)
+    if dist_matrix is None:
+        return aligned_frames
+
+    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+        raise ValueError("dist_matrix must be a square matrix.")
+
+    n_frames = len(aligned_frames)
+    n_matrix = int(dist_matrix.shape[0])
+    if n_frames < n_matrix:
+        raise ValueError(
+            f"frames has {n_frames} entries, but dist_matrix requires {n_matrix}."
+        )
+    if n_frames > n_matrix:
+        aligned_frames = aligned_frames[:n_matrix]
+
+    return aligned_frames
+
+def get_distances(frames):
+    data_dir = 'data/QM9'
+    os.makedirs(data_dir, exist_ok=True)
+
+    matrix_tasks = {
+        'grassmann_qr': {
+            'path': f'{data_dir}/dist_matrix_grassmann_qr.npy',
+            'compute': lambda: Grassmann.distance_matrix(frames, method='qr')
+        },
+        'grassmann_svd': {
+            'path': f'{data_dir}/dist_matrix_grassmann_svd.npy',
+            'compute': lambda: Grassmann.distance_matrix(frames, method='svd')
+        },
+        'euclidean_riemann': {
+            'path': f'{data_dir}/dist_matrix_euclidean_riemann.npy',
+            'compute': lambda: Riemann.distance_matrix(frames, metric_type='log-euclidean')
+        },
+        'affine_riemann': {
+            'path': f'{data_dir}/dist_matrix_affine_riemann.npy',
+            'compute': lambda: Riemann.distance_matrix(frames, metric_type='affine-invariant')
+        },
+        'wasserstein': {
+            'path': f'{data_dir}/dist_matrix_wasserstein.npy',
+            'compute': lambda: Wasserstein.distance_matrix(frames)
+        },
+        'ph_bottleneck': {
+            'path': f'{data_dir}/persistent_dist_matrix_bottleneck.npy',
+            'compute': lambda: PersistentHomology.distance_matrix(frames, metric="bottleneck")
+        },
+        'ph_sliced_wasserstein': {
+            'path': f'{data_dir}/persistent_dist_matrix_sw.npy',
+            'compute': lambda: PersistentHomology.distance_matrix(frames, metric="sliced_wasserstein")
+        }
+    }
+
+    matrices = {}
+
+    for name, task in matrix_tasks.items():
+        file_path = task['path']
+        
+        if os.path.exists(file_path):
+            logger.info(f"Loading {name} distance matrix...")
+            matrices[name] = np.load(file_path)
+        else:
+            logger.info(f"Computing {name} distance matrix...")
+            matrices[name] = task['compute']()
+            np.save(file_path, matrices[name])
+
+    logger.success("✓ All distance matrices are ready!")
+    
+    return matrices
+
+if __name__ == '__main__':
+    from src.datasets import QM9Dataset
+    dataset = QM9Dataset()
+    df = dataset.load()
+    frames = dataset.export_subset_xyz()
+    matrices = get_distances(frames)
+    

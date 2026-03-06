@@ -42,11 +42,14 @@ class Wasserstein:
         )
         n = len(frames)
         dist_matrix = np.zeros((n, n))
+        total_pairs = n * (n - 1) // 2
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = cls.compute_distance(frames[i], frames[j], metric=metric)
-                dist_matrix[i, j] = dist_matrix[j, i] = d
+        with tqdm(total=total_pairs, desc="Wasserstein distances", unit="pair") as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = cls.compute_distance(frames[i], frames[j], metric=metric)
+                    dist_matrix[i, j] = dist_matrix[j, i] = d
+                    pbar.update(1)
         logger.debug("Finished Wasserstein distance matrix computation.")
         return dist_matrix
 
@@ -138,11 +141,14 @@ class PersistentHomology:
         dgms = cls.compute_persistence_diagrams(frames, max_homology_dim, backend)
         n = len(dgms)
         dist_mat = np.zeros((n, n))
+        total_pairs = n * (n - 1) // 2
 
-        for i in tqdm(range(n), desc="Computing Persistence Diagram Distance Matrix"):
-            for j in range(i + 1, n):
-                d = cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims)
-                dist_mat[i, j] = dist_mat[j, i] = d
+        with tqdm(total=total_pairs, desc="Persistence distances", unit="pair") as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims)
+                    dist_mat[i, j] = dist_mat[j, i] = d
+                    pbar.update(1)
         logger.debug("Finished persistent homology distance matrix computation.")
         return dist_mat
 
@@ -213,11 +219,14 @@ class Grassmann:
         bases = cls.get_uk_bases(frames, k=k, method=method)
         num_frames = len(bases)
         dist_matrix = np.zeros((num_frames, num_frames))
+        total_pairs = num_frames * (num_frames - 1) // 2
 
-        for i in range(num_frames):
-            for j in range(i + 1, num_frames):
-                dist = cls.distance(bases[i], bases[j])
-                dist_matrix[i, j] = dist_matrix[j, i] = dist
+        with tqdm(total=total_pairs, desc="Grassmann distances", unit="pair") as pbar:
+            for i in range(num_frames):
+                for j in range(i + 1, num_frames):
+                    dist = cls.distance(bases[i], bases[j])
+                    dist_matrix[i, j] = dist_matrix[j, i] = dist
+                    pbar.update(1)
         logger.debug("Finished Grassmann distance matrix computation.")
         return dist_matrix
 
@@ -266,13 +275,14 @@ class Riemann:
         covs = cls.compute_covariance_matrices(frames)
         n = len(covs)
         dist_matrix = np.zeros((n, n))
+        total_pairs = n * (n - 1) // 2
 
-        for i in range(n):
-            for j in range(i + 1, n):
-
-                d = metric_fn(covs[i], covs[j])
-
-                dist_matrix[i, j] = dist_matrix[j, i] = d
+        with tqdm(total=total_pairs, desc="Riemannian distances", unit="pair") as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = metric_fn(covs[i], covs[j])
+                    dist_matrix[i, j] = dist_matrix[j, i] = d
+                    pbar.update(1)
         logger.success("Finished Riemannian distance matrix computation.")
 
         return dist_matrix

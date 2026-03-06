@@ -8,6 +8,8 @@ import polars as pl
 import numpy as np
 from typing import Optional, List, Dict, Any, Set
 from torch_geometric.datasets import QM9
+from ase import Atoms
+from ase.io import write
 from rdkit import Chem
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
@@ -412,6 +414,85 @@ class QM9Dataset:
             save_path=target_path,
             max_rattle=max_rattle
         )
+
+    def export_subset_xyz(
+        self,
+        output_filename: str = "qm9_subset.xyz",
+        subset_size: Optional[int] = None,
+        seed: int = 40,
+    ) -> List[Atoms]:
+        """
+        Export QM9 molecules to a single .xyz file.
+        Uses extxyz format so atom-level arrays (mass, partial charge) are preserved.
+        """
+        if self.df.is_empty():
+            self.load()
+
+        target_size = subset_size if subset_size is not None else self.subset_size
+        if target_size <= 0:
+            raise ValueError("subset_size must be a positive integer.")
+
+        sample_df = self.df.head(min(target_size, self.df.height))
+        if sample_df.is_empty():
+            raise ValueError("No molecules available to export.")
+
+        frames: List[Atoms] = []
+        failed_count = 0
+
+        for row in sample_df.iter_rows(named=True):
+            mol_id = row["mol_id"]
+            smiles = row["canonical_smiles"]
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    raise ValueError("Invalid SMILES.")
+
+                mol = Chem.AddHs(mol)
+                AllChem.ComputeGasteigerCharges(mol)
+
+                params = AllChem.ETKDG()
+                params.randomSeed = seed
+                if AllChem.EmbedMolecule(mol, params) == -1:
+                    raise ValueError("Embedding failed.")
+
+                conf = mol.GetConformer()
+                symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
+                positions = conf.GetPositions()
+                charges = np.array(
+                    [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
+                    dtype=np.float64,
+                )
+
+                atoms = Atoms(symbols=symbols, positions=positions)
+                masses = atoms.get_masses()
+                atoms.set_initial_charges(charges)
+                # Keep explicit arrays for tools expecting named per-atom properties.
+                atoms.arrays["partial_charge"] = charges
+                atoms.arrays["mass"] = masses
+                atoms.info.update(
+                    {
+                        "mol_id": mol_id,
+                        "smiles": smiles,
+                        "num_atoms": int(len(atoms)),
+                        "total_mass": float(np.sum(masses)),
+                        "mean_partial_charge": float(np.mean(charges)),
+                    }
+                )
+                frames.append(atoms)
+            except Exception as e:
+                logger.debug(f"Skipping {mol_id}: {e}")
+                failed_count += 1
+
+        if not frames:
+            raise ValueError("Failed to generate geometries for all selected molecules.")
+
+        output_path = os.path.join(self.root, output_filename)
+        write(output_path, frames, format="extxyz")
+        logger.success(
+            f"Saved {len(frames)} molecules to {output_path} "
+            f"(failed: {failed_count}, requested: {target_size})."
+        )
+        return frames
 
     def get_grassmann_distance_matrix(self, frames: List) -> np.ndarray:
         """
