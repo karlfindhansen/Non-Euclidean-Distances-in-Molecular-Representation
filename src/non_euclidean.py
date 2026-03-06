@@ -116,6 +116,11 @@ class PersistentHomology:
         for d in dims:
             p1, p2 = dgm1.get(d, np.empty((0, 2))), dgm2.get(d, np.empty((0, 2)))
             
+            if len(p1) > 0:
+                p1 = p1[np.isfinite(p1[:, 1])]
+            if len(p2) > 0:
+                p2 = p2[np.isfinite(p2[:, 1])]
+            
             if metric_key in {"bottleneck", "b"}:
                 total_dist += persim.bottleneck(p1, p2)
             else:

@@ -41,6 +41,18 @@ class QM9Dataset:
         "u", "h", "g", "cv", "u0_atom", "u_atom", "h_atom", "g_atom", 
         "A", "B", "C"
     ]
+    FUNCTIONAL_GROUP_DETECTORS = {
+        "benzene": Fragments.fr_benzene,
+        "alcohol": Fragments.fr_Al_OH,
+        "phenol": Fragments.fr_Ar_OH,
+        "amine": Fragments.fr_NH2,
+        "amide": Fragments.fr_amide,
+        "carboxylic_acid": Fragments.fr_COO,
+        "ester": Fragments.fr_ester,
+        "ketone": Fragments.fr_ketone,
+        "ether": Fragments.fr_ether,
+        "nitro": Fragments.fr_nitro,
+    }
     REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies"}
 
     def __init__(
@@ -64,6 +76,32 @@ class QM9Dataset:
         # Initialize Sub-Components
         self.geometry_engine = GeometryPerturber(save_path=os.path.join(root, "stress_test.xyz"))
         self.distance_engine = DistanceCalculator(cache_dir=root)
+
+    @staticmethod
+    def _classify_structure_type(mol: Chem.Mol) -> str:
+        """Classify molecule topology as aromatic, acyclic, or cyclic."""
+        n_rings = rdMolDescriptors.CalcNumRings(mol)
+        n_arom = rdMolDescriptors.CalcNumAromaticRings(mol)
+        if n_rings == 0:
+            return "acyclic"
+        if n_arom > 0:
+            return "aromatic"
+        return "cyclic"
+
+    @classmethod
+    def _detect_functional_groups(cls, mol: Chem.Mol) -> List[str]:
+        """Return a compact list of detected functional-group labels."""
+        groups = [
+            name for name, detector in cls.FUNCTIONAL_GROUP_DETECTORS.items()
+            if int(detector(mol)) > 0
+        ]
+        has_halogen = any(
+            atom.GetAtomicNum() in {9, 17, 35, 53}
+            for atom in mol.GetAtoms()
+        )
+        if has_halogen:
+            groups.append("halogen")
+        return groups
 
     def load(self, force_process: bool = False) -> pl.DataFrame:
         """Loads the main dataset, processing if necessary."""
@@ -120,12 +158,10 @@ class QM9Dataset:
             res = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
             if res != 0: continue
 
-            n_rings = rdMolDescriptors.CalcNumRings(mol)
-            n_arom = rdMolDescriptors.CalcNumAromaticRings(mol)
-
-            if n_rings == 0:
+            structure_type = self._classify_structure_type(mol)
+            if structure_type == "acyclic":
                 struct_class = "Acyclic"
-            elif n_arom > 0:
+            elif structure_type == "aromatic":
                 struct_class = "Aromatic"
             else:
                 struct_class = "Aliphatic Ring"
@@ -462,6 +498,13 @@ class QM9Dataset:
                     [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
                     dtype=np.float64,
                 )
+                heavy_atom_count = int(mol.GetNumHeavyAtoms())
+                element_counts = {"C": 0, "N": 0, "O": 0, "F": 0}
+                for atom in mol.GetAtoms():
+                    symbol = atom.GetSymbol()
+                    if symbol in element_counts:
+                        element_counts[symbol] += 1
+                heavy_atom_denom = float(heavy_atom_count) if heavy_atom_count > 0 else 1.0
 
                 atoms = Atoms(symbols=symbols, positions=positions)
                 masses = atoms.get_masses()
@@ -473,6 +516,23 @@ class QM9Dataset:
                     {
                         "mol_id": mol_id,
                         "smiles": smiles,
+                        "structure_type": self._classify_structure_type(mol),
+                        "functional_groups": ",".join(self._detect_functional_groups(mol)),
+                        "heavy_atom_count": heavy_atom_count,
+                        "element_count_C": int(element_counts["C"]),
+                        "element_count_N": int(element_counts["N"]),
+                        "element_count_O": int(element_counts["O"]),
+                        "element_count_F": int(element_counts["F"]),
+                        "element_ratio_C": float(element_counts["C"] / heavy_atom_denom),
+                        "element_ratio_N": float(element_counts["N"] / heavy_atom_denom),
+                        "element_ratio_O": float(element_counts["O"] / heavy_atom_denom),
+                        "element_ratio_F": float(element_counts["F"] / heavy_atom_denom),
+                        "mu": float(row["mu"]) if row.get("mu") is not None else None,
+                        "gap": float(row["gap"]) if row.get("gap") is not None else None,
+                        "cv": float(row["cv"]) if row.get("cv") is not None else None,
+                        "u0": float(row["u0"]) if row.get("u0") is not None else None,
+                        "homo": float(row["homo"]) if row.get("homo") is not None else None,
+                        "lumo": float(row["lumo"]) if row.get("lumo") is not None else None,
                         "num_atoms": int(len(atoms)),
                         "total_mass": float(np.sum(masses)),
                         "mean_partial_charge": float(np.mean(charges)),
