@@ -224,22 +224,28 @@ class QM9Dataset:
 
         self.add_soap()
         self.add_acsf()
+        self.add_coulomb_matrix()
 
         valid_mask = (
             pl.col("soap_embedding").is_not_null() & 
-            pl.col("acsf_embedding").is_not_null()
+            pl.col("acsf_embedding").is_not_null() &
+            pl.col("coulomb_matrix").is_not_null()
         )
 
         invalid_mask = (
             pl.col("soap_embedding").is_null() | 
-            pl.col("acsf_embedding").is_null()
+            pl.col("acsf_embedding").is_null() |
+            pl.col("coulomb_matrix").is_null()
         )
 
         failed_molecules = self.df.filter(invalid_mask)
-        logger.warning(f"Invalid molecules (SOAP+ACSF failure): {failed_molecules.select('mol_id').to_series().to_list()}")
+        logger.warning(
+            "Invalid molecules (SOAP+ACSF+Coulomb failure): "
+            f"{failed_molecules.select('mol_id').to_series().to_list()}"
+        )
         
         valid_count = self.df.filter(valid_mask).height
-        logger.info(f"Valid molecules (SOAP+ACSF success): {valid_count}")
+        logger.info(f"Valid molecules (SOAP+ACSF+Coulomb success): {valid_count}")
         required_df = (
             self.df.filter(pl.col("mol_id").is_in(list(required_set)))
             if required_set
@@ -281,7 +287,7 @@ class QM9Dataset:
             )
             .sort("_qm9_idx")
             .drop("_qm9_idx")
-            .drop(["soap_embedding", "acsf_embedding"])
+            .drop(["soap_embedding", "acsf_embedding", "coulomb_matrix"])
         )
 
         self.df.write_csv(self.file_path)
@@ -303,10 +309,13 @@ class QM9Dataset:
             )
         )
 
-    def add_selfies_onehot(self) -> None:
+    def add_selfies_onehot(self, flatten: bool = False) -> None:
         if "selfies_onehot" in self.df.columns: return
         self.df = self.df.with_columns(
-            MolecularFeaturizer.compute_selfies_onehot(self.df["selfies"])
+            MolecularFeaturizer.compute_selfies_onehot(
+                self.df["selfies"],
+                flatten=flatten
+            )
         )
 
     def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
@@ -329,6 +338,23 @@ class QM9Dataset:
         )
         self.df = self.df.with_columns(acsf_series.alias("acsf_embedding"))
         logger.success("Added ACSF embeddings.")
+
+    def add_coulomb_matrix(
+        self,
+        n_atoms_max: int | None = None,
+        permutation: str = "sorted_l2"
+    ) -> None:
+        """Adds Coulomb matrix descriptors to the dataframe."""
+        if "coulomb_matrix" in self.df.columns:
+            return
+
+        coulomb_series = MolecularFeaturizer.compute_coulomb_matrix(
+            self.df["canonical_smiles"],
+            n_atoms_max=n_atoms_max,
+            permutation=permutation
+        )
+        self.df = self.df.with_columns(coulomb_series.alias("coulomb_matrix"))
+        logger.success("Added Coulomb matrix descriptors.")
 
     def add_chemprop(
         self,
@@ -356,6 +382,8 @@ class QM9Dataset:
         n_max: int = 8,
         l_max: int = 6,
         sigma: float = 0.5,
+        coulomb_n_atoms_max: int | None = None,
+        coulomb_permutation: str = "sorted_l2",
         include_chemprop: bool = True,
         chemprop_model_path: str | None = None,
         chemprop_batch_size: int = 64,
@@ -373,6 +401,10 @@ class QM9Dataset:
         self.add_selfies_onehot()
         self.add_soap(r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma)
         self.add_acsf(r_cut=r_cut)
+        self.add_coulomb_matrix(
+            n_atoms_max=coulomb_n_atoms_max,
+            permutation=coulomb_permutation
+        )
 
         if include_chemprop:
             self.add_chemprop(
@@ -412,6 +444,13 @@ class QM9Dataset:
                 flattened_onehot, 
                 metric=dist_type, 
                 filename=f"dist_selfies_onehot_{dist_type}.npy"
+            )
+        elif metric == 'coulomb_matrix':
+            self.add_coulomb_matrix()
+            return self.distance_engine.get_matrix(
+                self.df["coulomb_matrix"],
+                metric=dist_type,
+                filename=f"dist_coulomb_matrix_{dist_type}.npy"
             )
 
         else:

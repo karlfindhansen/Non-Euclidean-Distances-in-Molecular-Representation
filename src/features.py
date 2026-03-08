@@ -11,12 +11,12 @@ from transformers import AutoTokenizer, AutoModel
 from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
-from dscribe.descriptors import SOAP, ACSF
+from dscribe.descriptors import SOAP, ACSF, CoulombMatrix
 
 class MolecularFeaturizer:
     """
     Responsible for converting SMILES/SELFIES into vector representations.
-    Now includes 3D physics-based descriptors (SOAP, ACSF).
+    Now includes 3D physics-based descriptors (SOAP, ACSF, Coulomb Matrix).
     """
     
     @staticmethod
@@ -112,7 +112,7 @@ class MolecularFeaturizer:
         return pl.Series("selfies_transformer", embeddings)
 
     @staticmethod
-    def compute_selfies_onehot(selfies_series: pl.Series) -> pl.Series:
+    def compute_selfies_onehot(selfies_series: pl.Series, flatten: bool = False) -> pl.Series:
         logger.info("Computing One-Hot Encodings...")
         data = [s for s in selfies_series.to_list() if s]
         if not data: return pl.Series("selfies_onehot", [None]*len(selfies_series))
@@ -124,7 +124,12 @@ class MolecularFeaturizer:
 
         def _encode(s):
             if not s: return None
-            return sf.selfies_to_encoding(s, vocab_stoi=vocab, pad_to_len=max_len, enc_type="one_hot")
+            encoded = sf.selfies_to_encoding(
+                s, vocab_stoi=vocab, pad_to_len=max_len, enc_type="one_hot"
+            )
+            if not flatten:
+                return encoded
+            return np.asarray(encoded).reshape(-1).tolist()
 
         return pl.Series("selfies_onehot", [_encode(s) for s in selfies_series.to_list()])
 
@@ -187,6 +192,53 @@ class MolecularFeaturizer:
 
         return smiles_series.map_elements(_compute_single_acsf, return_dtype=pl.List(pl.Float64))
     
+    @staticmethod
+    def compute_coulomb_matrix(
+        smiles_series: pl.Series,
+        n_atoms_max: int | None = None,
+        permutation: str = "sorted_l2"
+    ) -> pl.Series:
+        """
+        Computes Coulomb Matrix descriptors from 3D geometries.
+        Returns flattened vectors (length n_atoms_max * n_atoms_max).
+        """
+        logger.info(
+            f"Computing Coulomb matrices (n_atoms_max={n_atoms_max}, permutation={permutation})..."
+        )
+
+        mols = []
+        max_atoms = 0
+        for s in smiles_series.to_list():
+            mol = MolecularFeaturizer._generate_3d_mol(s)
+            mols.append(mol)
+            if mol is not None:
+                max_atoms = max(max_atoms, mol.GetNumAtoms())
+
+        if max_atoms == 0:
+            return pl.Series("coulomb_matrix", [None] * len(smiles_series))
+
+        n_atoms = n_atoms_max if n_atoms_max is not None else max_atoms
+        cm_engine = CoulombMatrix(
+            n_atoms_max=n_atoms,
+            permutation=permutation,
+            sparse=False
+        )
+
+        features = []
+        for mol in mols:
+            if mol is None:
+                features.append(None)
+                continue
+
+            try:
+                atoms = MolecularFeaturizer._rdkit_to_ase(mol)
+                vec = cm_engine.create(atoms)
+                features.append(np.asarray(vec).ravel().tolist())
+            except Exception:
+                features.append(None)
+
+        return pl.Series("coulomb_matrix", features)
+
 
     @staticmethod
     def compute_chemprop_embeddings(
