@@ -2,20 +2,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 from loguru import logger
+import json
 
-from src.descriptors import SOAPDescriptor, ACSFDescriptor
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+
+from pymatgen.core import Structure
+from pymatgen.io.ase import AseAtomsAdaptor
+
+import chemiscope
+
 from src.clusters import ClusterAnalysis
-from src.datasets import QM9Dataset
+from src.datasets import QM9Dataset, MaterialsProject
 
 
 def descriptors():
     loader = QM9Dataset()
     loader.load()
-    soap = SOAPDescriptor(loader, r_cut=6.0, n_max=8)
-    soap.compute()
+    #soap = SOAPDescriptor(loader, r_cut=6.0, n_max=8)
+    #soap.compute()
 
-    acsf = ACSFDescriptor(loader, r_cut=6.0)
-    acsf.compute()
+    #acsf = ACSFDescriptor(loader, r_cut=6.0)
+    #acsf.compute()
 
     cols = [
         "mol_weight", "logp", "tpsa", "num_heavy_atoms", "num_rings", 
@@ -126,6 +135,74 @@ def interactive_clustering(clustering_method, embedding_type):
     analyzer.plot_interactive(method='tsne', perplexity=30)
 
 
+def plot_chemiscope(mp_df, embedding_col="soap_embedding", n_clusters=5):
+
+    df = mp_df.to_pandas()
+
+    # ---- embeddings ----
+    X = np.vstack(df[embedding_col].values)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # ---- clustering ----
+    kmeans = KMeans(n_clusters=n_clusters, n_init=50, random_state=42)
+    clusters = kmeans.fit_predict(X_scaled)
+
+    # ---- t-SNE ----
+    tsne = TSNE(
+        n_components=2,
+        perplexity=30,
+        init="pca",
+        learning_rate="auto",
+        random_state=42
+    )
+
+    X_tsne = tsne.fit_transform(X_scaled)
+
+    df["tsne_1"] = X_tsne[:, 0]
+    df["tsne_2"] = X_tsne[:, 1]
+    df["cluster_id"] = clusters
+
+    # ---- structures ----
+    frames = []
+
+    for s_str in df["raw_structure"]:
+        pmg = Structure.from_dict(json.loads(s_str))
+        atoms = AseAtomsAdaptor.get_atoms(pmg)
+        frames.append(atoms)
+
+    # ---- properties ----
+    properties = {
+        "Cluster": df["cluster_id"].astype(int).values,
+        "Energy per Atom": df["energy_per_atom"].astype(float).values,
+        "Formula": df["formula_pretty"].astype(str).tolist(),
+        "t-SNE 1": df["tsne_1"].values,
+        "t-SNE 2": df["tsne_2"].values,
+    }
+
+    # ---- chemiscope settings for 2D plot ----
+    settings = {
+        "map": {
+            "x": {"property": "t-SNE 1"},
+            "y": {"property": "t-SNE 2"},
+            "color": {"property": "Cluster"}
+        }
+    }
+    
+    chemiscope.write_input(
+        "soap_tsne_clusters.json",
+        structures=frames,
+        properties=properties,
+        settings=settings,
+        metadata={
+            "name": "SOAP clustering visualization",
+            "description": "KMeans clustering with t-SNE projection"
+        }
+    )
+
+    chemiscope.show_input("soap_tsne_clusters.json")
+
 if __name__ == "__main__":
     #descriptors()
     #finger_prints()
@@ -133,4 +210,8 @@ if __name__ == "__main__":
     clustering_method = 'kmeans'
     embedding_type = 'morgan_fingerprint'
     #interactive_clustering(clustering_method, embedding_type)
-    
+
+    mp = MaterialsProject()
+    mp.load()
+    plot_chemiscope(mp.df, "acsf_embedding")
+        

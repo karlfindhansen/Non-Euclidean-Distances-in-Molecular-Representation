@@ -77,8 +77,8 @@ def align_frames_to_dist_matrix(
 
     return aligned_frames
 
-def get_distances(frames):
-    data_dir = 'data/QM9'
+def get_distances(frames, frames_ph=None, dataset = 'QM9'):
+    data_dir = f'data/{dataset}'
     os.makedirs(data_dir, exist_ok=True)
 
     matrix_tasks = {
@@ -111,6 +111,11 @@ def get_distances(frames):
             'compute': lambda: PersistentHomology.distance_matrix(frames, metric="sliced_wasserstein")
         }
     }
+
+    if frames_ph is not None:
+        logger.info("Using PH")
+        matrix_tasks['ph_bottleneck']['compute'] = lambda: PersistentHomology.distance_matrix(frames_ph, metric="bottleneck")
+        matrix_tasks['ph_sliced_wasserstein']['compute'] = lambda: PersistentHomology.distance_matrix(frames_ph, metric="sliced_wasserstein")
 
     matrices = {}
 

@@ -744,7 +744,7 @@ class MaterialsProject:
             soap_features = self._compute_feature(structures, soap_engine, "SOAP")
             # print the size of the soap features
             print(f"SOAP features shape: {len(soap_features)} x {len(soap_features[0]) if soap_features else 0}")
-            self.df = self.df.with_columns(pl.Series("soap_embedding", soap_features)) # the problem is here...
+            self.df = self.df.with_columns(pl.Series("soap_embedding", soap_features, dtype=pl.List(pl.Float64)))
             logger.success("SOAP embeddings added.")
 
         # Compute ACSF

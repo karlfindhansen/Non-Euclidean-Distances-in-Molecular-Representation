@@ -50,7 +50,7 @@ class Wasserstein:
                     d = cls.compute_distance(frames[i], frames[j], metric=metric)
                     dist_matrix[i, j] = dist_matrix[j, i] = d
                     pbar.update(1)
-        logger.debug("Finished Wasserstein distance matrix computation.")
+        logger.success("Finished Wasserstein distance matrix computation.")
         return dist_matrix
 
 class PersistentHomology:
@@ -86,13 +86,13 @@ class PersistentHomology:
         compute_fn = cls._compute_ripser if backend_key == "ripser" else cls._compute_gudhi
         diagrams = []
 
-        for frame in frames:
+        for frame in tqdm(frames, desc="Persistence diagrams", unit="frame"):
             pts = frame.get_positions()
             if len(pts) == 0:
                 diagrams.append({d: np.empty((0, 2)) for d in range(max_homology_dim + 1)})
             else:
                 diagrams.append(compute_fn(pts, max_homology_dim))
-        logger.debug("Finished persistence diagram computation.")
+        logger.success("Finished persistence diagram computation.")
         return diagrams
 
     @staticmethod
@@ -154,7 +154,7 @@ class PersistentHomology:
                     d = cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims)
                     dist_mat[i, j] = dist_mat[j, i] = d
                     pbar.update(1)
-        logger.debug("Finished persistent homology distance matrix computation.")
+        logger.success("Finished persistent homology distance matrix computation.")
         return dist_mat
 
 class Grassmann:
@@ -232,7 +232,7 @@ class Grassmann:
                     dist = cls.distance(bases[i], bases[j])
                     dist_matrix[i, j] = dist_matrix[j, i] = dist
                     pbar.update(1)
-        logger.debug("Finished Grassmann distance matrix computation.")
+        logger.success("Finished Grassmann distance matrix computation.")
         return dist_matrix
 
 class Riemann:
