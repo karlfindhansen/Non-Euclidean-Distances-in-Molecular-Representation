@@ -191,6 +191,8 @@ class QM9Dataset:
                 
                 # Flexibility/Complexity & newly added string/graph complexity metrics
                 "num_rotatable_bonds": int(Descriptors.NumRotatableBonds(mol)),
+                "fraction_csp1": rdMolDescriptors.CalcFractionCSP1(mol),
+                "fraction_csp2": rdMolDescriptors.CalcFractionCSP2(mol),
                 "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol),
                 "h_bond_donors": int(Descriptors.NumHDonors(mol)),
                 "h_bond_acceptors": int(Descriptors.NumHAcceptors(mol)),
@@ -575,6 +577,12 @@ class QM9Dataset:
                         "num_atoms": int(len(atoms)),
                         "total_mass": float(np.sum(masses)),
                         "mean_partial_charge": float(np.mean(charges)),
+                        "branching_index": int(row["branching_index"]),
+                        "num_sp_carbons": int(row["num_sp_carbons"]),
+                        "num_sp2_carbons": int(row["num_sp2_carbons"]),
+                        "num_sp3_carbons": int(row["num_sp3_carbons"]),
+                        "main_chain_length": int(row["main_chain_length"]),
+                        "raw_token_count": int(row["raw_token_count"]),
                     }
                 )
                 frames.append(atoms)

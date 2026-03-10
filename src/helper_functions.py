@@ -77,7 +77,7 @@ def align_frames_to_dist_matrix(
 
     return aligned_frames
 
-def get_distances(frames, frames_ph=None, dataset = 'QM9'):
+def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
     data_dir = f'data/{dataset}'
     os.makedirs(data_dir, exist_ok=True)
 
@@ -126,6 +126,9 @@ def get_distances(frames, frames_ph=None, dataset = 'QM9'):
             logger.info(f"Loading {name} distance matrix...")
             matrices[name] = np.load(file_path)
         else:
+            if not include_ph and name.startswith('ph_'):
+                logger.warning("Skipping PH task")
+                continue
             logger.info(f"Computing {name} distance matrix...")
             matrices[name] = task['compute']()
             np.save(file_path, matrices[name])
