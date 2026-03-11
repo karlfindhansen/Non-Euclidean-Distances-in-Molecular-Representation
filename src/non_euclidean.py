@@ -53,48 +53,56 @@ class Wasserstein:
         logger.success("Finished Wasserstein distance matrix computation.")
         return dist_matrix
 
+import numpy as np
+from typing import Dict, List, Sequence
+from tqdm import tqdm
+import persim
+from ripser import ripser
+# Assuming `logger` and `Atoms` are imported elsewhere
+
 class PersistentHomology:
     """
-    Task 6.1: Persistence diagrams from 3D point clouds of atoms.
-    Task 6.2: Diagram distances (Bottleneck or Sliced Wasserstein).
+    Computes topological features (persistence diagrams) from 3D atomic point clouds 
+    and evaluates the structural similarities between different frames using 
+    Bottleneck or Sliced Wasserstein distances.
     """
 
     @staticmethod
-    def _compute_ripser(points: np.ndarray, max_dim: int) -> Dict[int, np.ndarray]:
-        dgms = ripser(points, maxdim=max_dim)["dgms"]
+    def _compute_ripser(distance_matrix: np.ndarray, max_dim: int) -> Dict[int, np.ndarray]:
+        """Calculates persistence diagrams up to max_dim from a precomputed distance matrix."""
+        # distance_matrix=True is strictly required so ripser doesn't treat the input as a point cloud
+        dgms = ripser(distance_matrix, maxdim=max_dim, distance_matrix=True)["dgms"]
+        
+        # Format output into a dictionary mapping homology dimension to its (birth, death) array
         return {d: np.asarray(dgms[d]) for d in range(max_dim + 1)}
-
-    @staticmethod
-    def _compute_gudhi(points: np.ndarray, max_dim: int) -> Dict[int, np.ndarray]:
-        rips = gd.RipsComplex(points=points).create_simplex_tree(max_dimension=max_dim + 1)
-        rips.persistence()
-        return {d: np.asarray(rips.persistence_intervals_in_dimension(d)) for d in range(max_dim + 1)}
 
     @classmethod
     def compute_persistence_diagrams(
-        cls, frames: Sequence[Atoms], max_homology_dim: int = 2, backend: str = "ripser"
+        cls, frames: Sequence[Atoms], max_homology_dim: int = 2
     ) -> List[Dict[int, np.ndarray]]:
-        backend_key = backend.lower()
-        if backend_key not in {"ripser", "gudhi"}:
-            logger.error(f"Unknown persistence backend '{backend}'.")
-            raise ValueError("backend must be one of: ['ripser', 'gudhi']")
-
+        """Generates persistence diagrams for a sequence of molecular frames."""
+        
         logger.info(
             f"Computing persistence diagrams for {len(frames)} frames "
-            f"(backend='{backend_key}', max_homology_dim={max_homology_dim})."
+            f"(max_homology_dim={max_homology_dim})."
         )
-        compute_fn = cls._compute_ripser if backend_key == "ripser" else cls._compute_gudhi
+        
         diagrams = []
 
         for frame in tqdm(frames, desc="Persistence diagrams", unit="frame"):
-            pts = frame.get_positions()
-            if len(pts) == 0:
+            # Handle edge case of an empty simulation frame to prevent Ripser crashes
+            if len(frame) == 0:
                 diagrams.append({d: np.empty((0, 2)) for d in range(max_homology_dim + 1)})
-            else:
-                diagrams.append(compute_fn(pts, max_homology_dim))
+                continue
+            
+            # Use Minimum Image Convention (MIC) to ensure bonds across periodic 
+            # cell boundaries are calculated at their true shortest distance
+            dist_mat = frame.get_all_distances(mic=True)
+            diagrams.append(cls._compute_ripser(dist_mat, max_homology_dim))
+ 
         logger.success("Finished persistence diagram computation.")
         return diagrams
-
+    
     @staticmethod
     def distance(
         dgm1: Dict[int, np.ndarray],
@@ -103,7 +111,10 @@ class PersistentHomology:
         dims: Sequence[int] = (0, 1, 2),
         sw_projections: int = 50
     ) -> float:
-        """Computes total distance across specified homology dimensions."""
+        """
+        Computes the total topological distance between two diagrams across 
+        specified homology dimensions (e.g., 0=components, 1=loops, 2=voids).
+        """
         metric_key = metric.lower()
         if metric_key not in {"bottleneck", "b", "sliced-wasserstein", "sliced_wasserstein", "sw"}:
             logger.error(f"Unknown persistence metric '{metric}'.")
@@ -114,13 +125,17 @@ class PersistentHomology:
         total_dist = 0.0
         
         for d in dims:
+            # Safely fetch the diagrams for dimension `d`, defaulting to empty if missing
             p1, p2 = dgm1.get(d, np.empty((0, 2))), dgm2.get(d, np.empty((0, 2)))
             
+            # Filter out features with infinite death times (essential classes) 
+            # since distance metrics require finite bounds to compute properly
             if len(p1) > 0:
                 p1 = p1[np.isfinite(p1[:, 1])]
             if len(p2) > 0:
                 p2 = p2[np.isfinite(p2[:, 1])]
             
+            # Accumulate the calculated distance for this dimension
             if metric_key in {"bottleneck", "b"}:
                 total_dist += persim.bottleneck(p1, p2)
             else:
@@ -132,28 +147,36 @@ class PersistentHomology:
     def distance_matrix(
         cls,
         frames: Sequence[Atoms],
-        backend: str = "ripser",
         metric: str = "bottleneck",
         max_homology_dim: int = 2,
         homology_dims: Sequence[int] = (0, 1, 2)
     ) -> np.ndarray:
-        """Generates the pairwise distance matrix for a set of molecular frames."""
+        """
+        Generates a symmetric pairwise distance matrix comparing the topological 
+        features of all molecular frames in the sequence.
+        """
         logger.info(
             f"Computing persistent homology distance matrix for {len(frames)} frames "
-            f"(backend='{backend}', metric='{metric}', max_homology_dim={max_homology_dim}, "
+            f"(metric='{metric}', max_homology_dim={max_homology_dim}, "
             f"dims={tuple(homology_dims)})."
         )
-        dgms = cls.compute_persistence_diagrams(frames, max_homology_dim, backend)
+        
+        # Precompute all diagrams
+        dgms = cls.compute_persistence_diagrams(frames, max_homology_dim)
         n = len(dgms)
         dist_mat = np.zeros((n, n))
+        
+        # Only compute the upper triangle to halve the required calculations
         total_pairs = n * (n - 1) // 2
 
         with tqdm(total=total_pairs, desc="Persistence distances", unit="pair") as pbar:
             for i in range(n):
                 for j in range(i + 1, n):
                     d = cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims)
+                    # Mirror the upper triangle to the lower triangle
                     dist_mat[i, j] = dist_mat[j, i] = d
                     pbar.update(1)
+                    
         logger.success("Finished persistent homology distance matrix computation.")
         return dist_mat
 
