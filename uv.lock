@@ -192,6 +192,7 @@ dependencies = [
     { name = "kmedoids" },
     { name = "lmdb" },
     { name = "loguru" },
+    { name = "mapsim" },
     { name = "mp-api" },
     { name = "nbformat" },
     { name = "nglview" },
@@ -231,6 +232,7 @@ requires-dist = [
     { name = "kmedoids", specifier = ">=0.5.4" },
     { name = "lmdb", specifier = ">=1.7.5" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "mapsim", git = "https://github.com/mapequation/map-equation-similarity" },
     { name = "mp-api", specifier = ">=0.46.0" },
     { name = "nbformat", specifier = ">=5.10.4" },
     { name = "nglview", specifier = ">=4.0.1" },
@@ -1674,6 +1676,26 @@ wheels = [
 ]
 
 [[package]]
+name = "infomap"
+version = "2.9.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/8c/063ff6f2ba4127b7f8487328402173d5f19945bd12267a302df7368434cf/infomap-2.9.2.tar.gz", hash = "sha256:e0c61ded3531bcff019a024d6e37396e920db9ffdf43a6caca0b68b71e404036", size = 268109, upload-time = "2026-02-25T22:42:40.691Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/0d/31f3963d76723f8f52215bf2e2a97278caf9437b6f55df4b66a15c6fe266/infomap-2.9.2-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:e87b2a330b1858cf41127760ddc201199b6d7ba2f3ecb609c9b47e09fc53d1c0", size = 838843, upload-time = "2026-02-25T22:42:22.55Z" },
+    { url = "https://files.pythonhosted.org/packages/36/25/2ae9b4f8d992f31451fdca644328a2c57c1350d396331ec7e86ba7021c34/infomap-2.9.2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:760cba0684133b7e1590da34d2620f9e30060c43337612c3f9245e262e3799d1", size = 9231413, upload-time = "2026-02-25T22:42:23.774Z" },
+    { url = "https://files.pythonhosted.org/packages/39/75/7673ca56b92929291292ba537cf097c42c23f7a37bb9ca8406d7e5bb0ed0/infomap-2.9.2-cp312-cp312-win32.whl", hash = "sha256:c193a5c3069312278db962384a811bdc3b639512b885e6e764f0263c3c248ae8", size = 460374, upload-time = "2026-02-25T22:42:25.726Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/bb/2145c4d9125028cff55e948476534eaa2a0fb8325fce233bab269875c030/infomap-2.9.2-cp312-cp312-win_amd64.whl", hash = "sha256:8dd3a22171ac32f1c8fcfc6d94cc3ac239f372ec93da2f7678abe0678acca19c", size = 586219, upload-time = "2026-02-25T22:42:26.707Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/25/e5aa8973c97b401d09d17e03ff1c90a23ce290f1dcd672df40866e3badbe/infomap-2.9.2-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:38b23ed305930b0c4bbed13e5e95b1891ac067bbef090b398a30e15c4f882864", size = 838855, upload-time = "2026-02-25T22:42:27.776Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/32/314502dbfe6b5cfc560b389e1008dfb6fa6ad0bdf6bcbb06d3be705e1818/infomap-2.9.2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:de597c90661ed08a983ce8fc595bfafa240fdc8c770f50f8184c8f195a7ef8ba", size = 9230659, upload-time = "2026-02-25T22:42:29.011Z" },
+    { url = "https://files.pythonhosted.org/packages/15/7f/a06026303895967c797245bb58ada13e7e2344fabbcd4c99e93760361117/infomap-2.9.2-cp313-cp313-win32.whl", hash = "sha256:1a3ea625739a95edb7db618fe3c1008cad3e9b9d3c072171a892135ee79c7fd3", size = 460805, upload-time = "2026-02-25T22:42:30.878Z" },
+    { url = "https://files.pythonhosted.org/packages/16/53/a0239e499d65a43d64b941ff8ec7bc057cdb719baa86cb5de86e7fcdfc09/infomap-2.9.2-cp313-cp313-win_amd64.whl", hash = "sha256:1bea68718859067361a336229dd4e5cef40a80edb3482b941707a6659f3f6b3b", size = 586265, upload-time = "2026-02-25T22:42:33.203Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/bf/15daccaad306fdd30edbb25f19331ae311260dfb3f1a69621cd245d8c891/infomap-2.9.2-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:07e6fd43ee2ae5bf4332dcbe9ba0558f4ac442bb7df13759694fb585f8fb604a", size = 839066, upload-time = "2026-02-25T22:42:34.812Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/11/3af6089827e9728e39985a3ed007e6f489a971869ed75b88000a92223773/infomap-2.9.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4b6775f75ce8294a9f107b3a151357e122b7f602a77cecf955998493b853e6be", size = 9222169, upload-time = "2026-02-25T22:42:36.334Z" },
+    { url = "https://files.pythonhosted.org/packages/81/a8/41ab885c43d3fb5c220a0d7b651c51c96244c8ed5b35706cb28517bee798/infomap-2.9.2-cp314-cp314-win32.whl", hash = "sha256:94a331b6b66aff2dff0301d05cbb2716ca8f9cea1d4d084d01b23bd32a6766f8", size = 470190, upload-time = "2026-02-25T22:42:38.269Z" },
+    { url = "https://files.pythonhosted.org/packages/da/42/d511c30caf14366a6aa972aa90925af2c1d3b29caf033613d4a20cbf8b42/infomap-2.9.2-cp314-cp314-win_amd64.whl", hash = "sha256:3513d2b4c58e07ecfcb388a91d76c7d468170ef685129d54476a5dabbfb0e951", size = 600439, upload-time = "2026-02-25T22:42:39.651Z" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2263,6 +2285,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3a/05/a1dae3dffd1116099471c643b8924f5aa6524411dc6c63fdae648c4f1aca/loguru-0.7.3.tar.gz", hash = "sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6", size = 63559, upload-time = "2024-12-06T11:20:56.608Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/29/0348de65b8cc732daa3e33e67806420b2ae89bdce2b04af740289c5c6c8c/loguru-0.7.3-py3-none-any.whl", hash = "sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c", size = 61595, upload-time = "2024-12-06T11:20:54.538Z" },
+]
+
+[[package]]
+name = "mapsim"
+version = "0.8"
+source = { git = "https://github.com/mapequation/map-equation-similarity#8595d3b1fa0aa0420a63bbf03846dcaa3c90eb08" }
+dependencies = [
+    { name = "infomap" },
+    { name = "matplotlib" },
+    { name = "networkx" },
+    { name = "numpy" },
+    { name = "seaborn" },
 ]
 
 [[package]]

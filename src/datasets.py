@@ -463,7 +463,7 @@ class QM9Dataset:
         num_molecules: int = 10,
         perturbations: int = 20,
         include_base: bool = True,
-        max_rattle : float = 0.5,
+        max_bond_rattle : float = 0.05,
         mol_ids: Optional[List[str]] = None,
         rotated: bool = False
     ) -> list:
@@ -475,7 +475,7 @@ class QM9Dataset:
             else default_path
         )
 
-        if os.path.exists(target_path) and mol_ids is None and not include_base and not max_rattle > 0:
+        if os.path.exists(target_path) and mol_ids is None and not include_base and not max_bond_rattle > 0:
             return self.geometry_engine.load_stress_test(
                 save_path=target_path,
                 mol_ids=mol_ids
@@ -489,7 +489,7 @@ class QM9Dataset:
             include_base=include_base,
             rotated=rotated,
             save_path=target_path,
-            max_rattle=max_rattle
+            max_bond_rattle=max_bond_rattle
         )
 
     def export_subset_xyz(

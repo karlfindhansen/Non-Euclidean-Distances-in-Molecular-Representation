@@ -8,6 +8,27 @@ from typing import List, Sequence
 from loguru import logger
 import polars as pl
 
+def get_downstream_atoms(mol: Chem.Mol, fixed_idx: int, moving_idx: int) -> List[int]:
+    """
+    Finds all atoms attached to moving_idx, ensuring we don't traverse back 
+    through fixed_idx. This defines the 'branch' of the molecule that must move.
+    """
+    visited = {fixed_idx}
+    queue = [moving_idx]
+    moving_group = []
+    
+    while queue:
+        curr = queue.pop(0)
+        if curr not in visited:
+            visited.add(curr)
+            moving_group.append(curr)
+            atom = mol.GetAtomWithIdx(curr)
+            for nbr in atom.GetNeighbors():
+                nbr_idx = nbr.GetIdx()
+                if nbr_idx not in visited:
+                    queue.append(nbr_idx)
+    return moving_group
+
 class GeometryPerturber:
     """
     Handles 3D geometry generation and perturbation (Stress Test).
@@ -48,33 +69,31 @@ class GeometryPerturber:
         mol_ids: Sequence[str] | None = None,
         perturbations: int = 20, 
         include_base: bool = True,
-        max_rattle: float = 0.5, 
+        max_bond_rattle: float = 0.05,  # Changed from max_rattle (in Angstroms)
+        max_angle_rattle: float = 5.0,  # New parameter (in Degrees)
         seed: int = 40,
         rotated: bool = False,
         save_path: str | None = None,
     ) -> List[Atoms]:
-        """Generates perturbed geometries and saves them."""
-        logger.info(f"Generating Grassmann Stress Test (Seed={seed}, Rotated={rotated}, Max Rattle={max_rattle})...")
+        """Generates perturbed geometries using internal coordinates and saves them."""
+        logger.info(f"Generating Stress Test (Seed={seed}, Max Bond Rattle={max_bond_rattle}Å, Max Angle Rattle={max_angle_rattle}°)...")
         
         if dataframe.is_empty():
             raise ValueError("DataFrame provided for geometry generation is empty.")
 
-        target_path = save_path or self.save_path
+        target_path = save_path or getattr(self, 'save_path', 'stress_test.xyz')
+        
         if mol_ids is not None:
             requested_ids = list(dict.fromkeys(mol_ids))
             sample_df = dataframe.filter(pl.col("mol_id").is_in(requested_ids))
             if sample_df.is_empty():
                 raise ValueError("None of the provided mol_ids were found in the dataframe.")
-            missing = sorted(set(requested_ids) - set(sample_df["mol_id"].to_list()))
-            if missing:
-                logger.warning(f"Ignoring {len(missing)} missing mol_ids: {missing}")
         else:
             available = len(dataframe)
             n_sample = min(available, num_molecules)
             sample_df = dataframe.sample(n=n_sample, seed=seed)
 
         rng = np.random.default_rng(seed)
-        
         all_frames = []
         failed_count = 0
 
@@ -88,7 +107,11 @@ class GeometryPerturber:
                 
                 mol = Chem.AddHs(mol)
                 AllChem.ComputeGasteigerCharges(mol)
-                charges = [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()]
+                charges = [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms() if atom.HasProp("_GasteigerCharge")]
+
+                if len(charges) != mol.GetNumAtoms():
+                    charges = [0.0] * mol.GetNumAtoms()
+
                 params = AllChem.ETKDG()
                 params.randomSeed = seed
                 
@@ -110,16 +133,63 @@ class GeometryPerturber:
                     all_frames.append(base_atoms)
                 
                 for i in range(perturbations):
-                    # Create new Atom object for this perturbation
                     pert_atoms = Atoms(symbols=symbols, positions=base_pos.copy(), charges=charges)
-                    noise = rng.uniform(low=-max_rattle, high=max_rattle, size=base_pos.shape)
-                    pert_atoms.positions += noise
                     
+                    # 1. PERTURB BOND LENGTHS
+                    for bond in mol.GetBonds():
+                        # Skipping rings: expanding one bond in a ring forces another to break or distort wildly
+                        if bond.IsInRing():
+                            continue 
+                            
+                        a1 = bond.GetBeginAtomIdx()
+                        a2 = bond.GetEndAtomIdx()
+                        
+                        # Get atoms that should move when we stretch the a1-a2 bond
+                        moving_indices = get_downstream_atoms(mol, fixed_idx=a1, moving_idx=a2)
+                        
+                        # Create boolean mask for ASE
+                        mask = [idx in moving_indices for idx in range(len(pert_atoms))]
+                        
+                        current_dist = pert_atoms.get_distance(a1, a2)
+                        noise = rng.uniform(-max_bond_rattle, max_bond_rattle)
+                        new_dist = max(0.5, current_dist + noise) # Prevent atoms from overlapping
+                        
+                        try:
+                            pert_atoms.set_distance(a1, a2, new_dist, mask=mask)
+                        except Exception:
+                            pass # Safely ignore if geometry makes this impossible
+
+                    # 2. PERTURB ANGLES
+                    for atom in mol.GetAtoms():
+                        if atom.IsInRing(): 
+                            continue
+                            
+                        neighbors = atom.GetNeighbors()
+                        if len(neighbors) >= 2:
+                            # Just perturb the angle between the first two neighbors
+                            a1 = neighbors[0].GetIdx()
+                            center = atom.GetIdx()
+                            a2 = neighbors[1].GetIdx()
+                            
+                            moving_indices = get_downstream_atoms(mol, fixed_idx=center, moving_idx=a2)
+                            mask = [idx in moving_indices for idx in range(len(pert_atoms))]
+                            
+                            current_angle = pert_atoms.get_angle(a1, center, a2)
+                            angle_noise = rng.uniform(-max_angle_rattle, max_angle_rattle)
+                            # Clip to avoid flipping the molecule inside out (180 or 0 degrees)
+                            new_angle = np.clip(current_angle + angle_noise, 15.0, 165.0) 
+                            
+                            try:
+                                pert_atoms.set_angle(a1, center, a2, new_angle, mask=mask)
+                            except Exception:
+                                pass
+
+                    # 3. ROTATE ENTIRE MOLECULE (If requested)
                     if rotated:
                         angle = rng.uniform(0.0, 360.0)
                         axis = rng.normal(size=3)
                         axis /= np.linalg.norm(axis)
-                        pert_atoms.rotate(angle, axis)
+                        pert_atoms.rotate(angle, axis, center='COM') # Better to rotate around Center of Mass
                     
                     pert_atoms.info.update({
                         'mol_id': mol_id, 
