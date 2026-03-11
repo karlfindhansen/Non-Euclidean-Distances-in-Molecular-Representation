@@ -3,7 +3,6 @@ from scipy.linalg import subspace_angles
 from pyriemann.utils.distance import distance_riemann, distance_logeuclid
 from ase import Atoms
 import persim
-import gudhi as gd
 from ripser import ripser
 from typing import Dict, List, Literal
 import numpy as np
@@ -53,12 +52,6 @@ class Wasserstein:
         logger.success("Finished Wasserstein distance matrix computation.")
         return dist_matrix
 
-import numpy as np
-from typing import Dict, List, Sequence
-from tqdm import tqdm
-import persim
-from ripser import ripser
-# Assuming `logger` and `Atoms` are imported elsewhere
 
 class PersistentHomology:
     """
@@ -182,39 +175,46 @@ class PersistentHomology:
 
 class Grassmann:
     """
-    Task 7.1: Grassmann Manifold (Subspaces)
-    Supports both QR and SVD for orthonormal basis generation.
+    Handles molecular representation on Grassmann Manifolds G(k, n).
+    Represents each molecule as a k-dimensional subspace in R^n (atom-space).
     """
 
     @staticmethod
-    def get_uk_bases(
-        frames: Sequence[Atoms], 
+    def _get_uk_bases(
+        frames: Sequence['Atoms'], 
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd"
     ) -> np.ndarray:
         """
-        Computes an orthonormal basis for each frame.
-        
-        Args:
-            frames: Sequence of ASE Atoms objects.
-            k: Dimension of the subspace (usually 3 for 3D coordinates).
-            method: 'qr' for fast decomposition, 'svd' for principal component basis.
+        Maps 3D atomic coordinates to an orthonormal basis in R^n.
         """
         bases = []
+        # Ambient dimension n must be constant across the dataset for manifold comparison
         max_atoms = max(len(f) for f in frames)
+        
         for frame in frames:
-            coords = frame.get_positions()
+            coords = frame.get_positions(invariant=False)
             n_atoms = len(coords)
+
+            # Translation invariance: move geometric centroid to origin
             centered = coords - np.mean(coords, axis=0)
 
+            # Zero-padding ensures all molecules live in the same R^max_atoms space
+            # Missing atoms are treated as having zero variance in those dimensions
             padded = np.zeros((max_atoms, 3))
             padded[:n_atoms, :] = centered
+
+            # Rotational invariance: The Gram Matrix (n x n) captures relative.
+            # distances/angles between atoms, independent of 3D orientation.
+            gram = padded @ padded.T
             
             if method.lower() == "qr":
-                q, _ = np.linalg.qr(padded)
+                # QR decomposition of Gram matrix
+                q, _ = np.linalg.qr(gram)
                 basis = q[:, :k]
             else:
-                u, s, _ = np.linalg.svd(padded, full_matrices=False)
+                # SVD gives a basis ordered by structural variance
+                u, _, _ = np.linalg.svd(gram, full_matrices=False)
                 basis = u[:, :k]
                 
             bases.append(basis)
@@ -222,29 +222,32 @@ class Grassmann:
         return np.array(bases)
 
     @staticmethod
-    def distance(U1: np.ndarray, U2: np.ndarray) -> float:
+    def _distance(U1: np.ndarray, U2: np.ndarray) -> float:
         """
-        Step C: Compute Grassmann Distance using Principal Angles.
-        d = sqrt(sum(theta_i^2))
+        Computes the Geodesic (arc-length) distance on the Grassmannian.
+        Calculated as the L2 norm of the principal angles between subspaces.
         """
+        # Principal angles represent the 'rotations' needed to align two subspaces
         angles = subspace_angles(U1, U2)
         return float(np.linalg.norm(angles))
 
     @classmethod
     def distance_matrix(
         cls, 
-        frames: Sequence[Atoms], 
+        frames: Sequence['Atoms'], 
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd"
     ) -> np.ndarray:
         """
-        Generates the pairwise Grassmann distance matrix.
+        Computes a symmetric pairwise distance matrix for a molecular trajectory.
         """
         logger.info(
             f"Computing Grassmann distance matrix for {len(frames)} frames "
             f"(k={k}, method='{method}')."
         )
-        bases = cls.get_uk_bases(frames, k=k, method=method)
+        
+        # Precompute bases
+        bases = cls._get_uk_bases(frames, k=k, method=method)
         num_frames = len(bases)
         dist_matrix = np.zeros((num_frames, num_frames))
         total_pairs = num_frames * (num_frames - 1) // 2
@@ -252,9 +255,11 @@ class Grassmann:
         with tqdm(total=total_pairs, desc="Grassmann distances", unit="pair") as pbar:
             for i in range(num_frames):
                 for j in range(i + 1, num_frames):
-                    dist = cls.distance(bases[i], bases[j])
+                    # Compute distance once per unique pair
+                    dist = cls._distance(bases[i], bases[j])
                     dist_matrix[i, j] = dist_matrix[j, i] = dist
                     pbar.update(1)
+                    
         logger.success("Finished Grassmann distance matrix computation.")
         return dist_matrix
 

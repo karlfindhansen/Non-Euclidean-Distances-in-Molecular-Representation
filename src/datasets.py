@@ -492,8 +492,9 @@ class QM9Dataset:
             max_bond_rattle=max_bond_rattle
         )
 
-    def export_subset_xyz(
+    def get_positions(
         self,
+        invariant: bool = True,
         output_filename: str = "qm9_subset.xyz",
         subset_size: Optional[int] = None,
         seed: int = 40,
@@ -526,6 +527,11 @@ class QM9Dataset:
 
                 mol = Chem.AddHs(mol)
                 AllChem.ComputeGasteigerCharges(mol)
+                
+                # Ensuring permutational invariance
+                if invariant:
+                    order = Chem.CanonicalRankAtoms(mol)
+                    mol = Chem.RenumberAtoms(mol, list(order))
 
                 params = AllChem.ETKDG()
                 params.randomSeed = seed
@@ -533,6 +539,7 @@ class QM9Dataset:
                     raise ValueError("Embedding failed.")
 
                 conf = mol.GetConformer()
+
                 symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
                 positions = conf.GetPositions()
                 charges = np.array(
