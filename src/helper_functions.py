@@ -141,6 +141,6 @@ if __name__ == '__main__':
     from src.datasets import QM9Dataset
     dataset = QM9Dataset()
     df = dataset.load()
-    frames = dataset.export_subset_xyz()
+    frames = dataset.get_positions()
     matrices = get_distances(frames)
     

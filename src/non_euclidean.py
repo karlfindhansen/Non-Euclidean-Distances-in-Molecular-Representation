@@ -1,14 +1,17 @@
-from typing import Sequence
-from scipy.linalg import subspace_angles
-from pyriemann.utils.distance import distance_riemann, distance_logeuclid
-from ase import Atoms
-import persim
-from ripser import ripser
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Sequence
+
 import numpy as np
-from tqdm import tqdm
-from loguru import logger
 import ot
+import persim
+
+from ase import Atoms
+from ase.data import covalent_radii
+from loguru import logger
+from pymatgen.core import Element
+from ripser import ripser
+from scipy.linalg import subspace_angles
+from tqdm import tqdm
+from pyriemann.utils.distance import distance_logeuclid, distance_riemann
 
 class Wasserstein:
     """
@@ -179,8 +182,38 @@ class Grassmann:
     Represents each molecule as a k-dimensional subspace in R^n (atom-space).
     """
 
-    @staticmethod
+    @classmethod
+    def _extract_invariant_features(cls, frame: Atoms) -> np.ndarray:
+        """
+        Maps a molecule to a D x N matrix of invariant physical features.
+        D is the fixed ambient dimension. N is the number of atoms.
+        """
+        features = []
+        # Center of mass acts as an invariant spatial anchor
+        com = frame.get_center_of_mass()
+        
+        for atom in frame:
+            z = atom.number
+            rad = covalent_radii[z]
+            el = Element.from_Z(z)
+            en = el.X if el.X else 0.0
+
+            mass = atom.mass
+            
+            # Geometric invariance: distance to center of mass
+            dist_to_com = np.linalg.norm(atom.position - com)
+            
+            # D = 5 fixed, invariant features. 
+            # You can expand this to include SOAP or local coordination.
+            feat_vector = [z, rad, en, mass, dist_to_com]
+            features.append(feat_vector)
+            
+        # Transpose to yield (D_features, N_atoms)
+        return np.array(features).T
+
+    @classmethod
     def _get_uk_bases(
+        cls,
         frames: Sequence['Atoms'], 
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd"
@@ -190,31 +223,18 @@ class Grassmann:
         """
         bases = []
         # Ambient dimension n must be constant across the dataset for manifold comparison
-        max_atoms = max(len(f) for f in frames)
+        #max_atoms = max(len(f) for f in frames)
         
         for frame in frames:
-            coords = frame.get_positions(invariant=False)
-            n_atoms = len(coords)
-
-            # Translation invariance: move geometric centroid to origin
-            centered = coords - np.mean(coords, axis=0)
-
-            # Zero-padding ensures all molecules live in the same R^max_atoms space
-            # Missing atoms are treated as having zero variance in those dimensions
-            padded = np.zeros((max_atoms, 3))
-            padded[:n_atoms, :] = centered
-
-            # Rotational invariance: The Gram Matrix (n x n) captures relative.
-            # distances/angles between atoms, independent of 3D orientation.
-            gram = padded @ padded.T
+            feature_matrix = cls._extract_invariant_features(frame)
             
             if method.lower() == "qr":
-                # QR decomposition of Gram matrix
-                q, _ = np.linalg.qr(gram)
+                # QR decomposition of feature matrix
+                q, _ = np.linalg.qr(feature_matrix)
                 basis = q[:, :k]
             else:
                 # SVD gives a basis ordered by structural variance
-                u, _, _ = np.linalg.svd(gram, full_matrices=False)
+                u, _, _ = np.linalg.svd(feature_matrix, full_matrices=False)
                 basis = u[:, :k]
                 
             bases.append(basis)
@@ -273,7 +293,7 @@ class Riemann:
     @staticmethod
     def compute_covariance_matrices(frames: Sequence[Atoms]) -> np.ndarray:
         covs = []
-        for idx, frame in enumerate(frames):
+        for frame in frames:
             positions = frame.get_positions()
             charge = frame.get_initial_charges()
 

@@ -62,13 +62,65 @@ def plot_all_distance_matrices(**matrices):
     plt.tight_layout()
     plt.show()
 
+def clustering_on_distance_matrix(dist_matrix: np.ndarray):
+
+    from sklearn.cluster import SpectralClustering
+    import kmedoids
+    import umap
+    import seaborn as sns
+
+    # 1. Spectral Clustering (works directly on affinity/distance)
+    # Convert distance to affinity: exp(-d^2 / 2*sigma^2)
+    affinity = np.exp(-dist_matrix ** 2 / (2. * np.mean(dist_matrix) ** 2))
+    sc = SpectralClustering(n_clusters=2, affinity='precomputed', random_state=42)
+    labels = sc.fit_predict(affinity)
+
+    unique, counts = np.unique(labels, return_counts=True)
+    print("Number of items in each cluster for Spectral clustering: ")
+    print(dict(zip(unique, counts)))
+
+    model = kmedoids.KMedoids(n_clusters=2, random_state=42)
+    labels = model.fit_predict(dist_matrix)
+
+    # print the number of items in each cluster
+    unique, counts = np.unique(labels, return_counts=True)
+    print("Number of items in each cluster for Kmedoids: ")
+    print(dict(zip(unique, counts)))
+
+    # 2. UMAP for visualization of the distance matrix
+    # metric='precomputed' expects a distance matrix
+    reducer = umap.UMAP(metric='precomputed', n_neighbors=15, min_dist=0.1, random_state=42)
+    embedding = reducer.fit_transform(dist_matrix)
+
+    # 3. Plotting
+    plt.figure(figsize=(10, 7))
+    sns.scatterplot(
+        x=embedding[:, 0], 
+        y=embedding[:, 1], 
+        hue=labels, 
+        palette='viridis', 
+        legend='full',
+        s=60
+    )
+    plt.title(f"UMAP Projection with Spectral Clustering (Grassmann)")
+    plt.xlabel("UMAP 1")
+    plt.ylabel("UMAP 2")
+    plt.show()
+
+
 if __name__ == "__main__":
 
     qm9 = QM9Dataset()
     qm9.load()
 
     frames = qm9.run_stress_test()
+    all_frames = qm9.get_positions(invariant=True)
     
+    grassmann_dist_matrix = Grassmann.distance_matrix(all_frames, method='svd')
+    plot_all_distance_matrices(Grassmann=grassmann_dist_matrix)
+    clustering_on_distance_matrix(grassmann_dist_matrix)
+    exit()
+
     xyz_features = get_raw_xyz_features(frames)
     point_clouds = get_weighted_point_clouds(frames)
 
