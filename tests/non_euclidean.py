@@ -116,7 +116,8 @@ if __name__ == "__main__":
     frames = qm9.run_stress_test()
     all_frames = qm9.get_positions(invariant=True)
     
-    grassmann_dist_matrix = Grassmann.distance_matrix(all_frames, method='svd')
+    grassmann_dist_matrix = Grassmann.distance_matrix(all_frames)
+
     plot_all_distance_matrices(Grassmann=grassmann_dist_matrix)
     clustering_on_distance_matrix(grassmann_dist_matrix)
     exit()

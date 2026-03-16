@@ -53,7 +53,7 @@ class QM9Dataset:
         "ether": Fragments.fr_ether,
         "nitro": Fragments.fr_nitro,
     }
-    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies"}
+    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups"}
 
     def __init__(
         self,
@@ -158,6 +158,8 @@ class QM9Dataset:
             res = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
             if res != 0: continue
 
+            formula = CalcMolFormula(mol)
+
             structure_type = self._classify_structure_type(mol)
             if structure_type == "acyclic":
                 struct_class = "Acyclic"
@@ -168,14 +170,42 @@ class QM9Dataset:
             
             canonical = Chem.MolToSmiles(mol, canonical=True)
             selfies_str = sf.encoder(canonical)
+            functional_groups = self._detect_functional_groups(mol)
+            functional_groups_str = ",".join(functional_groups)
 
             dist_matrix = Chem.GetDistanceMatrix(mol)
 
+            num_carbons = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6)
+            num_sp_carbons = sum(
+                1
+                for atom in mol.GetAtoms()
+                if atom.GetAtomicNum() == 6
+                and atom.GetHybridization() == Chem.HybridizationType.SP
+            )
+            num_sp2_carbons = sum(
+                1
+                for atom in mol.GetAtoms()
+                if atom.GetAtomicNum() == 6
+                and atom.GetHybridization() == Chem.HybridizationType.SP2
+            )
+            num_sp3_carbons = sum(
+                1
+                for atom in mol.GetAtoms()
+                if atom.GetAtomicNum() == 6
+                and atom.GetHybridization() == Chem.HybridizationType.SP3
+            )
+            denom_c = float(num_carbons) if num_carbons > 0 else 1.0
+            fraction_csp1 = float(num_sp_carbons / denom_c)
+            fraction_csp2 = float(num_sp2_carbons / denom_c)
+            fraction_csp3 = float(num_sp3_carbons / denom_c)
+
             mol_dict = {
                 "mol_id": f"qm9_{i}",
+                "formula":formula,
                 "smiles": smiles, 
                 "canonical_smiles": canonical,
                 "selfies": selfies_str,
+                "functional_groups": functional_groups_str,
                 "num_atoms": int(data.num_nodes),
                 "structure_class": struct_class,
 
@@ -191,17 +221,17 @@ class QM9Dataset:
                 
                 # Flexibility/Complexity & newly added string/graph complexity metrics
                 "num_rotatable_bonds": int(Descriptors.NumRotatableBonds(mol)),
-                "fraction_csp1": rdMolDescriptors.CalcFractionCSP1(mol),
-                "fraction_csp2": rdMolDescriptors.CalcFractionCSP2(mol),
-                "fraction_csp3": rdMolDescriptors.CalcFractionCSP3(mol),
+                "fraction_csp1": fraction_csp1,
+                "fraction_csp2": fraction_csp2,
+                "fraction_csp3": fraction_csp3,
                 "h_bond_donors": int(Descriptors.NumHDonors(mol)),
                 "h_bond_acceptors": int(Descriptors.NumHAcceptors(mol)),
                 
                 # Syntactic and Complexity Descriptors
                 "branching_index": sum(1 for atom in mol.GetAtoms() if atom.GetDegree() > 2),
-                "num_sp_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP),
-                "num_sp2_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP2),
-                "num_sp3_carbons": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6 and atom.GetHybridization() == Chem.HybridizationType.SP3),
+                "num_sp_carbons": int(num_sp_carbons),
+                "num_sp2_carbons": int(num_sp2_carbons),
+                "num_sp3_carbons": int(num_sp3_carbons),
                 "main_chain_length":  int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
                 "raw_token_count": int(selfies_str.count('[')),
 
@@ -520,6 +550,7 @@ class QM9Dataset:
         for row in sample_df.iter_rows(named=True):
             mol_id = row["mol_id"]
             smiles = row["canonical_smiles"]
+            formula = row["formula"]
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is None:
@@ -564,6 +595,7 @@ class QM9Dataset:
                     {
                         "mol_id": mol_id,
                         "smiles": smiles,
+                        "formula": formula,
                         "structure_type": self._classify_structure_type(mol),
                         "functional_groups": ",".join(self._detect_functional_groups(mol)),
                         "heavy_atom_count": heavy_atom_count,

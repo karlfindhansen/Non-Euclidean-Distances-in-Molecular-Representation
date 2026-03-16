@@ -6,12 +6,14 @@ import persim
 
 from ase import Atoms
 from ase.data import covalent_radii
+from ase.neighborlist import neighbor_list
 from loguru import logger
 from pymatgen.core import Element
 from ripser import ripser
 from scipy.linalg import subspace_angles
 from tqdm import tqdm
 from pyriemann.utils.distance import distance_logeuclid, distance_riemann
+from sklearn.preprocessing import StandardScaler
 
 class Wasserstein:
     """
@@ -191,7 +193,19 @@ class Grassmann:
         features = []
         # Center of mass acts as an invariant spatial anchor
         com = frame.get_center_of_mass()
-        
+
+        # compute neighbor list
+        cutoff = 1.8
+        i_list, j_list, d_list = neighbor_list("ijd", frame, cutoff)
+
+        neighbors = {i: [] for i in range(len(frame))}
+        distances = {i: [] for i in range(len(frame))}
+
+        for i, j, d in zip(i_list, j_list, d_list):
+            neighbors[i].append(frame[j].number)
+            distances[i].append(d)
+
+
         for atom in frame:
             z = atom.number
             rad = covalent_radii[z]
@@ -202,14 +216,39 @@ class Grassmann:
             
             # Geometric invariance: distance to center of mass
             dist_to_com = np.linalg.norm(atom.position - com)
-            
-            # D = 5 fixed, invariant features. 
+
+            coord = len(neighbors[i])
+
+            if coord > 0:
+                avg_neighbor_z = np.mean(neighbors[i])
+                avg_neighbor_dist = np.mean(distances[i])
+            else:
+                avg_neighbor_z = 0
+                avg_neighbor_dist = 0
+
+            # D = 8 fixed, invariant features. 
             # You can expand this to include SOAP or local coordination.
-            feat_vector = [z, rad, en, mass, dist_to_com]
+            feat_vector = [
+                z,
+                rad,
+                en,
+                mass,
+                dist_to_com,
+                coord,
+                avg_neighbor_z,
+                avg_neighbor_dist
+            ]
+            
             features.append(feat_vector)
             
+        feat_matrix = np.array(features)
+        
+        # This ensures each feature contributes equally to the SVD basis
+        #scaler = StandardScaler()
+        #feat_matrix = scaler.fit_transform(feat_matrix)
+
         # Transpose to yield (D_features, N_atoms)
-        return np.array(features).T
+        return feat_matrix.T
 
     @classmethod
     def _get_uk_bases(
@@ -222,8 +261,6 @@ class Grassmann:
         Maps 3D atomic coordinates to an orthonormal basis in R^n.
         """
         bases = []
-        # Ambient dimension n must be constant across the dataset for manifold comparison
-        #max_atoms = max(len(f) for f in frames)
         
         for frame in frames:
             feature_matrix = cls._extract_invariant_features(frame)
