@@ -54,6 +54,7 @@ def get_structures(df, mol_id_list = None):
 def align_frames_to_dist_matrix(
     frames: Sequence[Atoms],
     dist_matrix: Optional[np.ndarray] = None,
+    return_matrix: bool = False,
 ) -> list[Atoms]:
     """
     Ensures frames match a precomputed pairwise distance matrix size.
@@ -61,42 +62,41 @@ def align_frames_to_dist_matrix(
     """
     aligned_frames = list(frames)
     if dist_matrix is None:
-        return aligned_frames
+        return aligned_frames if not return_matrix else (aligned_frames, dist_matrix)
 
     if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
         raise ValueError("dist_matrix must be a square matrix.")
 
     n_frames = len(aligned_frames)
     n_matrix = int(dist_matrix.shape[0])
-    if n_frames < n_matrix:
-        raise ValueError(
-            f"frames has {n_frames} entries, but dist_matrix requires {n_matrix}."
+    if n_frames != n_matrix:
+        min_n = min(n_frames, n_matrix)
+        logger.warning(
+            "Aligning frames and dist_matrix sizes: "
+            f"frames={n_frames}, dist_matrix={n_matrix}. Using first {min_n} entries."
         )
-    if n_frames > n_matrix:
-        aligned_frames = aligned_frames[:n_matrix]
+        aligned_frames = aligned_frames[:min_n]
+        dist_matrix = dist_matrix[:min_n, :min_n]
 
-    return aligned_frames
+    return aligned_frames if not return_matrix else (aligned_frames, dist_matrix)
 
 def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
     data_dir = f'data/{dataset}'
     os.makedirs(data_dir, exist_ok=True)
+    expected_n = len(frames)
 
     matrix_tasks = {
-        'grassmann_qr': {
-            'path': f'{data_dir}/dist_matrix_grassmann_qr.npy',
-            'compute': lambda: Grassmann.distance_matrix(frames, method='qr')
-        },
-        'grassmann_svd': {
-            'path': f'{data_dir}/dist_matrix_grassmann_svd.npy',
-            'compute': lambda: Grassmann.distance_matrix(frames, method='svd')
+        'grassmann': {
+            'path': f'{data_dir}/dist_matrix_grassmann.npy',
+            'compute': lambda: Grassmann.distance_matrix(frames)
         },
         'euclidean_riemann': {
             'path': f'{data_dir}/dist_matrix_euclidean_riemann.npy',
-            'compute': lambda: Riemann.distance_matrix(frames, metric_type='log-euclidean')
+            'compute': lambda: Riemann.distance_matrix(frames, metric='log-euclidean')
         },
         'affine_riemann': {
             'path': f'{data_dir}/dist_matrix_affine_riemann.npy',
-            'compute': lambda: Riemann.distance_matrix(frames, metric_type='affine-invariant')
+            'compute': lambda: Riemann.distance_matrix(frames, metric='affine-invariant')
         },
         'wasserstein': {
             'path': f'{data_dir}/dist_matrix_wasserstein.npy',
@@ -111,11 +111,6 @@ def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
             'compute': lambda: PersistentHomology.distance_matrix(frames, metric="sliced_wasserstein")
         }
     }
-
-    if frames_ph is not None:
-        logger.info("Using PH")
-        matrix_tasks['ph_bottleneck']['compute'] = lambda: PersistentHomology.distance_matrix(frames_ph, metric="bottleneck")
-        matrix_tasks['ph_sliced_wasserstein']['compute'] = lambda: PersistentHomology.distance_matrix(frames_ph, metric="sliced_wasserstein")
 
     matrices = {}
 
@@ -132,6 +127,16 @@ def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
             logger.info(f"Computing {name} distance matrix...")
             matrices[name] = task['compute']()
             np.save(file_path, matrices[name])
+
+        mat = np.asarray(matrices[name])
+        if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+            raise ValueError(
+                f"{name} distance matrix must be square. Got shape {mat.shape}."
+            )
+        if mat.shape[0] != expected_n:
+            raise ValueError(
+                f"{name} distance matrix size mismatch: expected ({expected_n}, {expected_n}), got {mat.shape}."
+            )
 
     logger.success("✓ All distance matrices are ready!")
     

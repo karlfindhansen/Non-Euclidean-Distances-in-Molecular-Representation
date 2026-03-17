@@ -8,12 +8,84 @@ from ase import Atoms
 from ase.data import covalent_radii
 from ase.neighborlist import neighbor_list
 from loguru import logger
+from scipy.linalg import logm, eigvalsh
 from pymatgen.core import Element
 from ripser import ripser
 from scipy.linalg import subspace_angles
 from tqdm import tqdm
-from pyriemann.utils.distance import distance_logeuclid, distance_riemann
 from sklearn.preprocessing import StandardScaler
+
+def _compute_invariant_feature_matrix(frame: Atoms, cutoff: float = 1.8) -> np.ndarray:
+    """
+    Maps a molecule to a D x N matrix of invariant physical features.
+    D is the fixed ambient dimension. N is the number of atoms.
+    """
+    features = []
+    # Center of mass acts as an invariant spatial anchor
+    com = frame.get_center_of_mass()
+
+    i_list, j_list, d_list = neighbor_list("ijd", frame, cutoff)
+
+    neighbors = {i: [] for i in range(len(frame))}
+    distances = {i: [] for i in range(len(frame))}
+
+    for i, j, d in zip(i_list, j_list, d_list):
+        neighbors[i].append(frame[j].number)
+        distances[i].append(d)
+
+    for i, atom in enumerate(frame):
+        z = atom.number
+        rad = covalent_radii[z]
+        el = Element.from_Z(z)
+        en = el.X if el.X else 0.0
+
+        mass = atom.mass
+
+        # Geometric invariance: distance to center of mass
+        dist_to_com = np.linalg.norm(atom.position - com)
+
+        coord = len(set(neighbors[i]))
+
+        if coord > 0:
+            avg_neighbor_z = np.mean(neighbors[i])
+            avg_neighbor_dist = np.mean(distances[i])
+        else:
+            avg_neighbor_z = 0
+            avg_neighbor_dist = 0
+
+        # D = 8 fixed, invariant features. 
+        # You can expand this to include SOAP or local coordination.
+        feat_vector = [
+            z,
+            rad,
+            en,
+            mass,
+            dist_to_com,
+            coord,
+            avg_neighbor_z,
+            avg_neighbor_dist
+        ]
+
+        features.append(feat_vector)
+
+    return np.array(features)
+
+def _pairwise_distance_matrix(
+    n: int,
+    pair_fn,
+    desc: str
+) -> np.ndarray:
+    dist_matrix = np.zeros((n, n))
+    total_pairs = n * (n - 1) // 2
+
+    with tqdm(total=total_pairs, desc=desc, unit="pair") as pbar:
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = pair_fn(i, j)
+                dist_matrix[i, j] = dist_matrix[j, i] = d
+                pbar.update(1)
+
+    return dist_matrix
 
 class Wasserstein:
     """
@@ -39,21 +111,17 @@ class Wasserstein:
         return float(distance)
 
     @classmethod
-    def distance_matrix(cls, frames: Sequence[Atoms], metric: str = 'sqeuclidean') -> np.ndarray:
+    def distance_matrix(cls, frames: Sequence[Atoms], metric: str = 'euclidean') -> np.ndarray:
         logger.info(
             f"Computing Wasserstein distance matrix for {len(frames)} frames "
             f"(ground metric='{metric}')."
         )
         n = len(frames)
-        dist_matrix = np.zeros((n, n))
-        total_pairs = n * (n - 1) // 2
-
-        with tqdm(total=total_pairs, desc="Wasserstein distances", unit="pair") as pbar:
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = cls.compute_distance(frames[i], frames[j], metric=metric)
-                    dist_matrix[i, j] = dist_matrix[j, i] = d
-                    pbar.update(1)
+        dist_matrix = _pairwise_distance_matrix(
+            n=n,
+            pair_fn=lambda i, j: cls.compute_distance(frames[i], frames[j], metric=metric),
+            desc="Wasserstein distances",
+        )
         logger.success("Finished Wasserstein distance matrix computation.")
         return dist_matrix
 
@@ -125,6 +193,9 @@ class PersistentHomology:
         for d in dims:
             # Safely fetch the diagrams for dimension `d`, defaulting to empty if missing
             p1, p2 = dgm1.get(d, np.empty((0, 2))), dgm2.get(d, np.empty((0, 2)))
+
+            if len(p1) == 0 and len(p2) == 0:
+                continue
             
             # Filter out features with infinite death times (essential classes) 
             # since distance metrics require finite bounds to compute properly
@@ -162,18 +233,11 @@ class PersistentHomology:
         # Precompute all diagrams
         dgms = cls.compute_persistence_diagrams(frames, max_homology_dim)
         n = len(dgms)
-        dist_mat = np.zeros((n, n))
-        
-        # Only compute the upper triangle to halve the required calculations
-        total_pairs = n * (n - 1) // 2
-
-        with tqdm(total=total_pairs, desc="Persistence distances", unit="pair") as pbar:
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims)
-                    # Mirror the upper triangle to the lower triangle
-                    dist_mat[i, j] = dist_mat[j, i] = d
-                    pbar.update(1)
+        dist_mat = _pairwise_distance_matrix(
+            n=n,
+            pair_fn=lambda i, j: cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims),
+            desc="Persistence distances",
+        )
                     
         logger.success("Finished persistent homology distance matrix computation.")
         return dist_mat
@@ -183,72 +247,6 @@ class Grassmann:
     Handles molecular representation on Grassmann Manifolds G(k, n).
     Represents each molecule as a k-dimensional subspace in R^n (atom-space).
     """
-
-    @classmethod
-    def _extract_invariant_features(cls, frame: Atoms) -> np.ndarray:
-        """
-        Maps a molecule to a D x N matrix of invariant physical features.
-        D is the fixed ambient dimension. N is the number of atoms.
-        """
-        features = []
-        # Center of mass acts as an invariant spatial anchor
-        com = frame.get_center_of_mass()
-
-        # compute neighbor list
-        cutoff = 1.8
-        i_list, j_list, d_list = neighbor_list("ijd", frame, cutoff)
-
-        neighbors = {i: [] for i in range(len(frame))}
-        distances = {i: [] for i in range(len(frame))}
-
-        for i, j, d in zip(i_list, j_list, d_list):
-            neighbors[i].append(frame[j].number)
-            distances[i].append(d)
-
-
-        for atom in frame:
-            z = atom.number
-            rad = covalent_radii[z]
-            el = Element.from_Z(z)
-            en = el.X if el.X else 0.0
-
-            mass = atom.mass
-            
-            # Geometric invariance: distance to center of mass
-            dist_to_com = np.linalg.norm(atom.position - com)
-
-            coord = len(neighbors[i])
-
-            if coord > 0:
-                avg_neighbor_z = np.mean(neighbors[i])
-                avg_neighbor_dist = np.mean(distances[i])
-            else:
-                avg_neighbor_z = 0
-                avg_neighbor_dist = 0
-
-            # D = 8 fixed, invariant features. 
-            # You can expand this to include SOAP or local coordination.
-            feat_vector = [
-                z,
-                rad,
-                en,
-                mass,
-                dist_to_com,
-                coord,
-                avg_neighbor_z,
-                avg_neighbor_dist
-            ]
-            
-            features.append(feat_vector)
-            
-        feat_matrix = np.array(features)
-        
-        # This ensures each feature contributes equally to the SVD basis
-        #scaler = StandardScaler()
-        #feat_matrix = scaler.fit_transform(feat_matrix)
-
-        # Transpose to yield (D_features, N_atoms)
-        return feat_matrix.T
 
     @classmethod
     def _get_uk_bases(
@@ -262,16 +260,24 @@ class Grassmann:
         """
         bases = []
         
-        for frame in frames:
-            feature_matrix = cls._extract_invariant_features(frame)
+        # Extract raw features for ALL frames
+        raw_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
+        
+        # Fit a global scaler across all atoms in the entire dataset
+        all_atoms_features = np.vstack(raw_matrices)
+        global_scaler = StandardScaler().fit(all_atoms_features)
+
+        for raw_feat in raw_matrices:
+            # Transform using the global standard and transpose to (D, N)
+            scaled_feat = global_scaler.transform(raw_feat).T
             
             if method.lower() == "qr":
                 # QR decomposition of feature matrix
-                q, _ = np.linalg.qr(feature_matrix)
+                q, _ = np.linalg.qr(scaled_feat)
                 basis = q[:, :k]
             else:
                 # SVD gives a basis ordered by structural variance
-                u, _, _ = np.linalg.svd(feature_matrix, full_matrices=False)
+                u, _, _ = np.linalg.svd(scaled_feat, full_matrices=False)
                 basis = u[:, :k]
                 
             bases.append(basis)
@@ -306,73 +312,180 @@ class Grassmann:
         # Precompute bases
         bases = cls._get_uk_bases(frames, k=k, method=method)
         num_frames = len(bases)
-        dist_matrix = np.zeros((num_frames, num_frames))
-        total_pairs = num_frames * (num_frames - 1) // 2
-
-        with tqdm(total=total_pairs, desc="Grassmann distances", unit="pair") as pbar:
-            for i in range(num_frames):
-                for j in range(i + 1, num_frames):
-                    # Compute distance once per unique pair
-                    dist = cls._distance(bases[i], bases[j])
-                    dist_matrix[i, j] = dist_matrix[j, i] = dist
-                    pbar.update(1)
-                    
+        dist_matrix = _pairwise_distance_matrix(
+            n=num_frames,
+            pair_fn=lambda i, j: cls._distance(bases[i], bases[j]),
+            desc="Grassmann distances",
+        )
+        
         logger.success("Finished Grassmann distance matrix computation.")
         return dist_matrix
 
 class Riemann:
+    """
+    Handles molecular representation on the Riemannian Manifold of SPD matrices.
 
-    _METRICS = {
-        "log-euclidean":    distance_logeuclid,
-        "affine-invariant": distance_riemann,
-    }
+    Each molecule is represented as a covariance matrix of invariant atomic
+    feature vectors. Distances are computed using either:
+
+    - Log-Euclidean metric
+    - Affine-Invariant Riemannian metric
+    """
+
+    @classmethod
+    def _get_spd_matrices(cls, frames, regularization: float = 1e-6) -> np.ndarray:
+        """
+        Converts frames into SPD covariance matrices.
+        """
+
+        # Extract invariant atomic features
+        raw_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
+
+        # Global normalization across all atoms in all frames
+        all_atoms_features = np.vstack(raw_matrices)
+        scaler = StandardScaler().fit(all_atoms_features)
+
+        spd_matrices = []
+
+        for raw_feat in raw_matrices:
+            X = scaler.transform(raw_feat).T   # shape (D, N)
+
+            C = (X @ X.T) / X.shape[1]
+            C += np.eye(C.shape[0]) * regularization
+
+            spd_matrices.append(C)
+
+        return np.array(spd_matrices)
+
+    # ---------------------------------------------------------
 
     @staticmethod
-    def compute_covariance_matrices(frames: Sequence[Atoms]) -> np.ndarray:
-        covs = []
-        for frame in frames:
-            positions = frame.get_positions()
-            charge = frame.get_initial_charges()
+    def _log_spd(C: np.ndarray) -> np.ndarray:
+        """
+        Computes matrix logarithm of SPD matrix using eigen-decomposition.
+        """
+        eigvals, eigvecs = np.linalg.eigh(C)
 
-            positions = np.hstack((positions, charge[:, np.newaxis]))
+        eigvals = np.clip(eigvals, 1e-12, None)
 
-            cov = np.cov(positions, rowvar=False)   
-            cov = (cov + cov.T) / 2
-            cov += np.eye(cov.shape[0]) * 1e-6   
+        log_eigvals = np.log(eigvals)
 
-            covs.append(cov)
-        return np.array(covs)
+        return eigvecs @ np.diag(log_eigvals) @ eigvecs.T
+
+    # ---------------------------------------------------------
+
+    @classmethod
+    def _log_spd_batch(cls, spd_matrices: np.ndarray) -> np.ndarray:
+        """
+        Precompute log-SPD matrices for all frames.
+        """
+        log_mats = []
+
+        for C in tqdm(spd_matrices, desc="Computing log-SPD matrices"):
+            log_mats.append(cls._log_spd(C))
+
+        return np.array(log_mats)
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _distance_log_euclidean(logC1: np.ndarray, logC2: np.ndarray) -> float:
+        """
+        Log-Euclidean Riemannian distance.
+
+        d(A,B) = || log(A) - log(B) ||_F
+        """
+        return float(np.linalg.norm(logC1 - logC2, ord="fro"))
+
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _distance_affine_invariant(C1: np.ndarray, C2: np.ndarray) -> float:
+        """
+        Affine-Invariant Riemannian distance.
+
+        d(A,B) = sqrt( sum( log(lambda_i)^2 ) )
+        where lambda_i are generalized eigenvalues.
+        """
+
+        eigvals = eigvalsh(C1, C2)
+        eigvals = np.clip(eigvals, 1e-12, None)
+
+        return float(np.sqrt(np.sum(np.log(eigvals) ** 2)))
+
+    # ---------------------------------------------------------
 
     @classmethod
     def distance_matrix(
         cls,
-        frames: Sequence[Atoms],
-        metric_type: str = "log-euclidean",
+        frames,
+        metric: str = "log-euclidean",
+        regularization: float = 1e-6,
     ) -> np.ndarray:
+        """
+        Computes pairwise Riemannian distance matrix for frames.
+        """
+
         logger.info(
             f"Computing Riemannian distance matrix for {len(frames)} frames "
-            f"(metric_type='{metric_type}')."
+            f"(metric='{metric}')"
         )
-        key = metric_type.strip().lower().replace("_", "-").replace(" ", "-")
-        metric_fn = cls._METRICS.get(key)
-        if metric_fn is None:
-            logger.error(f"Unknown Riemann metric_type '{metric_type}'.")
+
+        metric_key = metric.lower()
+
+        if metric_key not in {"log-euclidean", "affine-invariant"}:
             raise ValueError(
-                f"Unknown metric_type '{metric_type}'. "
-                f"Choose from: {list(cls._METRICS)}."
+                "metric must be one of: ['log-euclidean', 'affine-invariant']"
             )
 
-        covs = cls.compute_covariance_matrices(frames)
-        n = len(covs)
-        dist_matrix = np.zeros((n, n))
-        total_pairs = n * (n - 1) // 2
+        # Step 1: Build SPD matrices
+        spd_matrices = cls._get_spd_matrices(frames, regularization)
+        n = len(spd_matrices)
 
-        with tqdm(total=total_pairs, desc="Riemannian distances", unit="pair") as pbar:
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = metric_fn(covs[i], covs[j])
-                    dist_matrix[i, j] = dist_matrix[j, i] = d
-                    pbar.update(1)
+        dist_matrix = np.zeros((n, n))
+
+        # -------------------------------------------------
+        # LOG-EUCLIDEAN METRIC
+        # -------------------------------------------------
+
+        if metric_key == "log-euclidean":
+
+            log_mats = cls._log_spd_batch(spd_matrices)
+
+            total_pairs = n * (n - 1) // 2
+
+            with tqdm(total=total_pairs, desc="Riemann distances", unit="pair") as pbar:
+
+                for i in range(n):
+                    for j in range(i + 1, n):
+
+                        d = cls._distance_log_euclidean(log_mats[i], log_mats[j])
+
+                        dist_matrix[i, j] = dist_matrix[j, i] = d
+
+                        pbar.update(1)
+
+        # -------------------------------------------------
+        # AFFINE-INVARIANT METRIC
+        # -------------------------------------------------
+
+        else:
+
+            total_pairs = n * (n - 1) // 2
+
+            with tqdm(total=total_pairs, desc="Riemann distances", unit="pair") as pbar:
+
+                for i in range(n):
+                    for j in range(i + 1, n):
+
+                        d = cls._distance_affine_invariant(
+                            spd_matrices[i], spd_matrices[j]
+                        )
+
+                        dist_matrix[i, j] = dist_matrix[j, i] = d
+
+                        pbar.update(1)
+
         logger.success("Finished Riemannian distance matrix computation.")
 
         return dist_matrix

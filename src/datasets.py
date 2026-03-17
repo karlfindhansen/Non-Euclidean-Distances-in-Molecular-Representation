@@ -11,6 +11,7 @@ from torch_geometric.datasets import QM9
 from ase import Atoms
 from ase.io import write
 from rdkit import Chem
+from rdkit import RDLogger
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
@@ -61,12 +62,14 @@ class QM9Dataset:
         filename: str = "dataset_cleaned.csv",
         subset_size: int = 2000,
         required_mol_ids: Optional[List[str]] = None,
+        embed_seed: int = 40,
     ):
         self.root = root
         self.filename = filename
         self.file_path = os.path.join(root, filename)
         self.subset_size = subset_size
         self.required_mol_ids = required_mol_ids or []
+        self.embed_seed = embed_seed
         self.df = pl.DataFrame()
         self.scaler = StandardScaler()
         self.is_scaled = False
@@ -76,6 +79,8 @@ class QM9Dataset:
         # Initialize Sub-Components
         self.geometry_engine = GeometryPerturber(save_path=os.path.join(root, "stress_test.xyz"))
         self.distance_engine = DistanceCalculator(cache_dir=root)
+
+        RDLogger.DisableLog("rdApp.error")
 
     @staticmethod
     def _classify_structure_type(mol: Chem.Mol) -> str:
@@ -102,6 +107,24 @@ class QM9Dataset:
         if has_halogen:
             groups.append("halogen")
         return groups
+
+    @staticmethod
+    def _compute_average_bond_length(mol: Chem.Mol) -> float:
+        """Compute average bond length (Angstrom) from the molecule's conformer."""
+        if mol.GetNumBonds() == 0:
+            return 0.0
+        conf = mol.GetConformer()
+        total = 0.0
+        count = 0
+        for bond in mol.GetBonds():
+            i = bond.GetBeginAtomIdx()
+            j = bond.GetEndAtomIdx()
+            pi = conf.GetAtomPosition(i)
+            pj = conf.GetAtomPosition(j)
+            dist = ((pi.x - pj.x) ** 2 + (pi.y - pj.y) ** 2 + (pi.z - pj.z) ** 2) ** 0.5
+            total += dist
+            count += 1
+        return float(total / count) if count > 0 else 0.0
 
     def load(self, force_process: bool = False) -> pl.DataFrame:
         """Loads the main dataset, processing if necessary."""
@@ -149,14 +172,16 @@ class QM9Dataset:
             if len(data_list) >= buffer_size and i >= max_required_index:
                 break
             smiles = getattr(data, 'smiles', None)
-            if not smiles: continue
+            if not smiles: 
+                continue
 
-            mol = Chem.MolFromSmiles(smiles)
-            if not mol: continue
-
-            mol = Chem.AddHs(mol)
-            res = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-            if res != 0: continue
+            mol = self._embed_molecule(
+                smiles=smiles,
+                seed=self.embed_seed,
+                invariant=True,
+            )
+            if mol is None:
+                continue
 
             formula = CalcMolFormula(mol)
 
@@ -174,6 +199,7 @@ class QM9Dataset:
             functional_groups_str = ",".join(functional_groups)
 
             dist_matrix = Chem.GetDistanceMatrix(mol)
+            avg_bond_length = self._compute_average_bond_length(mol)
 
             num_carbons = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6)
             num_sp_carbons = sum(
@@ -234,6 +260,7 @@ class QM9Dataset:
                 "num_sp3_carbons": int(num_sp3_carbons),
                 "main_chain_length":  int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
                 "raw_token_count": int(selfies_str.count('[')),
+                "avg_bond_length": avg_bond_length,
 
                 # These count specific chemical motifs
                 "fr_benzene": int(Fragments.fr_benzene(mol)),           # Benzene rings
@@ -323,7 +350,41 @@ class QM9Dataset:
         )
 
         self.df.write_csv(self.file_path)
-        logger.success(f"Saved processed dataset to {self.file_path}")
+        logger.success(f"Saved processed dataset with {self.df.height} rows to {self.file_path}")
+
+    @staticmethod
+    def _embed_molecule(smiles: str, seed: int = 42, invariant: bool = True) -> Optional[Chem.Mol]:
+        """
+        Takes a SMILES string, generates a 3D conformer using RDKit, 
+        assigns Gasteiger charges, and optionally ensures permutational invariance.
+        """
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None
+
+            # Add hydrogens before embedding
+            mol = Chem.AddHs(mol)
+            
+            # Compute partial charges
+            AllChem.ComputeGasteigerCharges(mol)
+
+            # Reorder atoms to ensure deterministic, invariant atom indexing
+            if invariant:
+                order = Chem.CanonicalRankAtoms(mol)
+                mol = Chem.RenumberAtoms(mol, list(order))
+
+            # Embed the molecule in 3D space using ETKDG
+            params = AllChem.ETKDG()
+            params.randomSeed = seed
+            if AllChem.EmbedMolecule(mol, params) == -1:
+                return None
+
+            return mol
+            
+        except Exception as e:
+            logger.debug(f"Molecule embedding failed for SMILES '{smiles}': {e}")
+            return None
 
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
         if "morgan_fingerprint" in self.df.columns: return
@@ -527,7 +588,7 @@ class QM9Dataset:
         invariant: bool = True,
         output_filename: str = "qm9_subset.xyz",
         subset_size: Optional[int] = None,
-        seed: int = 40,
+        seed: Optional[int] = None,
     ) -> List[Atoms]:
         """
         Export QM9 molecules to a single .xyz file.
@@ -544,29 +605,30 @@ class QM9Dataset:
         if sample_df.is_empty():
             raise ValueError("No molecules available to export.")
 
+        if seed is None:
+            seed = self.embed_seed
+        elif seed != self.embed_seed:
+            logger.warning(
+                f"get_positions(seed={seed}) differs from dataset embed_seed={self.embed_seed}; "
+                "this may change which molecules can be embedded."
+            )
+
         frames: List[Atoms] = []
         failed_count = 0
+        failed_ids: List[str] = []
 
         for row in sample_df.iter_rows(named=True):
             mol_id = row["mol_id"]
-            smiles = row["canonical_smiles"]
+            smiles = row["smiles"]
+            canonical_smiles = row["canonical_smiles"]
             formula = row["formula"]
             try:
-                mol = Chem.MolFromSmiles(smiles)
+                mol = self._embed_molecule(
+                    smiles=smiles,
+                    seed=seed,
+                    invariant=invariant,
+                )
                 if mol is None:
-                    raise ValueError("Invalid SMILES.")
-
-                mol = Chem.AddHs(mol)
-                AllChem.ComputeGasteigerCharges(mol)
-                
-                # Ensuring permutational invariance
-                if invariant:
-                    order = Chem.CanonicalRankAtoms(mol)
-                    mol = Chem.RenumberAtoms(mol, list(order))
-
-                params = AllChem.ETKDG()
-                params.randomSeed = seed
-                if AllChem.EmbedMolecule(mol, params) == -1:
                     raise ValueError("Embedding failed.")
 
                 conf = mol.GetConformer()
@@ -595,6 +657,7 @@ class QM9Dataset:
                     {
                         "mol_id": mol_id,
                         "smiles": smiles,
+                        "canonical_smiles": canonical_smiles,
                         "formula": formula,
                         "structure_type": self._classify_structure_type(mol),
                         "functional_groups": ",".join(self._detect_functional_groups(mol)),
@@ -625,12 +688,20 @@ class QM9Dataset:
                     }
                 )
                 frames.append(atoms)
+                
             except Exception as e:
                 logger.debug(f"Skipping {mol_id}: {e}")
                 failed_count += 1
+                failed_ids.append(mol_id)
 
         if not frames:
             raise ValueError("Failed to generate geometries for all selected molecules.")
+        if failed_count > 0 or len(frames) != sample_df.height:
+            raise ValueError(
+                "Failed to generate geometries for all selected molecules: "
+                f"requested={sample_df.height}, generated={len(frames)}, failed={failed_count}. "
+                f"failed_ids={failed_ids}"
+            )
 
         output_path = os.path.join(self.root, output_filename)
         write(output_path, frames, format="extxyz")
@@ -638,6 +709,7 @@ class QM9Dataset:
             f"Saved {len(frames)} molecules to {output_path} "
             f"(failed: {failed_count}, requested: {target_size})."
         )
+        
         return frames
 
     def get_grassmann_distance_matrix(self, frames: List) -> np.ndarray:
