@@ -63,6 +63,12 @@ class QM9Dataset:
         subset_size: int = 2000,
         required_mol_ids: Optional[List[str]] = None,
         embed_seed: int = 40,
+        sampling_strategy: str = "stratified",
+        stratify_by: Optional[List[str]] = None,
+        stratify_bins: int = 10,
+        sampling_seed: int = 40,
+        min_per_stratum: int = 1,
+        sampling_buffer: float = 1.1,
     ):
         self.root = root
         self.filename = filename
@@ -70,6 +76,12 @@ class QM9Dataset:
         self.subset_size = subset_size
         self.required_mol_ids = required_mol_ids or []
         self.embed_seed = embed_seed
+        self.sampling_strategy = sampling_strategy
+        self.stratify_by = stratify_by or ["num_atoms", "gap"]
+        self.stratify_bins = stratify_bins
+        self.sampling_seed = sampling_seed
+        self.min_per_stratum = min_per_stratum
+        self.sampling_buffer = sampling_buffer
         self.df = pl.DataFrame()
         self.scaler = StandardScaler()
         self.is_scaled = False
@@ -81,6 +93,134 @@ class QM9Dataset:
         self.distance_engine = DistanceCalculator(cache_dir=root)
 
         RDLogger.DisableLog("rdApp.error")
+
+    def _select_qm9_indices(self, dataset: QM9) -> List[int]:
+        """Selects QM9 indices using a stratified sampling scheme."""
+        if self.sampling_strategy not in {"stratified", "head"}:
+            raise ValueError(
+                f"Unsupported sampling_strategy='{self.sampling_strategy}'. "
+                "Use 'stratified' or 'head'."
+            )
+
+        if self.sampling_strategy == "head":
+            buffer_size = int(self.subset_size * 1.1)
+            required_indices = self._parse_required_indices()
+            max_required_index = max(required_indices) if required_indices else -1
+            limit = max(buffer_size, max_required_index + 1)
+            return list(range(min(limit, len(dataset))))
+
+        required_indices = set(self._parse_required_indices())
+        out_of_range = [i for i in required_indices if i < 0 or i >= len(dataset)]
+        if out_of_range:
+            logger.warning(
+                "Some required mol_id indices are outside QM9 range and will be ignored: "
+                f"{sorted(out_of_range)}"
+            )
+            required_indices = {i for i in required_indices if 0 <= i < len(dataset)}
+        valid_stratify_keys = set(self.QM9_TARGETS) | {"num_atoms"}
+        invalid = [k for k in self.stratify_by if k not in valid_stratify_keys]
+        if invalid:
+            raise ValueError(
+                f"Invalid stratify_by key(s): {invalid}. "
+                f"Valid keys: {sorted(valid_stratify_keys)}"
+            )
+
+        n = len(dataset)
+        if n == 0:
+            return []
+
+        values: Dict[str, np.ndarray] = {}
+        for key in self.stratify_by:
+            values[key] = np.zeros(n, dtype=float)
+
+        for i, data in enumerate(dataset):
+            for key in self.stratify_by:
+                if key == "num_atoms":
+                    values[key][i] = float(data.num_nodes)
+                else:
+                    target_idx = self.QM9_TARGETS.index(key)
+                    values[key][i] = float(data.y[0, target_idx].item())
+
+        binned: Dict[str, np.ndarray] = {}
+        for key in self.stratify_by:
+            if key == "num_atoms":
+                binned[key] = values[key].astype(int)
+                continue
+            series = values[key]
+            if self.stratify_bins <= 1 or np.all(series == series[0]):
+                binned[key] = np.zeros_like(series, dtype=int)
+                continue
+            edges = np.quantile(series, np.linspace(0, 1, self.stratify_bins + 1))
+            edges = np.unique(edges)
+            if edges.size <= 2:
+                binned[key] = np.zeros_like(series, dtype=int)
+                continue
+            binned[key] = np.digitize(series, edges[1:-1], right=True)
+
+        strata: Dict[tuple, List[int]] = {}
+        for i in range(n):
+            if i in required_indices:
+                continue
+            key = tuple(int(binned[k][i]) for k in self.stratify_by)
+            strata.setdefault(key, []).append(i)
+
+        target_size = int(np.ceil(self.subset_size * self.sampling_buffer))
+        slots = max(target_size - len(required_indices), 0)
+        if slots <= 0:
+            return sorted(required_indices)
+
+        total = sum(len(v) for v in strata.values())
+        if total == 0:
+            return sorted(required_indices)
+
+        counts = {k: len(v) for k, v in strata.items()}
+        num_strata = len(counts)
+        min_take = 0
+        if self.min_per_stratum > 0 and slots >= num_strata:
+            min_take = self.min_per_stratum
+
+        base_take = {k: min(min_take, counts[k]) for k in counts}
+        remaining_slots = slots - sum(base_take.values())
+        remaining_counts = {k: counts[k] - base_take[k] for k in counts}
+        remaining_total = sum(remaining_counts.values())
+
+        if remaining_slots > 0 and remaining_total > 0:
+            raw = {k: remaining_counts[k] / remaining_total * remaining_slots for k in counts}
+            take = {k: int(np.floor(raw[k])) for k in counts}
+            remainder = remaining_slots - sum(take.values())
+            if remainder > 0:
+                frac = sorted(
+                    ((raw[k] - take[k], k) for k in counts),
+                    reverse=True
+                )
+                for _, k in frac[:remainder]:
+                    take[k] += 1
+        else:
+            take = {k: 0 for k in counts}
+
+        rng = np.random.default_rng(self.sampling_seed)
+        selected = set(required_indices)
+        for k, indices in strata.items():
+            k_take = base_take[k] + take[k]
+            if k_take <= 0:
+                continue
+            if k_take >= len(indices):
+                selected.update(indices)
+            else:
+                chosen = rng.choice(indices, size=k_take, replace=False)
+                selected.update(chosen.tolist())
+
+        return sorted(selected)
+
+    def _parse_required_indices(self) -> List[int]:
+        required_set: Set[str] = set(self.required_mol_ids)
+        required_indices = []
+        for mol_id in required_set:
+            if mol_id.startswith("qm9_"):
+                suffix = mol_id.split("qm9_", 1)[1]
+                if suffix.isdigit():
+                    required_indices.append(int(suffix))
+        return required_indices
 
     @staticmethod
     def _classify_structure_type(mol: Chem.Mol) -> str:
@@ -126,6 +266,115 @@ class QM9Dataset:
             count += 1
         return float(total / count) if count > 0 else 0.0
 
+    def _build_qm9_row(self, i: int, data) -> Optional[Dict[str, Any]]:
+        smiles = getattr(data, "smiles", None)
+        if not smiles:
+            return None
+
+        mol = self._embed_molecule(
+            smiles=smiles,
+            seed=self.embed_seed,
+            invariant=True,
+        )
+        if mol is None:
+            return None
+
+        formula = CalcMolFormula(mol)
+
+        structure_type = self._classify_structure_type(mol)
+        if structure_type == "acyclic":
+            struct_class = "Acyclic"
+        elif structure_type == "aromatic":
+            struct_class = "Aromatic"
+        else:
+            struct_class = "Aliphatic Ring"
+
+        canonical = Chem.MolToSmiles(mol, canonical=True)
+        selfies_str = sf.encoder(canonical)
+        functional_groups = self._detect_functional_groups(mol)
+        functional_groups_str = ",".join(functional_groups)
+
+        dist_matrix = Chem.GetDistanceMatrix(mol)
+        avg_bond_length = self._compute_average_bond_length(mol)
+
+        num_carbons = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6)
+        num_sp_carbons = sum(
+            1
+            for atom in mol.GetAtoms()
+            if atom.GetAtomicNum() == 6
+            and atom.GetHybridization() == Chem.HybridizationType.SP
+        )
+        num_sp2_carbons = sum(
+            1
+            for atom in mol.GetAtoms()
+            if atom.GetAtomicNum() == 6
+            and atom.GetHybridization() == Chem.HybridizationType.SP2
+        )
+        num_sp3_carbons = sum(
+            1
+            for atom in mol.GetAtoms()
+            if atom.GetAtomicNum() == 6
+            and atom.GetHybridization() == Chem.HybridizationType.SP3
+        )
+        denom_c = float(num_carbons) if num_carbons > 0 else 1.0
+        fraction_csp1 = float(num_sp_carbons / denom_c)
+        fraction_csp2 = float(num_sp2_carbons / denom_c)
+        fraction_csp3 = float(num_sp3_carbons / denom_c)
+
+        mol_dict = {
+            "mol_id": f"qm9_{i}",
+            "formula": formula,
+            "smiles": smiles,
+            "canonical_smiles": canonical,
+            "selfies": selfies_str,
+            "functional_groups": functional_groups_str,
+            "num_atoms": int(data.num_nodes),
+            "structure_class": struct_class,
+
+            # Physical Properties
+            "mol_weight": int(Descriptors.MolWt(mol)),
+            "logp": int(Descriptors.MolLogP(mol)),
+            "tpsa": int(Descriptors.TPSA(mol)),
+
+            # Structural/Complexity Descriptors
+            "num_heavy_atoms": int(mol.GetNumHeavyAtoms()),
+            "num_rings": int(rdMolDescriptors.CalcNumRings(mol)),
+            "num_aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(mol)),
+
+            # Flexibility/Complexity & newly added string/graph complexity metrics
+            "num_rotatable_bonds": int(Descriptors.NumRotatableBonds(mol)),
+            "fraction_csp1": fraction_csp1,
+            "fraction_csp2": fraction_csp2,
+            "fraction_csp3": fraction_csp3,
+            "h_bond_donors": int(Descriptors.NumHDonors(mol)),
+            "h_bond_acceptors": int(Descriptors.NumHAcceptors(mol)),
+
+            # Syntactic and Complexity Descriptors
+            "branching_index": sum(1 for atom in mol.GetAtoms() if atom.GetDegree() > 2),
+            "num_sp_carbons": int(num_sp_carbons),
+            "num_sp2_carbons": int(num_sp2_carbons),
+            "num_sp3_carbons": int(num_sp3_carbons),
+            "main_chain_length": int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
+            "raw_token_count": int(selfies_str.count("[")),
+            "avg_bond_length": avg_bond_length,
+
+            # These count specific chemical motifs
+            "fr_benzene": int(Fragments.fr_benzene(mol)),
+            "fr_alcohol": int(Fragments.fr_Al_OH(mol)),
+            "fr_phenol": int(Fragments.fr_Ar_OH(mol)),
+            "fr_amine": int(Fragments.fr_NH2(mol)),
+            "fr_amide": int(Fragments.fr_amide(mol)),
+            "fr_carboxylic_acid": int(Fragments.fr_COO(mol)),
+            "fr_ester": int(Fragments.fr_ester(mol)),
+            "fr_ketone": int(Fragments.fr_ketone(mol)),
+            "fr_ether": int(Fragments.fr_ether(mol)),
+            "fr_nitro": int(Fragments.fr_nitro(mol)),
+            "fr_halogen": int(rdMolDescriptors.CalcNumHeteroatoms(mol)),
+        }
+
+        mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
+        return mol_dict
+
     def load(self, force_process: bool = False) -> pl.DataFrame:
         """Loads the main dataset, processing if necessary."""
         if os.path.exists(self.file_path) and not force_process:
@@ -157,127 +406,37 @@ class QM9Dataset:
             raise RuntimeError(f"QM9 download failed: {e}")
 
         required_set: Set[str] = set(self.required_mol_ids)
-        required_indices = []
-        for mol_id in required_set:
-            if mol_id.startswith("qm9_"):
-                suffix = mol_id.split("qm9_", 1)[1]
-                if suffix.isdigit():
-                    required_indices.append(int(suffix))
-
+        required_indices = self._parse_required_indices()
         max_required_index = max(required_indices) if required_indices else -1
         data_list = []
-        buffer_size = int(self.subset_size * 1.1)
-        for i, data in enumerate(dataset):
-            # Keep iterating until we both have enough candidates and have passed required indices.
-            if len(data_list) >= buffer_size and i >= max_required_index:
-                break
-            smiles = getattr(data, 'smiles', None)
-            if not smiles: 
-                continue
-
-            mol = self._embed_molecule(
-                smiles=smiles,
-                seed=self.embed_seed,
-                invariant=True,
+        if self.sampling_strategy == "head":
+            buffer_size = int(self.subset_size * 1.1)
+            for i, data in enumerate(dataset):
+                # Keep iterating until we both have enough candidates and have passed required indices.
+                if len(data_list) >= buffer_size and i >= max_required_index:
+                    break
+                mol_dict = self._build_qm9_row(i, data)
+                if mol_dict is not None:
+                    data_list.append(mol_dict)
+        else:
+            selected_indices = self._select_qm9_indices(dataset)
+            selected_set = set(selected_indices)
+            max_selected = max(selected_indices) if selected_indices else -1
+            processed = 0
+            logger.info(
+                "Stratified sampling enabled. "
+                f"Selected {len(selected_indices)} indices from QM9."
             )
-            if mol is None:
-                continue
-
-            formula = CalcMolFormula(mol)
-
-            structure_type = self._classify_structure_type(mol)
-            if structure_type == "acyclic":
-                struct_class = "Acyclic"
-            elif structure_type == "aromatic":
-                struct_class = "Aromatic"
-            else:
-                struct_class = "Aliphatic Ring"
-            
-            canonical = Chem.MolToSmiles(mol, canonical=True)
-            selfies_str = sf.encoder(canonical)
-            functional_groups = self._detect_functional_groups(mol)
-            functional_groups_str = ",".join(functional_groups)
-
-            dist_matrix = Chem.GetDistanceMatrix(mol)
-            avg_bond_length = self._compute_average_bond_length(mol)
-
-            num_carbons = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6)
-            num_sp_carbons = sum(
-                1
-                for atom in mol.GetAtoms()
-                if atom.GetAtomicNum() == 6
-                and atom.GetHybridization() == Chem.HybridizationType.SP
-            )
-            num_sp2_carbons = sum(
-                1
-                for atom in mol.GetAtoms()
-                if atom.GetAtomicNum() == 6
-                and atom.GetHybridization() == Chem.HybridizationType.SP2
-            )
-            num_sp3_carbons = sum(
-                1
-                for atom in mol.GetAtoms()
-                if atom.GetAtomicNum() == 6
-                and atom.GetHybridization() == Chem.HybridizationType.SP3
-            )
-            denom_c = float(num_carbons) if num_carbons > 0 else 1.0
-            fraction_csp1 = float(num_sp_carbons / denom_c)
-            fraction_csp2 = float(num_sp2_carbons / denom_c)
-            fraction_csp3 = float(num_sp3_carbons / denom_c)
-
-            mol_dict = {
-                "mol_id": f"qm9_{i}",
-                "formula":formula,
-                "smiles": smiles, 
-                "canonical_smiles": canonical,
-                "selfies": selfies_str,
-                "functional_groups": functional_groups_str,
-                "num_atoms": int(data.num_nodes),
-                "structure_class": struct_class,
-
-                # Physical Properties
-                "mol_weight": int(Descriptors.MolWt(mol)),        
-                "logp": int(Descriptors.MolLogP(mol)),            
-                "tpsa": int(Descriptors.TPSA(mol)),               
-                
-                # Structural/Complexity Descriptors
-                "num_heavy_atoms": int(mol.GetNumHeavyAtoms()),
-                "num_rings": int(rdMolDescriptors.CalcNumRings(mol)),
-                "num_aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(mol)),
-                
-                # Flexibility/Complexity & newly added string/graph complexity metrics
-                "num_rotatable_bonds": int(Descriptors.NumRotatableBonds(mol)),
-                "fraction_csp1": fraction_csp1,
-                "fraction_csp2": fraction_csp2,
-                "fraction_csp3": fraction_csp3,
-                "h_bond_donors": int(Descriptors.NumHDonors(mol)),
-                "h_bond_acceptors": int(Descriptors.NumHAcceptors(mol)),
-                
-                # Syntactic and Complexity Descriptors
-                "branching_index": sum(1 for atom in mol.GetAtoms() if atom.GetDegree() > 2),
-                "num_sp_carbons": int(num_sp_carbons),
-                "num_sp2_carbons": int(num_sp2_carbons),
-                "num_sp3_carbons": int(num_sp3_carbons),
-                "main_chain_length":  int(dist_matrix.max()) if len(dist_matrix) > 0 else 0,
-                "raw_token_count": int(selfies_str.count('[')),
-                "avg_bond_length": avg_bond_length,
-
-                # These count specific chemical motifs
-                "fr_benzene": int(Fragments.fr_benzene(mol)),           # Benzene rings
-                "fr_alcohol": int(Fragments.fr_Al_OH(mol)),             # Aliphatic alcohols
-                "fr_phenol": int(Fragments.fr_Ar_OH(mol)),              # Aromatic alcohols
-                "fr_amine": int(Fragments.fr_NH2(mol)),                 # Primary amines
-                "fr_amide": int(Fragments.fr_amide(mol)),               # Amide groups
-                "fr_carboxylic_acid": int(Fragments.fr_COO(mol)),       # Carboxylic acids
-                "fr_ester": int(Fragments.fr_ester(mol)),               # Ester groups
-                "fr_ketone": int(Fragments.fr_ketone(mol)),             # Ketones
-                "fr_ether": int(Fragments.fr_ether(mol)),               # Ether linkages
-                "fr_nitro": int(Fragments.fr_nitro(mol)),               # Nitro groups
-                "fr_halogen": int(rdMolDescriptors.CalcNumHeteroatoms(mol)), # Simple heteroatom count
-            }
-
-            mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
-            data_list.append(mol_dict)
+            for i, data in enumerate(dataset):
+                if processed >= len(selected_set) and i > max_selected:
+                    break
+                if i not in selected_set:
+                    continue
+                mol_dict = self._build_qm9_row(i, data)
+                if mol_dict is None:
+                    continue
+                data_list.append(mol_dict)
+                processed += 1
 
         self.df = pl.DataFrame(data_list)
 
@@ -328,7 +487,24 @@ class QM9Dataset:
 
         deduped_non_required = non_required_valid.unique(subset=["canonical_smiles"], keep="first")
         slots_for_non_required = max(self.subset_size - required_df.height, 0)
-        selected_non_required = deduped_non_required.head(slots_for_non_required)
+        if slots_for_non_required <= 0:
+            selected_non_required = pl.DataFrame(schema=self.df.schema)
+        else:
+            available = deduped_non_required.height
+            if available < slots_for_non_required:
+                logger.warning(
+                    "Not enough non-required molecules after filtering to reach "
+                    f"subset_size={self.subset_size}. Available={available}."
+                )
+            take_n = min(slots_for_non_required, available)
+            if self.sampling_strategy == "head":
+                selected_non_required = deduped_non_required.head(take_n)
+            else:
+                selected_non_required = deduped_non_required.sample(
+                    n=take_n,
+                    seed=self.sampling_seed,
+                    shuffle=True
+                )
 
         if required_df.height > 0:
             self.df = pl.concat([required_df, selected_non_required], how="vertical_relaxed")
@@ -387,7 +563,8 @@ class QM9Dataset:
             return None
 
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
-        if "morgan_fingerprint" in self.df.columns: return
+        if "morgan_fingerprint" in self.df.columns: 
+            return
         self.df = self.df.with_columns(
             MolecularFeaturizer.compute_morgan_fingerprints(
                 self.df["canonical_smiles"], radius, fp_size
@@ -395,7 +572,8 @@ class QM9Dataset:
         )
 
     def add_selfies_transformer(self, model_name: str = "HUBioDataLab/SELFormer") -> None:
-        if "selfies_transformer" in self.df.columns: return
+        if "selfies_transformer" in self.df.columns: 
+            return
         self.df = self.df.with_columns(
             MolecularFeaturizer.compute_selfies_transformer(
                 self.df["selfies"], model_name
@@ -403,7 +581,8 @@ class QM9Dataset:
         )
 
     def add_selfies_onehot(self, flatten: bool = False) -> None:
-        if "selfies_onehot" in self.df.columns: return
+        if "selfies_onehot" in self.df.columns: 
+            return
         self.df = self.df.with_columns(
             MolecularFeaturizer.compute_selfies_onehot(
                 self.df["selfies"],
@@ -413,7 +592,8 @@ class QM9Dataset:
 
     def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
         """Adds SOAP descriptors to the dataframe."""
-        if "soap_embedding" in self.df.columns: return
+        if "soap_embedding" in self.df.columns: 
+            return
         
         soap_series = MolecularFeaturizer.compute_soap(
             self.df["canonical_smiles"], 
@@ -424,7 +604,8 @@ class QM9Dataset:
 
     def add_acsf(self, r_cut=6.0) -> None:
         """Adds ACSF descriptors to the dataframe."""
-        if "acsf_embedding" in self.df.columns: return
+        if "acsf_embedding" in self.df.columns: 
+            return
         
         acsf_series = MolecularFeaturizer.compute_acsf(
             self.df["canonical_smiles"], r_cut=r_cut
