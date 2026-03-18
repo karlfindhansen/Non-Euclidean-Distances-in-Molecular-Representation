@@ -3,11 +3,13 @@ from rdkit.Chem import AllChem
 from ase import Atoms
 import polars as pl
 import numpy as np
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Iterable
 from loguru import logger
 import os
 
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
+import kmedoids
 
 
 def get_structures(df, mol_id_list = None):
@@ -141,6 +143,70 @@ def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
     logger.success("✓ All distance matrices are ready!")
     
     return matrices
+
+
+def find_best_kmedoids_k(
+    dist_matrix: np.ndarray,
+    k_range: Iterable[int] = range(2, 15),
+    random_state: int = 42,
+    feature_matrix: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Evaluate K-Medoids clustering over a range of k using:
+    - inertia (sum of distances to assigned medoids)
+    - silhouette score (precomputed distances)
+    - Calinski-Harabasz score (on feature_matrix if provided, else on dist_matrix)
+    """
+    dist_matrix = np.asarray(dist_matrix)
+    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+        raise ValueError("dist_matrix must be a square matrix.")
+
+    n = dist_matrix.shape[0]
+    k_list = [int(k) for k in k_range if 2 <= int(k) <= n - 1]
+    if not k_list:
+        raise ValueError("k_range must contain values in [2, n-1].")
+
+    results = {"k": [], "inertia": [], "silhouette": [], "ch": []}
+
+    use_features_for_ch = feature_matrix is not None
+    if feature_matrix is None:
+        logger.warning(
+            "feature_matrix is None; Calinski-Harabasz will be computed on dist_matrix "
+            "(treated as features). Provide feature_matrix for a more meaningful CH score."
+        )
+
+    for k in k_list:
+        model = kmedoids.KMedoids(n_clusters=k, metric="precomputed", random_state=random_state)
+        labels = model.fit_predict(dist_matrix)
+        medoid_indices = model.medoid_indices_
+
+        inertia = float(
+            sum(dist_matrix[i, medoid_indices[labels[i]]] for i in range(n))
+        )
+
+        sil = float(silhouette_score(dist_matrix, labels, metric="precomputed"))
+
+        if use_features_for_ch:
+            if feature_matrix.shape[0] != n:
+                raise ValueError(
+                    "feature_matrix must have the same number of rows as dist_matrix."
+                )
+            ch = float(calinski_harabasz_score(feature_matrix, labels))
+        else:
+            ch = float(calinski_harabasz_score(dist_matrix, labels))
+
+        results["k"].append(k)
+        results["inertia"].append(inertia)
+        results["silhouette"].append(sil)
+        results["ch"].append(ch)
+
+    best_k = {
+        "inertia": results["k"][int(np.argmin(results["inertia"]))],
+        "silhouette": results["k"][int(np.argmax(results["silhouette"]))],
+        "ch": results["k"][int(np.argmax(results["ch"]))],
+    }
+
+    return {"results": results, "best_k": best_k}
 
 if __name__ == '__main__':
     from src.datasets import QM9Dataset

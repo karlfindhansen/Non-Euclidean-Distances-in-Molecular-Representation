@@ -61,14 +61,49 @@ def _compute_invariant_feature_matrix(frame: Atoms, cutoff: float = 1.8) -> np.n
             en,
             mass,
             dist_to_com,
-            coord,
-            avg_neighbor_z,
-            avg_neighbor_dist
+            #coord,
+            #avg_neighbor_z,
+            #avg_neighbor_dist
         ]
 
         features.append(feat_vector)
 
-    return np.array(features)
+    return np.array(features).T
+
+
+def _compute_feature_matrices(
+    frames: Sequence[Atoms],
+    normalized: bool = False,
+) -> List[np.ndarray]:
+    """
+    Builds invariant feature matrices for all frames.
+
+    If normalized=True, applies a global StandardScaler across all atoms
+    in the dataset (fit on the stacked per-atom features).
+    """
+    raw_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
+
+    if not normalized:
+        return raw_matrices
+
+    if not raw_matrices:
+        return raw_matrices
+
+    stacked = np.vstack([m.T for m in raw_matrices if m.size > 0]) if raw_matrices else np.empty((0, 0))
+
+    if stacked.size == 0:
+        return raw_matrices
+
+    scaler = StandardScaler().fit(stacked)
+
+    scaled_matrices = []
+    for raw in raw_matrices:
+        if raw.size == 0:
+            scaled_matrices.append(raw)
+            continue
+        scaled_matrices.append(scaler.transform(raw.T).T)
+
+    return scaled_matrices
 
 def _pairwise_distance_matrix(
     n: int,
@@ -253,31 +288,25 @@ class Grassmann:
         cls,
         frames: Sequence['Atoms'], 
         k: int = 3, 
-        method: Literal["qr", "svd"] = "svd"
+        method: Literal["qr", "svd"] = "svd",
+        normalized: bool = False,
     ) -> np.ndarray:
         """
         Maps 3D atomic coordinates to an orthonormal basis in R^n.
         """
         bases = []
         
-        # Extract raw features for ALL frames
-        raw_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
-        
-        # Fit a global scaler across all atoms in the entire dataset
-        all_atoms_features = np.vstack(raw_matrices)
-        global_scaler = StandardScaler().fit(all_atoms_features)
+        # Extract raw (or normalized) features for ALL frames
+        raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
 
         for raw_feat in raw_matrices:
-            # Transform using the global standard and transpose to (D, N)
-            scaled_feat = global_scaler.transform(raw_feat).T
-            
             if method.lower() == "qr":
                 # QR decomposition of feature matrix
-                q, _ = np.linalg.qr(scaled_feat)
+                q, _ = np.linalg.qr(raw_feat)
                 basis = q[:, :k]
             else:
                 # SVD gives a basis ordered by structural variance
-                u, _, _ = np.linalg.svd(scaled_feat, full_matrices=False)
+                u, _, _ = np.linalg.svd(raw_feat, full_matrices=False)
                 basis = u[:, :k]
                 
             bases.append(basis)
@@ -299,18 +328,19 @@ class Grassmann:
         cls, 
         frames: Sequence['Atoms'], 
         k: int = 3, 
-        method: Literal["qr", "svd"] = "svd"
+        method: Literal["qr", "svd"] = "svd",
+        normalized: bool = False,
     ) -> np.ndarray:
         """
         Computes a symmetric pairwise distance matrix for a molecular trajectory.
         """
         logger.info(
             f"Computing Grassmann distance matrix for {len(frames)} frames "
-            f"(k={k}, method='{method}')."
+            f"(k={k}, method='{method}', normalized={normalized})."
         )
         
         # Precompute bases
-        bases = cls._get_uk_bases(frames, k=k, method=method)
+        bases = cls._get_uk_bases(frames, k=k, method=method, normalized=normalized)
         num_frames = len(bases)
         dist_matrix = _pairwise_distance_matrix(
             n=num_frames,
@@ -333,22 +363,22 @@ class Riemann:
     """
 
     @classmethod
-    def _get_spd_matrices(cls, frames, regularization: float = 1e-6) -> np.ndarray:
+    def _get_spd_matrices(
+        cls,
+        frames,
+        regularization: float = 1e-6,
+        normalized: bool = False,
+    ) -> np.ndarray:
         """
         Converts frames into SPD covariance matrices.
         """
-
-        # Extract invariant atomic features
-        raw_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
-
-        # Global normalization across all atoms in all frames
-        all_atoms_features = np.vstack(raw_matrices)
-        scaler = StandardScaler().fit(all_atoms_features)
+        # Extract invariant atomic features (optionally normalized)
+        raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
 
         spd_matrices = []
 
         for raw_feat in raw_matrices:
-            X = scaler.transform(raw_feat).T   # shape (D, N)
+            X = raw_feat
 
             C = (X @ X.T) / X.shape[1]
             C += np.eye(C.shape[0]) * regularization
@@ -421,6 +451,7 @@ class Riemann:
         frames,
         metric: str = "log-euclidean",
         regularization: float = 1e-6,
+        normalized: bool = False,
     ) -> np.ndarray:
         """
         Computes pairwise Riemannian distance matrix for frames.
@@ -428,7 +459,7 @@ class Riemann:
 
         logger.info(
             f"Computing Riemannian distance matrix for {len(frames)} frames "
-            f"(metric='{metric}')"
+            f"(metric='{metric}', normalized={normalized})"
         )
 
         metric_key = metric.lower()
@@ -439,7 +470,11 @@ class Riemann:
             )
 
         # Step 1: Build SPD matrices
-        spd_matrices = cls._get_spd_matrices(frames, regularization)
+        spd_matrices = cls._get_spd_matrices(
+            frames,
+            regularization=regularization,
+            normalized=normalized,
+        )
         n = len(spd_matrices)
 
         dist_matrix = np.zeros((n, n))

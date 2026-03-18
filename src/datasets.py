@@ -54,7 +54,7 @@ class QM9Dataset:
         "ether": Fragments.fr_ether,
         "nitro": Fragments.fr_nitro,
     }
-    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups"}
+    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups", "avg_bond_length"}
 
     def __init__(
         self,
@@ -685,6 +685,7 @@ class QM9Dataset:
                         "num_sp3_carbons": int(row["num_sp3_carbons"]),
                         "main_chain_length": int(row["main_chain_length"]),
                         "raw_token_count": int(row["raw_token_count"]),
+                        "avg_bond_length": float(row["avg_bond_length"]),
                     }
                 )
                 frames.append(atoms)
