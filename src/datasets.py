@@ -689,46 +689,84 @@ class QM9Dataset:
         logger.success("Finished adding all requested descriptors.")
     
 
-    def get_distance_matrix(self, metric: str = 'morgan', dist_type: str = 'jaccard') -> 'np.ndarray':
-        """Calculates distance matrix using the distance engine."""
-        if metric == 'morgan':
-            self.add_morgan_fingerprints()
-            return self.distance_engine.get_matrix(
-                self.df["morgan_fingerprint"], 
-                metric=dist_type, 
-                filename=f"dist_morgan_{dist_type}.npy"
-            )
-        elif metric == 'selfies_transformer':
-            self.add_selfies_transformer()
-            return self.distance_engine.get_matrix(
-                self.df["selfies_transformer"], 
-                metric=dist_type, 
-                filename=f"dist_selfies_transformer_{dist_type}.npy"
-            )
-        
-        elif metric == 'selfies_onehot':
-            self.add_selfies_onehot()
+    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard") -> 'np.ndarray':
+        """
+        Computes a distance matrix for a chosen descriptor.
 
-            flattened_onehot = self.df["selfies_onehot"].map_elements(
-                lambda x: np.array(x).flatten().tolist() if x is not None else None,
-                return_dtype=pl.Object
-            )
-            
-            return self.distance_engine.get_matrix(
-                flattened_onehot, 
-                metric=dist_type, 
-                filename=f"dist_selfies_onehot_{dist_type}.npy"
-            )
-        elif metric == 'coulomb_matrix':
-            self.add_coulomb_matrix()
-            return self.distance_engine.get_matrix(
-                self.df["coulomb_matrix"],
-                metric=dist_type,
-                filename=f"dist_coulomb_matrix_{dist_type}.npy"
+        Descriptors:
+            - morgan
+            - selfies_transformer (alias: transformer)
+            - selfies_onehot (alias: onehot)
+            - soap
+            - acsf
+            - coulomb_matrix
+            - chemprop
+
+        Distance types:
+            - jaccard (Tanimoto)
+            - euclidean
+            - cosine
+            - soap_kernel (1 - normalized SOAP dot product)
+            - hamming
+        """
+
+        descriptor = descriptor.lower()
+        aliases = {
+            "transformer": "selfies_transformer",
+            "onehot": "selfies_onehot",
+        }
+        descriptor = aliases.get(descriptor, descriptor)
+
+        def _series_for(desc: str) -> pl.Series:
+            if desc == "morgan":
+                self.add_morgan_fingerprints()
+                return self.df["morgan_fingerprint"]
+            if desc == "selfies_transformer":
+                self.add_selfies_transformer()
+                return self.df["selfies_transformer"]
+            if desc == "selfies_onehot":
+                self.add_selfies_onehot(flatten=True)
+                return self.df["selfies_onehot"]
+            if desc == "soap":
+                self.add_soap()
+                return self.df["soap_embedding"]
+            if desc == "acsf":
+                self.add_acsf()
+                return self.df["acsf_embedding"]
+            if desc == "coulomb_matrix":
+                self.add_coulomb_matrix()
+                return self.df["coulomb_matrix"]
+            if desc == "chemprop":
+                self.add_chemprop()
+                return self.df["chemprop_embedding"]
+            raise ValueError(
+                f"Unknown descriptor: {desc}. "
+                "Expected one of: morgan, selfies_transformer, selfies_onehot, "
+                "soap, acsf, coulomb_matrix, chemprop."
             )
 
-        else:
-            raise ValueError(f"Unknown metric: {metric}")
+        if dist_type == "jaccard" and descriptor not in {"morgan", "selfies_onehot"}:
+            logger.warning(
+                "Jaccard distance is usually used for binary fingerprints. "
+                f"Descriptor='{descriptor}' may not be binary."
+            )
+        if dist_type == "soap_kernel" and descriptor != "soap":
+            logger.warning(
+                "SOAP kernel is designed for SOAP descriptors. "
+                f"Descriptor='{descriptor}' may not be compatible."
+            )
+        if dist_type == "hamming" and descriptor not in {"morgan", "selfies_onehot"}:
+            logger.warning(
+                "Hamming distance is usually used for binary fingerprints. "
+                f"Descriptor='{descriptor}' may not be binary."
+            )
+
+        series = _series_for(descriptor)
+        return self.distance_engine.get_matrix(
+            series,
+            metric=dist_type,
+            filename=f"dist_{descriptor}_{dist_type}.npy"
+        )
 
     def run_stress_test(
         self,

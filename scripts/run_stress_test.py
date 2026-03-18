@@ -18,7 +18,7 @@ def main():
     
     # Calculate Distances
     print("Calculating distances...")
-    dist_matrix = loader.get_distance_matrix(metric='morgan')
+    dist_matrix = loader.get_distance_matrix(descriptor='morgan')
     print(f"Distance matrix shape: {dist_matrix.shape}")
 
 if __name__ == "__main__":

@@ -1,46 +1,127 @@
 import numpy as np
+import matplotlib.pyplot as plt
+
 from loguru import logger
 
 from src.datasets import QM9Dataset
+from rdkit import Chem
+from rdkit.Chem import Draw
+import os
 
-def main():
-    # 1. Initialize and Load
-    loader = QM9Dataset()
-    loader.load()
-
-    # --- Scenario A: Morgan Fingerprints (Jaccard) ---
-    logger.info("--- Computing Distance: Morgan Fingerprints (Jaccard) ---")
-    dist_morgan = loader.get_distance_matrix(metric='morgan')
+def plot_distance_matrix(dist_matrix, title="Distance Matrix", save_path=None):
+    plt.figure(figsize=(8, 6))
     
-    logger.info(f"Shape: {dist_morgan.shape} | Mean Dist: {np.mean(dist_morgan):.4f}")
-
-    # --- Scenario B: Transformer Embeddings (Euclidean) ---
-    logger.info("\n--- Computing Distance: SELFIES Transformers (Euclidean) ---")
-    dist_transformer = loader.get_distance_matrix(metric='selfies_transformer')
+    plt.imshow(dist_matrix, interpolation='nearest')
+    plt.colorbar(label='Distance')
     
-    logger.info(f"Shape: {dist_transformer.shape} | Mean Dist: {np.mean(dist_transformer):.4f}")
-
-    # --- Scenario C: One-Hot Encodings (Euclidean) ---
-    logger.info("\n--- Computing Distance: SELFIES One-Hot (Euclidean) ---")
-    dist_onehot = loader.get_distance_matrix(metric='selfies_onehot')
+    plt.title(title)
+    plt.xlabel("Molecule index")
+    plt.ylabel("Molecule index")
     
-    logger.info(f"Shape: {dist_onehot.shape} | Mean Dist: {np.mean(dist_onehot):.4f}")
+    plt.tight_layout()
 
-    logger.info("\n" + "="*30)
-    logger.info("PREVIEW: FIRST 3x3 BLOCK COMPARISON")
-    logger.info("="*30)
-    
-    print(f"\nMorgan (Jaccard):\n{dist_morgan[:3, :3]}")
-    print(f"\nTransformer (Euclidean):\n{dist_transformer[:3, :3]}")
-    print(f"\nOne-Hot (Euclidean):\n{dist_onehot[:3, :3]}")
+    if save_path:
+        plt.savefig(save_path)
 
-    # Logic Check: Diagonal should always be 0.0
-    for name, mat in [("Morgan", dist_morgan), ("Transformer", dist_transformer), ("OneHot", dist_onehot)]:
-        diag_sum = np.trace(mat)
-        if not np.isclose(diag_sum, 0):
-            logger.warning(f"{name} matrix diagonal is not zero! Check your distance logic.")
-        else:
-            logger.success(f"{name} matrix passed diagonal integrity check.")
+    plt.show()
+
+def extract_extreme_pairs(dist_matrix, df, top_k=5):
+    n = dist_matrix.shape[0]
+    if n == 0:
+        raise ValueError("Empty distance matrix.")
+
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    dists = dist_matrix[i_idx, j_idx]
+
+    order = np.argsort(dists)
+    low_idx = order[:top_k]
+    high_idx = order[-top_k:][::-1]
+
+    def build_pairs(sel_idx):
+        pairs = []
+        for k in sel_idx:
+            i = int(i_idx[k])
+            j = int(j_idx[k])
+            pairs.append({
+                "i": i,
+                "j": j,
+                "mol_id_i": df["mol_id"][i],
+                "mol_id_j": df["mol_id"][j],
+                "smiles_i": df["canonical_smiles"][i],
+                "smiles_j": df["canonical_smiles"][j],
+                "distance": float(dists[k]),
+            })
+        return pairs
+
+    return build_pairs(low_idx), build_pairs(high_idx)
+
+def plot_pair_grid(pairs, title, save_path=None, max_pairs=6):
+    if not pairs:
+        logger.warning(f"No pairs to plot for {title}")
+        return
+
+    pairs = pairs[:max_pairs]
+    mols = []
+    legends = []
+    for p in pairs:
+        mol_i = Chem.MolFromSmiles(p["smiles_i"])
+        mol_j = Chem.MolFromSmiles(p["smiles_j"])
+        mols.extend([mol_i, mol_j])
+        legends.extend([
+            f"{p['mol_id_i']}",
+            f"{p['mol_id_j']}\nd={p['distance']:.3f}"
+        ])
+
+    img = Draw.MolsToGridImage(
+        mols,
+        molsPerRow=2,
+        subImgSize=(250, 200),
+        legends=legends
+    )
+
+    plt.figure(figsize=(6, 3 * len(pairs)))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.title(title)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=200)
+        logger.info(f"Saved pair plot to {save_path}")
+
+    plt.show()
+
+def distance(
+    qm9,
+    descriptor="morgan",
+    dist_type="cosine",
+    top_k=6,
+    save_dir="figures/qm9/distances/cosine"
+):
+
+    dist_matrix = qm9.get_distance_matrix(descriptor=descriptor, dist_type=dist_type)
+
+    plot_distance_matrix(
+        dist_matrix,
+        title=f"{descriptor} {dist_type.capitalize()} Distance Matrix"
+    )
+
+    low_pairs, high_pairs = extract_extreme_pairs(dist_matrix, qm9.df, top_k=top_k)
+
+    os.makedirs(save_dir, exist_ok=True)
+    plot_pair_grid(low_pairs, title=f"Most Similar Pairs ({descriptor}/{dist_type})", save_path=os.path.join(save_dir, f"qm9_{descriptor}_most_similar_{dist_type}.png"), max_pairs=top_k)
+    plot_pair_grid(high_pairs, title=f"Least Similar Pairs ({descriptor}/{dist_type})", save_path=os.path.join(save_dir, f"qm9_{descriptor}_least_similar_{dist_type}.png"), max_pairs=top_k)
 
 if __name__ == "__main__":
-    main()
+
+    qm9 = QM9Dataset()
+    qm9.load()
+    
+    descriptor = "soap"
+    dist_type = "euclidean"
+    top_k = 6
+    save_dir = f"figures/qm9/distances/{dist_type}"
+
+    distance(qm9, descriptor=descriptor, dist_type=dist_type, top_k=6)
+
+

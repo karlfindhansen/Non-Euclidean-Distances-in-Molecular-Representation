@@ -16,7 +16,7 @@ class DistanceCalculator:
     def get_matrix(
         self, 
         data_series: pl.Series, 
-        metric: Literal['jaccard', 'euclidean'], 
+        metric: Literal['jaccard', 'euclidean', 'cosine', 'soap_kernel', 'hamming'], 
         filename: str
     ) -> np.ndarray:
         """
@@ -43,8 +43,16 @@ class DistanceCalculator:
         data_array = np.array(data_list, dtype=dtype)
 
         try:
-            condensed = pdist(data_array, metric=metric)
-            matrix = squareform(condensed)
+            if metric == "soap_kernel":
+                # SOAP kernel distance: 1 - normalized dot product
+                norms = np.linalg.norm(data_array, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                normalized = data_array / norms
+                kernel = normalized @ normalized.T
+                matrix = 1.0 - kernel
+            else:
+                condensed = pdist(data_array, metric=metric)
+                matrix = squareform(condensed)
             np.save(path, matrix)
             logger.success(f"Saved distance matrix to {path}")
             return matrix
