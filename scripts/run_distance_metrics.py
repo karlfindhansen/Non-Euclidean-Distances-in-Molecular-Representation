@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from loguru import logger
 
 from src.datasets import QM9Dataset
+from src.non_euclidean import Wasserstein, PersistentHomology, Grassmann, Riemann
 from rdkit import Chem
 from rdkit.Chem import Draw
 import os
@@ -112,6 +113,76 @@ def distance(
     plot_pair_grid(low_pairs, title=f"Most Similar Pairs ({descriptor}/{dist_type})", save_path=os.path.join(save_dir, f"qm9_{descriptor}_most_similar_{dist_type}.png"), max_pairs=top_k)
     plot_pair_grid(high_pairs, title=f"Least Similar Pairs ({descriptor}/{dist_type})", save_path=os.path.join(save_dir, f"qm9_{descriptor}_least_similar_{dist_type}.png"), max_pairs=top_k)
 
+def non_euclidean_distance(
+    qm9,
+    kind="wasserstein",
+    subset_size=200,
+    top_k=6,
+    save_dir="figures/qm9/distances/non_euclidean",
+    **kwargs
+):
+    """
+    Computes non-Euclidean distances for a subset of molecules.
+    kinds: wasserstein, persistent_homology, grassmann, riemann
+    """
+    frames = qm9.get_positions(subset_size=subset_size)
+    df_subset = qm9.df.head(len(frames))
+
+    kind = kind.lower()
+    if kind == "wasserstein":
+        metric = kwargs.get("ground_metric", "euclidean")
+        dist_matrix = Wasserstein.distance_matrix(frames, metric=metric)
+        title = f"Wasserstein ({metric})"
+        tag = f"wasserstein_{metric}"
+    elif kind in {"persistent_homology", "persistence"}:
+        metric = kwargs.get("metric", "bottleneck")
+        max_dim = kwargs.get("max_homology_dim", 2)
+        dims = kwargs.get("homology_dims", (0, 1, 2))
+        dist_matrix = PersistentHomology.distance_matrix(
+            frames,
+            metric=metric,
+            max_homology_dim=max_dim,
+            homology_dims=dims,
+        )
+        title = f"Persistent Homology ({metric})"
+        tag = f"persistent_homology_{metric}"
+    elif kind == "grassmann":
+        k = kwargs.get("k", 3)
+        method = kwargs.get("method", "svd")
+        normalized = kwargs.get("normalized", False)
+        dist_matrix = Grassmann.distance_matrix(frames, k=k, method=method, normalized=normalized)
+        title = f"Grassmann (k={k}, {method})"
+        tag = f"grassmann_k{k}_{method}"
+    elif kind == "riemann":
+        metric = kwargs.get("metric", "log-euclidean")
+        normalized = kwargs.get("normalized", False)
+        dist_matrix = Riemann.distance_matrix(frames, metric=metric, normalized=normalized)
+        title = f"Riemann ({metric})"
+        tag = f"riemann_{metric}"
+    else:
+        raise ValueError("kind must be one of: wasserstein, persistent_homology, grassmann, riemann")
+
+    os.makedirs(save_dir, exist_ok=True)
+    plot_distance_matrix(
+        dist_matrix,
+        title=f"{title} Distance Matrix",
+        save_path=os.path.join(save_dir, f"qm9_{tag}_matrix.png")
+    )
+
+    low_pairs, high_pairs = extract_extreme_pairs(dist_matrix, df_subset, top_k=top_k)
+    plot_pair_grid(
+        low_pairs,
+        title=f"Most Similar Pairs ({title})",
+        save_path=os.path.join(save_dir, f"qm9_{tag}_most_similar.png"),
+        max_pairs=top_k
+    )
+    plot_pair_grid(
+        high_pairs,
+        title=f"Least Similar Pairs ({title})",
+        save_path=os.path.join(save_dir, f"qm9_{tag}_least_similar.png"),
+        max_pairs=top_k
+    )
+
 if __name__ == "__main__":
 
     qm9 = QM9Dataset()
@@ -122,6 +193,13 @@ if __name__ == "__main__":
     top_k = 6
     save_dir = f"figures/qm9/distances/{dist_type}"
 
-    distance(qm9, descriptor=descriptor, dist_type=dist_type, top_k=6)
+    #distance(qm9, descriptor=descriptor, dist_type=dist_type, top_k=6)
 
+    kind = "wasserstein"
+    subset_size = 2000
+    
+    #non_euclidean_distance(qm9, kind="wasserstein", subset_size=subset_size)
+    non_euclidean_distance(qm9, kind="persistent_homology", subset_size=500, metric="bottleneck")
+    # non_euclidean_distance(qm9, kind="grassmann", subset_size=200, k=3, method="svd")
+    # non_euclidean_distance(qm9, kind="riemann", subset_size=200, metric="log-euclidean")
 
