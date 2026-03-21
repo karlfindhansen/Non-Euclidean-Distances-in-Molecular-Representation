@@ -1,13 +1,14 @@
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 
 from loguru import logger
+from rdkit import Chem
+from rdkit.Chem import Draw
 
 from src.datasets import QM9Dataset
 from src.non_euclidean import Wasserstein, PersistentHomology, Grassmann, Riemann
-from rdkit import Chem
-from rdkit.Chem import Draw
-import os
 
 def plot_distance_matrix(dist_matrix, title="Distance Matrix", save_path=None):
     plt.figure(figsize=(8, 6))
