@@ -296,7 +296,8 @@ def evaluate_descriptor_kmeans(
                 df_scored, "cluster_eval", embedding_col="embedding_eval"
             )
 
-            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo", "num_sp_carbons", "num_sp2_carbons", "num_sp3_carbons", "num_rings"]
+
             if all(c in df_scored.columns for c in prop_cols) and "functional_groups" in df_scored.columns:
                 property_matrix = df_scored.select(prop_cols).to_numpy()
                 categories = df_scored["functional_groups"].to_list()
@@ -446,7 +447,8 @@ def evaluate_euclidean_agglomerative(
                 df_scored, "cluster_eval", embedding_col="embedding_eval"
             )
 
-            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo", "num_sp_carbons", "num_sp2_carbons", "num_sp3_carbons", "num_rings"]
+
             if all(c in df_scored.columns for c in prop_cols) and "functional_groups" in df_scored.columns:
                 property_matrix = df_scored.select(prop_cols).to_numpy()
                 categories = df_scored["functional_groups"].to_list()
@@ -954,7 +956,8 @@ def evaluate_isomer_euclidean_agglomerative(
                 df_scored, "cluster_eval", embedding_col="embedding_eval"
             )
 
-            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo", "num_sp_carbons", "num_sp2_carbons", "num_sp3_carbons", "num_rings"]
+
             if all(c in df_scored.columns for c in prop_cols) and "functional_groups" in df_scored.columns:
                 property_matrix = df_scored.select(prop_cols).to_numpy()
                 categories = df_scored["functional_groups"].to_list()
