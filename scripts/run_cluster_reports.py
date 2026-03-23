@@ -808,6 +808,181 @@ def evaluate_isomer_non_euclidean_kmedoids(
 
         logger.success(f"Isomer non-euclidean evaluation complete for {name}")
 
+def evaluate_isomer_euclidean_agglomerative(
+    k_range=range(2, 15),
+    output_dir="results/cluster_reports/isomers_euclidean",
+    target_formula=None,
+):
+    qm9 = QM9Dataset()
+    qm9.load()
+
+    qm9.add_morgan_fingerprints()
+    qm9.add_selfies_transformer()
+    qm9.add_chemprop()
+    qm9.add_acsf()
+    qm9.add_soap()
+
+    if "formula" not in qm9.df.columns:
+        raise ValueError("QM9 dataframe missing 'formula' column.")
+
+    formula_counts = qm9.df.group_by("formula").len().sort("len", descending=True)
+    if formula_counts.is_empty():
+        raise ValueError("No formulas found in QM9 dataframe.")
+
+    if target_formula is None:
+        target_formula = formula_counts.row(0)[0]
+
+    isomers_df = qm9.df.filter(pl.col("formula") == target_formula)
+    if isomers_df.is_empty():
+        raise ValueError(f"No isomers found for formula {target_formula}.")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    configs = [
+        {
+            "name": "morgan_fingerprint",
+            "prep": lambda X: (X == 1).astype(int),
+            "metric": "jaccard",
+            "linkage": "average",
+        },
+        {
+            "name": "chemprop_embedding",
+            "prep": lambda X: normalize(X, norm="l2", axis=1),
+            "metric": "cosine",
+            "linkage": "average",
+        },
+        {
+            "name": "selfies_transformer",
+            "prep": lambda X: normalize(X, norm="l2", axis=1),
+            "metric": "cosine",
+            "linkage": "average",
+        },
+        {
+            "name": "acsf_embedding",
+            "prep": lambda X: StandardScaler().fit_transform(X),
+            "metric": "euclidean",
+            "linkage": "ward",
+        },
+        {
+            "name": "soap_embedding",
+            "prep": lambda X: normalize(X, norm="l2", axis=1),
+            "metric": "euclidean",
+            "linkage": "ward",
+        },
+    ]
+
+    for cfg in configs:
+        name = cfg["name"]
+        if name not in isomers_df.columns:
+            logger.warning(f"Skipping {name}: column not found.")
+            continue
+
+        df = isomers_df.filter(pl.col(name).is_not_null())
+        if df.is_empty():
+            logger.warning(f"Skipping {name}: all values are null.")
+            continue
+
+        X = np.stack(df[name].to_list())
+        if X.ndim > 2:
+            X = X.reshape(X.shape[0], -1)
+        X = cfg["prep"](X)
+
+        if X.shape[0] < 3:
+            logger.warning(f"Skipping {name}: not enough samples for silhouette.")
+            continue
+
+        k_list = [int(k) for k in k_range if 2 <= int(k) < X.shape[0]]
+        if not k_list:
+            logger.warning(f"Skipping {name}: no valid k in k_range for n={X.shape[0]}.")
+            continue
+
+        scores = {"k": [], "silhouette": []}
+
+        for k in k_list:
+            model = AgglomerativeClustering(
+                n_clusters=int(k),
+                metric=cfg["metric"],
+                linkage=cfg["linkage"],
+            )
+            labels = model.fit_predict(X)
+            score = silhouette_score(X, labels, metric=cfg["metric"])
+            scores["k"].append(int(k))
+            scores["silhouette"].append(float(score))
+
+        best_k = scores["k"][int(np.argmax(scores["silhouette"]))]
+
+        out_base = os.path.join(output_dir, f"{name}_formula_{target_formula}")
+        pl.DataFrame(scores).write_csv(f"{out_base}_agglo_eval.csv")
+        with open(f"{out_base}_agglo_best.json", "w") as f:
+            json.dump(
+                {
+                    "best_k": int(best_k),
+                    "metric": cfg["metric"],
+                    "linkage": cfg["linkage"],
+                    "formula": target_formula,
+                },
+                f,
+                indent=2,
+            )
+
+        # Cluster quality scores (congruence + MolecularClusterScore) on THIS embedding
+        try:
+            model = AgglomerativeClustering(
+                n_clusters=int(best_k),
+                metric=cfg["metric"],
+                linkage=cfg["linkage"],
+            )
+            labels_best = model.fit_predict(X)
+
+            embedding_list = [row.tolist() for row in X]
+            df_scored = df.with_columns(
+                [
+                    pl.Series("cluster_eval", labels_best),
+                    pl.Series("embedding_eval", embedding_list),
+                ]
+            )
+
+            scores_payload = {
+                "embedding": name,
+                "formula": target_formula,
+                "best_k_used": int(best_k),
+                "valid_count": int(len(embedding_list)),
+                "total_count": int(len(embedding_list)),
+            }
+
+            scores_payload["congruence"] = calculate_congruence(
+                df_scored, "cluster_eval", embedding_col="embedding_eval"
+            )
+
+            prop_cols = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+            if all(c in df_scored.columns for c in prop_cols) and "functional_groups" in df_scored.columns:
+                property_matrix = df_scored.select(prop_cols).to_numpy()
+                categories = df_scored["functional_groups"].to_list()
+                mcs = MolecularClusterScore()
+                mcs_result = mcs.compute_total_score(
+                    X,
+                    labels_best,
+                    property_matrix,
+                    categories,
+                )
+                if "structure_class" in df_scored.columns:
+                    mcs_result["structure_class_score"] = mcs.compute_category_score(
+                        df_scored["structure_class"].to_list(),
+                        labels_best,
+                    )
+                scores_payload["molecular_cluster_score"] = mcs_result
+            else:
+                scores_payload["molecular_cluster_score"] = {
+                    "error": "Missing property or category columns."
+                }
+
+            with open(f"{out_base}_cluster_scores.json", "w") as f:
+                json.dump(scores_payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to compute isomer euclidean scores for {name}: {e}")
+
+        logger.success(f"Isomer euclidean evaluation complete for {name}")
+
 def load_precomputed_distances(
     dataset_dir: str,
     expected_n: int,
@@ -1077,6 +1252,9 @@ if __name__ == "__main__":
         k_range=range(2, 15),
         use_precomputed_only=False,
         include_ph=False,
+    )
+    evaluate_isomer_euclidean_agglomerative(
+        k_range=range(2, 15),
     )
 
     evaluate_descriptor_kmeans()
