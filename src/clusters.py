@@ -1,15 +1,16 @@
 import numpy as np
 import polars as pl
+import pandas as pd
 import matplotlib.pyplot as plt
+import plotly.express as px
+
 from loguru import logger
+from collections import Counter
+
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.decomposition import PCA
-from sklearn.metrics import adjusted_rand_score, silhouette_score, calinski_harabasz_score, silhouette_samples
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
-from collections import Counter
-import plotly.express as px
+from sklearn.metrics import adjusted_rand_score, silhouette_score, calinski_harabasz_score, silhouette_samples, davies_bouldin_score
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.manifold import TSNE
 
 class ClusterAnalysis:
@@ -558,3 +559,217 @@ class ClusterAnalysis:
         """Returns summary dataframe."""
         if self.meta_df is None:
             return pl.DataFrame({"cluster": self.labels_})
+        
+
+def calculate_congruence(df, cluster_col, embedding_col="soap_embedding"):
+    results = {}
+    if embedding_col not in df.columns:
+        raise ValueError(f"Embedding column '{embedding_col}' not found in DataFrame.")
+    if isinstance(df, pl.DataFrame):
+        clusters = df.get_column(cluster_col).unique().to_list()
+    else:
+        clusters = df[cluster_col].unique()
+
+    for c in clusters:
+        if isinstance(df, pl.DataFrame):
+            subset = df.filter(pl.col(cluster_col) == c)
+            if subset.height == 0:
+                continue
+
+            # 1. Functional Consistency
+            vc = subset.get_column("functional_groups").value_counts(normalize=True)
+            if "proportion" in vc.columns:
+                func_score = vc.get_column("proportion").max()
+            else:
+                counts = vc.get_column("count")
+                func_score = (counts / counts.sum()).max()
+
+            # 2. Property Cohesion (using logp, tpsa, mol_weight)
+            props = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+            cvs = []
+            for p in props:
+                s = subset.get_column(p)
+                mu = s.mean()
+                sigma = s.std()
+                if mu is not None and sigma is not None and mu != 0:
+                    cvs.append(sigma / abs(mu))
+            prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+
+            # 3. Geometric Score (assuming soap_embedding is a list/array)
+            embeddings = np.stack(subset.get_column(embedding_col).to_list())
+        else:
+            subset = df[df[cluster_col] == c]
+            if len(subset) == 0:
+                continue
+
+            # 1. Functional Consistency
+            func_score = subset["functional_groups"].value_counts(normalize=True).max()
+
+            # 2. Property Cohesion (using logp, tpsa, mol_weight)
+            props = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+            cvs = []
+            for p in props:
+                mu = subset[p].mean()
+                sigma = subset[p].std()
+                if mu is not None and sigma is not None and mu != 0:
+                    cvs.append(sigma / abs(mu))
+            prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+
+            # 3. Geometric Score (assuming soap_embedding is a list/array)
+            embeddings = np.stack(subset[embedding_col].values)
+
+        centroid = np.mean(embeddings, axis=0)
+        denom_centroid = np.linalg.norm(centroid)
+        if denom_centroid == 0:
+            geom_score = 0
+        else:
+            geom_score = np.mean(
+                [
+                    np.dot(e, centroid)
+                    / (np.linalg.norm(e) * denom_centroid)
+                    if np.linalg.norm(e) != 0
+                    else 0
+                    for e in embeddings
+                ]
+            )
+
+        # Weighted Average (Equal weights 1/3 each)
+        total_score = (func_score + prop_score + geom_score) / 3
+        results[c] = total_score
+
+    return results
+
+class MolecularClusterScore:
+    
+    def __init__(
+        self,
+        structure_weight=0.4,
+        property_weight=0.3,
+        category_weight=0.2,
+        separation_weight=0.1
+    ):
+        self.w_structure = structure_weight
+        self.w_property = property_weight
+        self.w_category = category_weight
+        self.w_separation = separation_weight
+
+    def compute_structure_score(self, embedding, labels):
+        """
+        Structural similarity using Silhouette score
+        """
+        if len(np.unique(labels)) < 2:
+            return 0
+
+        score = silhouette_score(embedding, labels, metric="cosine")
+
+        # normalize silhouette from [-1,1] → [0,1]
+        return (score + 1) / 2
+
+
+    def compute_separation_score(self, embedding, labels):
+        """
+        Cluster separation using Davies–Bouldin index
+        """
+        if len(np.unique(labels)) < 2:
+            return 0
+
+        db = davies_bouldin_score(embedding, labels)
+
+        # convert to [0,1] score (lower DB is better)
+        return 1 / (1 + db)
+
+
+    def compute_property_score(self, properties, labels):
+        """
+        Low intra-cluster variance in chemical/physical properties
+        """
+        global_var = np.var(properties, axis=0).mean()
+
+        cluster_vars = []
+
+        for c in np.unique(labels):
+            cluster_data = properties[labels == c]
+
+            if len(cluster_data) > 1:
+                cluster_vars.append(np.var(cluster_data, axis=0).mean())
+
+        if len(cluster_vars) == 0:
+            return 0
+
+        score = 1 - np.mean(cluster_vars) / global_var
+
+        return max(0, min(score, 1))
+
+
+    def compute_category_score(self, categories, labels):
+        """
+        Cluster purity using functional groups or structure classes
+        """
+        purity_scores = []
+
+        categories = pd.Series(categories)
+
+        for c in np.unique(labels):
+
+            cluster_cats = categories[labels == c]
+
+            if len(cluster_cats) == 0:
+                continue
+
+            counts = cluster_cats.value_counts()
+
+            purity = counts.max() / counts.sum()
+
+            purity_scores.append(purity)
+
+        if len(purity_scores) == 0:
+            return 0
+
+        return np.mean(purity_scores)
+
+
+    def compute_total_score(
+        self,
+        soap_embeddings,
+        labels,
+        property_matrix,
+        categories
+    ):
+        """
+        Full composite cluster score
+        """
+
+        structure_score = self.compute_structure_score(
+            soap_embeddings,
+            labels
+        )
+
+        property_score = self.compute_property_score(
+            property_matrix,
+            labels
+        )
+
+        category_score = self.compute_category_score(
+            categories,
+            labels
+        )
+
+        separation_score = self.compute_separation_score(
+            soap_embeddings,
+            labels
+        )
+
+        total = (
+            self.w_structure * structure_score
+            + self.w_property * property_score
+            + self.w_category * category_score
+            + self.w_separation * separation_score
+        )
+
+        return {
+            "total_score": total,
+            "structure_score": structure_score,
+            "property_score": property_score,
+            "category_score": category_score,
+            "separation_score": separation_score
+        }
