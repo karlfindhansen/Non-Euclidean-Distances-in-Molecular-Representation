@@ -53,6 +53,22 @@ class MolecularFeaturizer:
         )
 
     @staticmethod
+    def _descriptor_to_list(vec, reduce: str | None = None) -> list[float]:
+        """
+        Convert a descriptor output into a flat Python list.
+        If reduce == "mean" and vec is 2D, mean-pool over atoms.
+        """
+        if vec is None:
+            return None
+
+        arr = np.asarray(vec)
+        if arr.ndim == 1:
+            return arr.ravel().tolist()
+        if reduce == "mean":
+            return np.mean(arr, axis=0).ravel().tolist()
+        return arr.ravel().tolist()
+
+    @staticmethod
     def compute_morgan_fingerprints(smiles_series: pl.Series, radius: int = 3, fp_size: int = 2048) -> pl.Series:
         logger.info(f"Computing Morgan Fingerprints (Radius={radius}, Size={fp_size})...")
         gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
@@ -157,7 +173,7 @@ class MolecularFeaturizer:
                 # atomic_soap shape: (n_atoms, n_features)
                 atomic_soap = soap_engine.create(atoms)
                 # Mean pooling -> (n_features,)
-                return np.mean(atomic_soap, axis=0).tolist()
+                return MolecularFeaturizer._descriptor_to_list(atomic_soap, reduce="mean")
             except Exception as e:
                 return None
 
@@ -186,11 +202,14 @@ class MolecularFeaturizer:
             try:
                 atoms = MolecularFeaturizer._rdkit_to_ase(mol)
                 atomic_acsf = acsf_engine.create(atoms)
-                return np.mean(atomic_acsf, axis=0).tolist()
+                return MolecularFeaturizer._descriptor_to_list(atomic_acsf, reduce="mean")
             except Exception:
                 return None
 
         return smiles_series.map_elements(_compute_single_acsf, return_dtype=pl.List(pl.Float64))
+
+
+    @staticmethod
     
     @staticmethod
     def compute_coulomb_matrix(

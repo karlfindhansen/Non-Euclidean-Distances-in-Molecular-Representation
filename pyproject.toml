@@ -21,6 +21,7 @@ dependencies = [
     "lmdb>=1.7.5",
     "loguru>=0.7.3",
     "mapsim",
+    "mendeleev>=1.1.0",
     "mp-api>=0.46.0",
     "nbformat>=5.10.4",
     "nglview>=4.0.1",

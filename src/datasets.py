@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any, Set
 from torch_geometric.datasets import QM9
 from ase import Atoms
 from ase.io import write
+from ase.data import atomic_numbers
 from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
@@ -23,6 +24,7 @@ from sklearn.preprocessing import StandardScaler
 from pymatgen.core import Structure
 from dscribe.descriptors import SOAP, ACSF
 from pymatgen.io.ase import AseAtomsAdaptor
+from mendeleev import element
 
 from transformers import logging as tf_log
 tf_log.set_verbosity_error()
@@ -59,7 +61,7 @@ class QM9Dataset:
     def __init__(
         self,
         root: str = "data/QM9",
-        filename: str = "dataset_cleaned.csv",
+        filename: str = "dataset_cleaned.parquet",
         subset_size: int = 2000,
         required_mol_ids: Optional[List[str]] = None,
         embed_seed: int = 40,
@@ -380,7 +382,7 @@ class QM9Dataset:
         if os.path.exists(self.file_path) and not force_process:
             logger.info(f"Loading QM9 from {self.file_path}...")
             try:
-                self.df = pl.read_csv(self.file_path)
+                self.df = pl.read_parquet(self.file_path)
                 validate_columns(self.df, self.REQUIRED_COLUMNS)
                 validate_size(self.df, self.subset_size)
                 if self.required_mol_ids:
@@ -390,6 +392,23 @@ class QM9Dataset:
                         raise ValueError(
                             f"Cached dataset is missing required mol_id(s): {missing_cached}"
                         )
+                missing = [
+                name
+                for name in (
+                        "morgan_fingerprint",
+                        "selfies_transformer",
+                        "selfies_onehot",
+                        "soap_embedding",
+                        "acsf_embedding",
+                        "coulomb_matrix",
+                        "chemprop_embedding",
+                )
+                    if name not in self.df.columns
+                ]
+                if missing:
+                    logger.info(f"Descriptors missing from cache ({missing}); computing now.")
+                    self.add_all_descriptors()
+                    self.df.write_parquet(self.file_path)
                 return self.df
             except Exception as e:
                 logger.error(f"Load failed ({e}). Reprocessing...")
@@ -522,10 +541,12 @@ class QM9Dataset:
             )
             .sort("_qm9_idx")
             .drop("_qm9_idx")
-            .drop(["soap_embedding", "acsf_embedding", "coulomb_matrix"])
         )
 
-        self.df.write_csv(self.file_path)
+        # Compute and persist all descriptors for cached reuse.
+        self.add_all_descriptors()
+
+        self.df.write_parquet(self.file_path)
         logger.success(f"Saved processed dataset with {self.df.height} rows to {self.file_path}")
 
     @staticmethod
@@ -967,11 +988,21 @@ class MaterialsProject:
         base_path: str = "data/Materials Project/",
         file_name: str = "stable_oxides.parquet",
         config_path: str = "config/api_key.json",
+        sampling_strategy: str = "stratified",
+        stratify_bins: int = 10,
+        sampling_seed: int = 40,
+        min_per_bin: int = 1,
+        sampling_buffer: float = 1.5,
     ) -> None:
         self.base_path = base_path
         self.file_name = file_name
         self.file_path = os.path.join(self.base_path, self.file_name)
         self.api_key = self._load_api_key(config_path)
+        self.sampling_strategy = sampling_strategy
+        self.stratify_bins = stratify_bins
+        self.sampling_seed = sampling_seed
+        self.min_per_bin = min_per_bin
+        self.sampling_buffer = sampling_buffer
         self.df = pl.DataFrame()
         os.makedirs(self.base_path, exist_ok=True)
 
@@ -988,8 +1019,13 @@ class MaterialsProject:
         if os.path.exists(self.file_path) and not force_fetch:
             logger.info(f"Loading cached Parquet data from {self.file_path}...")
             self.df = pl.read_parquet(self.file_path)
-            if "soap_embedding" not in self.df.columns or "acsf_embedding" not in self.df.columns:
-                logger.info("Descriptors not found in cached data, computing them now.")
+            missing = [
+                name
+                for name in ("soap_embedding", "acsf_embedding")
+                if name not in self.df.columns
+            ]
+            if missing:
+                logger.info(f"Descriptors missing from cache ({missing}); computing them now.")
                 self._add_descriptors()
                 self.df.write_parquet(self.file_path)
                 logger.success("Descriptors added and Parquet updated.")
@@ -997,9 +1033,15 @@ class MaterialsProject:
         return self._fetch_from_api(limit)
 
     def _fetch_from_api(self, limit: int) -> pl.DataFrame:
-        logger.info(f"Fetching {limit} stable oxides from API...")
+        logger.info(f"Fetching {limit} stable oxides from API. Using {self.sampling_strategy} sampling.")
         if not self.api_key:
             raise ValueError("API Key not found. Check your config path.")
+
+        fetch_limit = (
+            int(np.ceil(limit * self.sampling_buffer))
+            if self.sampling_strategy == "stratified"
+            else limit
+        )
 
         with MPRester(self.api_key) as mpr:
             query_kwargs = dict(
@@ -1008,13 +1050,13 @@ class MaterialsProject:
                 fields=[
                     "material_id", "formula_pretty", "structure",
                     "symmetry", "energy_per_atom", "formation_energy_per_atom",
-                    "density"
+                    "density", "band_gap", "is_metal"
                 ],
             )
 
             # mp-api versions no longer expose mpr.listen; paginate via search instead.
-            chunk_size = min(max(limit, 1), 1000)
-            num_chunks = max((limit + chunk_size - 1) // chunk_size, 1)
+            chunk_size = min(max(fetch_limit, 1), 1000)
+            num_chunks = max((fetch_limit + chunk_size - 1) // chunk_size, 1)
             try:
                 docs = mpr.materials.summary.search(
                     **query_kwargs,
@@ -1027,7 +1069,12 @@ class MaterialsProject:
                 except TypeError:
                     docs = mpr.materials.summary.search(**query_kwargs)
 
-            docs = list(docs)[:limit]
+            docs = list(docs)[:fetch_limit]
+
+            if self.sampling_strategy == "stratified":
+                docs = self._stratified_sample_docs(docs, target_size=limit)
+            else:
+                docs = docs[:limit]
 
             data_list = [
                 self._process_doc(d)
@@ -1042,6 +1089,89 @@ class MaterialsProject:
 
         return self.df
 
+    def _stratified_sample_docs(self, docs: list, target_size: int) -> list:
+        """
+        Stratified sampling on band_gap using quantile bins.
+        """
+        if target_size <= 0 or not docs:
+            return []
+
+        values = np.array(
+            [
+                float(d.band_gap) if d.band_gap is not None else np.nan
+                for d in docs
+            ],
+            dtype=float,
+        )
+
+        valid_mask = ~np.isnan(values)
+        if valid_mask.sum() == 0:
+            return docs[:target_size]
+
+        vals = values[valid_mask]
+        if self.stratify_bins <= 1 or np.all(vals == vals[0]):
+            rng = np.random.default_rng(self.sampling_seed)
+            indices = rng.choice(len(docs), size=min(target_size, len(docs)), replace=False)
+            return [docs[i] for i in indices]
+
+        edges = np.quantile(vals, np.linspace(0, 1, self.stratify_bins + 1))
+        edges = np.unique(edges)
+        if edges.size <= 2:
+            rng = np.random.default_rng(self.sampling_seed)
+            indices = rng.choice(len(docs), size=min(target_size, len(docs)), replace=False)
+            return [docs[i] for i in indices]
+
+        bins = np.full(len(docs), -1, dtype=int)
+        bins[valid_mask] = np.digitize(values[valid_mask], edges[1:-1], right=True)
+
+        strata: dict[int, list[int]] = {}
+        for i, b in enumerate(bins):
+            if b < 0:
+                continue
+            strata.setdefault(int(b), []).append(i)
+
+        counts = {k: len(v) for k, v in strata.items()}
+        num_strata = len(counts)
+        slots = min(target_size, len(docs))
+        min_take = 0
+        if self.min_per_bin > 0 and slots >= num_strata:
+            min_take = self.min_per_bin
+
+        base_take = {k: min(min_take, counts[k]) for k in counts}
+        remaining_slots = slots - sum(base_take.values())
+        remaining_counts = {k: counts[k] - base_take[k] for k in counts}
+        remaining_total = sum(remaining_counts.values())
+
+        if remaining_slots > 0 and remaining_total > 0:
+            raw = {k: remaining_counts[k] / remaining_total * remaining_slots for k in counts}
+            take = {k: int(np.floor(raw[k])) for k in counts}
+            remainder = remaining_slots - sum(take.values())
+            if remainder > 0:
+                frac = sorted(((raw[k] - take[k], k) for k in counts), reverse=True)
+                for _, k in frac[:remainder]:
+                    take[k] += 1
+        else:
+            take = {k: 0 for k in counts}
+
+        rng = np.random.default_rng(self.sampling_seed)
+        selected = []
+        for k, indices in strata.items():
+            k_take = base_take[k] + take[k]
+            if k_take <= 0:
+                continue
+            if k_take >= len(indices):
+                selected.extend(indices)
+            else:
+                chosen = rng.choice(indices, size=k_take, replace=False)
+                selected.extend(chosen.tolist())
+
+        if len(selected) < slots:
+            remaining = list(set(range(len(docs))) - set(selected))
+            extra = rng.choice(remaining, size=min(slots - len(selected), len(remaining)), replace=False)
+            selected.extend(extra.tolist())
+
+        return [docs[i] for i in selected]
+
     def _process_doc(self, d) -> Dict[str, Any]:
         struct = d.structure
         lat = struct.lattice
@@ -1050,6 +1180,8 @@ class MaterialsProject:
             "formula_pretty": str(d.formula_pretty),
             "energy_per_atom": float(d.energy_per_atom),
             "formation_energy_per_atom": float(d.formation_energy_per_atom),
+            "band_gap": float(d.band_gap),
+            "is_metal": bool(d.is_metal),
             "raw_structure": json.dumps(struct.as_dict()),
             "crystal_system": str(d.symmetry.crystal_system),
             "space_group": str(d.symmetry.symbol),
@@ -1070,16 +1202,36 @@ class MaterialsProject:
         struct_strings = self.df["raw_structure"].to_list()
         return [Structure.from_dict(json.loads(s)) for s in tqdm(struct_strings, desc="Reconstructing structures")]
 
-    def _add_descriptors(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
+    def _add_descriptors(
+        self,
+        r_cut=6.0,
+        n_max=8,
+        l_max=6,
+        sigma=0.5,
+    ) -> None:
         """Computes and adds SOAP and ACSF descriptors to the DataFrame."""
         structures = self._get_structures()
         
         unique_elements = sorted(list(set(el.symbol for s in structures for el in s.composition.elements)))
+        weighting = {el: element(el).atomic_number for el in unique_elements}
         
         # Compute SOAP
         if "soap_embedding" not in self.df.columns:
             logger.info(f"Computing Periodic SOAP for {len(structures)} structures...")
-            soap_engine = SOAP(species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, sparse=True)
+            soap_engine = SOAP(
+                species=unique_elements, 
+                periodic=True, 
+                r_cut=r_cut, 
+                n_max=n_max, 
+                l_max=l_max, 
+                sigma=sigma, 
+                sparse=True,
+                average="inner",
+                compression={
+                    "mode": "mu2",
+                    "species_weighting": weighting
+                }
+            )
             soap_features = self._compute_feature(structures, soap_engine, "SOAP")
             # print the size of the soap features
             print(f"SOAP features shape: {len(soap_features)} x {len(soap_features[0]) if soap_features else 0}")
@@ -1092,11 +1244,31 @@ class MaterialsProject:
             acsf_engine = ACSF(
                 species=unique_elements, periodic=True, r_cut=r_cut,
                 g2_params=[[1, 1], [1, 2], [1, 3]],
-                g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]]
+                g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
             )
-            acsf_features = self._compute_feature(structures, acsf_engine, "ACSF")
-            self.df = self.df.with_columns(pl.Series("acsf_embedding", acsf_features))
-            logger.success("ACSF embeddings added.")
+            
+            # 1. Get the raw (n_atoms, n_features) matrices
+            raw_acsf_features = self._compute_feature(structures, acsf_engine, "ACSF")
+            
+            # 2. Average over the atoms (axis=0) to get a single vector per material
+            normalized_acsf = []
+            for v in raw_acsf_features:
+                if v is None:
+                    normalized_acsf.append(None)
+                else:
+                    arr = np.asarray(v)
+                    if arr.ndim == 2:
+                        # Average atomic vectors into a global crystal vector
+                        mean_vec = np.mean(arr, axis=0).tolist()
+                        normalized_acsf.append(mean_vec)
+                    else:
+                        normalized_acsf.append(arr.ravel().tolist())
+
+            # 3. Add to Polars
+            self.df = self.df.with_columns(
+                pl.Series("acsf_embedding", normalized_acsf, dtype=pl.List(pl.Float64), strict=False)
+            )
+            logger.success("ACSF embeddings averaged and added.")
 
     def _compute_feature(
         self,
@@ -1123,7 +1295,7 @@ class MaterialsProject:
                 batch_out = engine.create(batch_atoms, n_jobs=1)
 
                 for vec in batch_out:
-                    features.append(np.mean(vec, axis=0).tolist())
+                    features.append(vec)
 
             except Exception as e:
                 logger.warning(f"{desc_name} batch failed: {e}")
@@ -1131,7 +1303,7 @@ class MaterialsProject:
                 for s in batch_structs:
                     try:
                         atoms = AseAtomsAdaptor.get_atoms(s)
-                        vec = np.mean(engine.create(atoms, n_jobs=1), axis=0).tolist()
+                        vec = engine.create(atoms, n_jobs=1)
                         features.append(vec)
                     except Exception as e2:
                         logger.warning(f"{desc_name} failed for a structure: {e2}")
