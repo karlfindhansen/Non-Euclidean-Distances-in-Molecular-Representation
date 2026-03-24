@@ -83,9 +83,10 @@ def align_frames_to_dist_matrix(
     return aligned_frames if not return_matrix else (aligned_frames, dist_matrix)
 
 def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
-    data_dir = f'data/{dataset}'
-    os.makedirs(data_dir, exist_ok=True)
     expected_n = len(frames)
+    data_dir = f'data/{dataset}/distance_matrices_n{expected_n}'
+    os.makedirs(data_dir, exist_ok=True)
+    print(os.listdir(data_dir))
 
     matrix_tasks = {
         'grassmann': {
