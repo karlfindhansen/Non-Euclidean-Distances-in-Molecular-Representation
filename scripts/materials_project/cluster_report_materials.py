@@ -251,7 +251,7 @@ def evaluate_materials_euclidean_agglomerative(
             }
 
             scores_payload["congruence"] = calculate_congruence(
-                df_scored, "cluster_eval", embedding_col="embedding_eval"
+                df_scored, "cluster_eval", embedding_col="embedding_eval", dataset="materials_project"
             )
 
             scores_payload["molecular_cluster_score"] = _materials_cluster_score(
@@ -390,14 +390,26 @@ def load_precomputed_distances(
 
 
 def consolidate_cluster_reports(
-    output_path="results/cluster_reports/consolidated_report.json",
+    output_path="results/cluster_reports/consolidated_report_materials.json",
     root_dir="results/cluster_reports",
 ):
     report = {}
 
     for dirpath, _, filenames in os.walk(root_dir):
+
+        if dirpath != root_dir and "materials" not in dirpath:
+            continue
+
         for fname in filenames:
             if not (fname.endswith(".json") or fname.endswith(".csv")):
+                continue
+            
+            # Prevent the function from recursively reading its own previous output file
+            if fname == os.path.basename(output_path):
+                continue
+            
+            # If files are directly in root_dir, ensure they belong to materials
+            if dirpath == root_dir and "materials" not in fname:
                 continue
 
             rel_dir = os.path.relpath(dirpath, root_dir)
@@ -542,6 +554,19 @@ def main():
         include_ph=False,
         output_dir="results/cluster_reports/materials_non_euclidean",
     )
+
+    evaluate_materials_descriptor_kmeans(
+        k_range=range(2, 15),
+        limit=1000,
+        output_dir="results/cluster_reports/materials_descriptors_kmeans",
+    )
+
+    evaluate_materials_euclidean_agglomerative(
+        k_range=range(2, 15),
+        limit=1000,
+        output_dir="results/cluster_reports/materials_euclidean_metrics",
+    )
+
     consolidate_cluster_reports()
 
 

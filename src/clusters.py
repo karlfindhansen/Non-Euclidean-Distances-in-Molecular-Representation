@@ -561,7 +561,7 @@ class ClusterAnalysis:
             return pl.DataFrame({"cluster": self.labels_})
         
 
-def calculate_congruence(df, cluster_col, embedding_col="soap_embedding"):
+def calculate_congruence(df, cluster_col, dataset="materials_project", embedding_col="soap_embedding"):
     results = {}
     if embedding_col not in df.columns:
         raise ValueError(f"Embedding column '{embedding_col}' not found in DataFrame.")
@@ -570,74 +570,144 @@ def calculate_congruence(df, cluster_col, embedding_col="soap_embedding"):
     else:
         clusters = df[cluster_col].unique()
 
-    for c in clusters:
-        if isinstance(df, pl.DataFrame):
-            subset = df.filter(pl.col(cluster_col) == c)
-            if subset.height == 0:
-                continue
+    if dataset == "qm9":
+        for c in clusters:
+            if isinstance(df, pl.DataFrame):
+                subset = df.filter(pl.col(cluster_col) == c)
+                if subset.height == 0:
+                    continue
 
-            # 1. Functional Consistency
-            vc = subset.get_column("functional_groups").value_counts(normalize=True)
-            if "proportion" in vc.columns:
-                func_score = vc.get_column("proportion").max()
+                # 1. Functional Consistency
+                vc = subset.get_column("functional_groups").value_counts(normalize=True)
+                if "proportion" in vc.columns:
+                    func_score = vc.get_column("proportion").max()
+                else:
+                    counts = vc.get_column("count")
+                    func_score = (counts / counts.sum()).max()
+
+                # 2. Property Cohesion (using logp, tpsa, mol_weight)
+                props = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+                cvs = []
+                for p in props:
+                    s = subset.get_column(p)
+                    mu = s.mean()
+                    sigma = s.std()
+                    if mu is not None and sigma is not None and mu != 0:
+                        cvs.append(sigma / abs(mu))
+                prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+
+                # 3. Geometric Score (assuming soap_embedding is a list/array)
+                embeddings = np.stack(subset.get_column(embedding_col).to_list())
             else:
-                counts = vc.get_column("count")
-                func_score = (counts / counts.sum()).max()
+                subset = df[df[cluster_col] == c]
+                if len(subset) == 0:
+                    continue
 
-            # 2. Property Cohesion (using logp, tpsa, mol_weight)
-            props = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
-            cvs = []
-            for p in props:
-                s = subset.get_column(p)
-                mu = s.mean()
-                sigma = s.std()
-                if mu is not None and sigma is not None and mu != 0:
-                    cvs.append(sigma / abs(mu))
-            prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+                # 1. Functional Consistency
+                func_score = subset["functional_groups"].value_counts(normalize=True).max()
 
-            # 3. Geometric Score (assuming soap_embedding is a list/array)
-            embeddings = np.stack(subset.get_column(embedding_col).to_list())
-        else:
-            subset = df[df[cluster_col] == c]
-            if len(subset) == 0:
-                continue
+                # 2. Property Cohesion (using logp, tpsa, mol_weight)
+                props = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
+                cvs = []
+                for p in props:
+                    mu = subset[p].mean()
+                    sigma = subset[p].std()
+                    if mu is not None and sigma is not None and mu != 0:
+                        cvs.append(sigma / abs(mu))
+                prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
 
-            # 1. Functional Consistency
-            func_score = subset["functional_groups"].value_counts(normalize=True).max()
+                # 3. Geometric Score (assuming soap_embedding is a list/array)
+                embeddings = np.stack(subset[embedding_col].values)
 
-            # 2. Property Cohesion (using logp, tpsa, mol_weight)
-            props = ["logp", "tpsa", "mol_weight", "homo", "lumo"]
-            cvs = []
-            for p in props:
-                mu = subset[p].mean()
-                sigma = subset[p].std()
-                if mu is not None and sigma is not None and mu != 0:
-                    cvs.append(sigma / abs(mu))
-            prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+            centroid = np.mean(embeddings, axis=0)
+            denom_centroid = np.linalg.norm(centroid)
+            if denom_centroid == 0:
+                geom_score = 0
+            else:
+                geom_score = np.mean(
+                    [
+                        np.dot(e, centroid)
+                        / (np.linalg.norm(e) * denom_centroid)
+                        if np.linalg.norm(e) != 0
+                        else 0
+                        for e in embeddings
+                    ]
+                )
 
-            # 3. Geometric Score (assuming soap_embedding is a list/array)
-            embeddings = np.stack(subset[embedding_col].values)
+            # Weighted Average (Equal weights 1/3 each)
+            total_score = (func_score + prop_score + geom_score) / 3
+            results[c] = total_score
 
-        centroid = np.mean(embeddings, axis=0)
-        denom_centroid = np.linalg.norm(centroid)
-        if denom_centroid == 0:
-            geom_score = 0
-        else:
-            geom_score = np.mean(
-                [
-                    np.dot(e, centroid)
-                    / (np.linalg.norm(e) * denom_centroid)
-                    if np.linalg.norm(e) != 0
-                    else 0
-                    for e in embeddings
-                ]
-            )
+        return results
+    else:
+        for c in clusters:
+            if isinstance(df, pl.DataFrame):
+                subset = df.filter(pl.col(cluster_col) == c)
+                if subset.height == 0:
+                    continue
 
-        # Weighted Average (Equal weights 1/3 each)
-        total_score = (func_score + prop_score + geom_score) / 3
-        results[c] = total_score
+                # # 1. Functional Consistency
+                # vc = subset.get_column("functional_groups").value_counts(normalize=True)
+                # if "proportion" in vc.columns:
+                #     func_score = vc.get_column("proportion").max()
+                # else:
+                #     counts = vc.get_column("count")
+                #     func_score = (counts / counts.sum()).max()
 
-    return results
+                props = ["energy_per_atom", "formation_energy_per_atom", "band_gap", "density", "volume", "num_sites"]
+                cvs = []
+                for p in props:
+                    s = subset.get_column(p)
+                    mu = s.mean()
+                    sigma = s.std()
+                    if mu is not None and sigma is not None and mu != 0:
+                        cvs.append(sigma / abs(mu))
+                prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+
+                # 3. Geometric Score (assuming soap_embedding is a list/array)
+                embeddings = np.stack(subset.get_column(embedding_col).to_list())
+            else:
+                subset = df[df[cluster_col] == c]
+                if len(subset) == 0:
+                    continue
+
+                # 1. Functional Consistency
+                #func_score = subset["functional_groups"].value_counts(normalize=True).max()
+
+                props = ["energy_per_atom", "formation_energy_per_atom", "band_gap", "density", "volume", "num_sites"]
+                cvs = []
+                for p in props:
+                    mu = subset[p].mean()
+                    sigma = subset[p].std()
+                    if mu is not None and sigma is not None and mu != 0:
+                        cvs.append(sigma / abs(mu))
+                prop_score = 1 / (1 + np.mean(cvs)) if cvs else 0
+
+                # 3. Geometric Score (assuming soap_embedding is a list/array)
+                embeddings = np.stack(subset[embedding_col].values)
+
+            centroid = np.mean(embeddings, axis=0)
+            denom_centroid = np.linalg.norm(centroid)
+            if denom_centroid == 0:
+                geom_score = 0
+            else:
+                geom_score = np.mean(
+                    [
+                        np.dot(e, centroid)
+                        / (np.linalg.norm(e) * denom_centroid)
+                        if np.linalg.norm(e) != 0
+                        else 0
+                        for e in embeddings
+                    ]
+                )
+
+            # Weighted Average (Equal weights 1/3 each)
+            total_score = (prop_score + geom_score) / 3
+            results[c] = total_score
+
+        return results
+
+
 
 class MolecularClusterScore:
     
