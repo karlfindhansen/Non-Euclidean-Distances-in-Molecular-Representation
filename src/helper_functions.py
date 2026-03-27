@@ -1,15 +1,23 @@
+import os
+import chemiscope
+import json
+import webbrowser
+import kmedoids
+import polars as pl
+import numpy as np
+
+from pathlib import Path
+from pymatgen.io.ase import AseAtomsAdaptor
+from pymatgen.core import Structure
+from sklearn.manifold import TSNE
+from typing import Sequence, Optional, Iterable
+from loguru import logger
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from ase import Atoms
-import polars as pl
-import numpy as np
-from typing import Sequence, Optional, Iterable
-from loguru import logger
-import os
 
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
-import kmedoids
 
 
 def get_structures(df, mol_id_list = None):
@@ -208,6 +216,107 @@ def find_best_kmedoids_k(
     }
 
     return {"results": results, "best_k": best_k}
+
+def _open_in_browser(path_or_url):
+    try:
+        if not path_or_url:
+            return
+        if isinstance(path_or_url, str) and (
+            path_or_url.startswith("http://") or path_or_url.startswith("https://")
+        ):
+            webbrowser.open(path_or_url)
+            return
+        webbrowser.open(Path(path_or_url).resolve().as_uri())
+    except Exception as exc:
+        print(f"Could not open browser automatically: {exc}")
+
+
+def create_chemiscope_viewer(df, dist_matrix, labels):
+    print("Running t-SNE dimensionality reduction...")
+
+    tsne = TSNE(
+        n_components=2, 
+        metric='precomputed', 
+        init='random',
+        random_state=42, 
+        perplexity=30
+    )
+    tsne_embeddings = tsne.fit_transform(dist_matrix)
+
+    print("Converting Pymatgen structures to ASE Atoms for Chemiscope...")
+    frames = []
+    adaptor = AseAtomsAdaptor()
+    
+    for struct_json in df["raw_structure"]:
+        struct = Structure.from_dict(json.loads(struct_json))
+        atoms = adaptor.get_atoms(struct)
+        frames.append(atoms)
+
+    print("Assembling properties for Chemiscope...")
+  
+    properties = {
+        "tSNE_1": tsne_embeddings[:, 0],
+        "tSNE_2": tsne_embeddings[:, 1],
+        "Cluster": labels.astype(int),
+        "Formula": df["formula_pretty"].to_list(),
+        "Band_Gap": df["band_gap"].to_list(),
+        "Energy_per_Atom": df["energy_per_atom"].to_list(),
+        "Is_Metal": df["is_metal"].to_list(),
+    }
+
+    settings = {
+        "map": {
+            "x": {"property": "tSNE_1"},
+            "y": {"property": "tSNE_2"},
+            "color": {"property": "Cluster"},
+            #"symbol": "circle",
+            "size": {"factor": 35}
+        },
+        "structure": [
+            {"keepOrientation": True, "supercell": [2, 2, 2]}
+        ]
+    }
+
+    print("Generating Chemiscope widget...")
+    if hasattr(chemiscope, "write_html"):
+        output_html = "materials_tsne_clustering.html"
+        chemiscope.write_html(
+            output_html,
+            frames=frames,
+            properties=properties,
+            settings=settings,
+            title="Materials Project - SOAP t-SNE Clustering",
+        )
+        print(f"Saved interactive viewer to: {output_html}")
+        _open_in_browser(output_html)
+        return chemiscope.show(frames=frames, properties=properties, settings=settings)
+
+    output_json = "materials_tsne_clustering.json"
+    if not hasattr(chemiscope, "write_input"):
+        raise AttributeError(
+            "chemiscope does not provide write_html or write_input; "
+            "please upgrade/downgrade chemiscope to a supported version."
+        )
+
+    chemiscope.write_input(
+        output_json,
+        structures=frames,
+        properties=properties,
+        settings=settings,
+        metadata={"name": "Materials Project - SOAP t-SNE Clustering"},
+    )
+    print(f"Saved Chemiscope input to: {output_json}")
+    viewer = chemiscope.show_input(output_json)
+    viewer_url = getattr(viewer, "url", None)
+    if viewer_url:
+        _open_in_browser(viewer_url)
+    else:
+        print(
+            "If the viewer does not open automatically, run "
+            "`chemiscope show materials_tsne_clustering.json`."
+        )
+    return viewer
+
 
 if __name__ == '__main__':
     from src.datasets import QM9Dataset

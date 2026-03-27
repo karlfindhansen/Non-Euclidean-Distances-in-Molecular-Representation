@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Sequence
+from typing import Dict, List, Sequence, Literal, Optional
 
 import numpy as np
 import ot
@@ -104,6 +104,17 @@ def _compute_feature_matrices(
         scaled_matrices.append(scaler.transform(raw.T).T)
 
     return scaled_matrices
+
+def _compute_soap_feature_matrices(frames: Sequence[Atoms]):
+    """
+    Builds invariant soap feature matrices for all frames.
+    """
+    features = []
+    for frame in frames:
+        features.append(frame.soap)
+    
+    return features
+
 
 def _pairwise_distance_matrix(
     n: int,
@@ -286,10 +297,12 @@ class Grassmann:
     @classmethod
     def _get_uk_bases(
         cls,
-        frames: Sequence['Atoms'], 
+        frames: Optional[Sequence['Atoms']], 
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd",
+        features : Literal['soap', 'invariant'] = 'invariant',
         normalized: bool = False,
+        precomputed_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
         Maps 3D atomic coordinates to an orthonormal basis in R^n.
@@ -297,7 +310,17 @@ class Grassmann:
         bases = []
         
         # Extract raw (or normalized) features for ALL frames
-        raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
+        if precomputed_matrices is not None:
+            raw_matrices = precomputed_matrices
+        else:
+            if frames is None:
+                raise ValueError("Must provide either 'frames' or 'precomputed_matrices'.")
+            if features == 'invariant':
+                raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
+            elif features == 'soap':
+                raw_matrices = _compute_soap_feature_matrices(frames, normalized=normalized)
+            else:
+                raise ValueError(f"Unknown feature type: {features}")
 
         for raw_feat in raw_matrices:
             if method.lower() == "qr":
@@ -311,7 +334,7 @@ class Grassmann:
                 
             bases.append(basis)
         
-        return np.array(bases)
+        return bases
 
     @staticmethod
     def _distance(U1: np.ndarray, U2: np.ndarray) -> float:
@@ -326,29 +349,38 @@ class Grassmann:
     @classmethod
     def distance_matrix(
         cls, 
-        frames: Sequence['Atoms'], 
+        frames: Optional[Sequence['Atoms']] = None, 
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd",
+        features : Literal['soap', 'invariant'] = 'invariant',
         normalized: bool = False,
+        precomputed_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
         Computes a symmetric pairwise distance matrix for a molecular trajectory.
         """
-        logger.info(
-            f"Computing Grassmann distance matrix for {len(frames)} frames "
-            f"(k={k}, method='{method}', normalized={normalized})."
-        )
+        num_items = len(precomputed_matrices) if precomputed_matrices is not None else len(frames)
         
         # Precompute bases
-        bases = cls._get_uk_bases(frames, k=k, method=method, normalized=normalized)
-        num_frames = len(bases)
-        dist_matrix = _pairwise_distance_matrix(
-            n=num_frames,
-            pair_fn=lambda i, j: cls._distance(bases[i], bases[j]),
-            desc="Grassmann distances",
+        bases = cls._get_uk_bases(
+            frames=frames, 
+            k=k, 
+            method=method, 
+            features=features, 
+            normalized=normalized,
+            precomputed_matrices=precomputed_matrices
         )
         
-        logger.success("Finished Grassmann distance matrix computation.")
+        # Initialize an empty symmetric matrix
+        dist_matrix = np.zeros((num_items, num_items))
+        
+        # Compute pairwise distances (upper triangle)
+        for i in tqdm(range(num_items), desc="Grassmann distances", unit="pair"):
+            for j in range(i + 1, num_items):
+                d = cls._distance(bases[i], bases[j])
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d # Matrix is symmetric
+                
         return dist_matrix
 
 class Riemann:
