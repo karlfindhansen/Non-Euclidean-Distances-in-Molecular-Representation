@@ -96,7 +96,7 @@ class QM9Dataset:
         RDLogger.DisableLog("rdApp.error")
 
     def _select_qm9_indices(self, dataset: QM9) -> List[int]:
-        """Selects QM9 indices using a stratified sampling scheme."""
+        """Selects QM9 indices using a proportional stratified sampling scheme."""
         if self.sampling_strategy not in {"stratified", "head"}:
             raise ValueError(
                 f"Unsupported sampling_strategy='{self.sampling_strategy}'. "
@@ -104,7 +104,7 @@ class QM9Dataset:
             )
 
         if self.sampling_strategy == "head":
-            buffer_size = int(self.subset_size * 1.1)
+            buffer_size = int(self.subset_size * self.sampling_buffer)
             required_indices = self._parse_required_indices()
             max_required_index = max(required_indices) if required_indices else -1
             limit = max(buffer_size, max_required_index + 1)
@@ -118,6 +118,7 @@ class QM9Dataset:
                 f"{sorted(out_of_range)}"
             )
             required_indices = {i for i in required_indices if 0 <= i < len(dataset)}
+            
         valid_stratify_keys = set(self.QM9_TARGETS) | {"num_atoms"}
         invalid = [k for k in self.stratify_by if k not in valid_stratify_keys]
         if invalid:
@@ -130,6 +131,7 @@ class QM9Dataset:
         if n == 0:
             return []
 
+        # 1. Extract values
         values: Dict[str, np.ndarray] = {}
         for key in self.stratify_by:
             values[key] = np.zeros(n, dtype=float)
@@ -142,22 +144,24 @@ class QM9Dataset:
                     target_idx = self.QM9_TARGETS.index(key)
                     values[key][i] = float(data.y[0, target_idx].item())
 
+        # 2. Assign values to bins
         binned: Dict[str, np.ndarray] = {}
         for key in self.stratify_by:
             if key == "num_atoms":
+                # Discrete variable: Use exact integer as the bin
                 binned[key] = values[key].astype(int)
-                continue
-            series = values[key]
-            if self.stratify_bins <= 1 or np.all(series == series[0]):
-                binned[key] = np.zeros_like(series, dtype=int)
-                continue
-            edges = np.quantile(series, np.linspace(0, 1, self.stratify_bins + 1))
-            edges = np.unique(edges)
-            if edges.size <= 2:
-                binned[key] = np.zeros_like(series, dtype=int)
-                continue
-            binned[key] = np.digitize(series, edges[1:-1], right=True)
+            else:
+                # Continuous variable: Classical equal-width binning
+                series = values[key]
+                val_min, val_max = series.min(), series.max()
+                if self.stratify_bins <= 1 or val_min == val_max:
+                    binned[key] = np.zeros_like(series, dtype=int)
+                else:
+                    edges = np.linspace(val_min, val_max, self.stratify_bins + 1)
+                    edges[-1] += 1e-9  # Catch the absolute max value
+                    binned[key] = np.digitize(series, edges, right=False)
 
+        # 3. Form Strata intersections (e.g., bin 4 for num_atoms AND bin 2 for gap)
         strata: Dict[tuple, List[int]] = {}
         for i in range(n):
             if i in required_indices:
@@ -167,50 +171,40 @@ class QM9Dataset:
 
         target_size = int(np.ceil(self.subset_size * self.sampling_buffer))
         slots = max(target_size - len(required_indices), 0)
-        if slots <= 0:
+        
+        total_available = sum(len(v) for v in strata.values())
+        if slots <= 0 or total_available == 0:
             return sorted(required_indices)
 
-        total = sum(len(v) for v in strata.values())
-        if total == 0:
-            return sorted(required_indices)
-
-        counts = {k: len(v) for k, v in strata.items()}
-        num_strata = len(counts)
-        min_take = 0
-        if self.min_per_stratum > 0 and slots >= num_strata:
-            min_take = self.min_per_stratum
-
-        base_take = {k: min(min_take, counts[k]) for k in counts}
-        remaining_slots = slots - sum(base_take.values())
-        remaining_counts = {k: counts[k] - base_take[k] for k in counts}
-        remaining_total = sum(remaining_counts.values())
-
-        if remaining_slots > 0 and remaining_total > 0:
-            raw = {k: remaining_counts[k] / remaining_total * remaining_slots for k in counts}
-            take = {k: int(np.floor(raw[k])) for k in counts}
-            remainder = remaining_slots - sum(take.values())
-            if remainder > 0:
-                frac = sorted(
-                    ((raw[k] - take[k], k) for k in counts),
-                    reverse=True
-                )
-                for _, k in frac[:remainder]:
-                    take[k] += 1
-        else:
-            take = {k: 0 for k in counts}
-
+        # 4. Proportional Allocation
+        chosen_indices = []
         rng = np.random.default_rng(self.sampling_seed)
-        selected = set(required_indices)
-        for k, indices in strata.items():
-            k_take = base_take[k] + take[k]
-            if k_take <= 0:
-                continue
-            if k_take >= len(indices):
-                selected.update(indices)
-            else:
-                chosen = rng.choice(indices, size=k_take, replace=False)
-                selected.update(chosen.tolist())
 
+        for k, indices in strata.items():
+            # Proportion of this specific strata in the full dataset
+            proportion = len(indices) / total_available
+            take = int(np.round(slots * proportion))
+            take = min(take, len(indices))
+            
+            if take > 0:
+                chosen = rng.choice(indices, size=take, replace=False)
+                chosen_indices.extend(chosen.tolist())
+
+        # 5. Fill remaining slots due to rounding down
+        remaining_slots = slots - len(chosen_indices)
+        if remaining_slots > 0:
+            chosen_set = set(chosen_indices)
+            all_unchosen = [idx for indices in strata.values() for idx in indices if idx not in chosen_set]
+            if all_unchosen:
+                extra = rng.choice(
+                    all_unchosen,
+                    size=min(remaining_slots, len(all_unchosen)),
+                    replace=False
+                )
+                chosen_indices.extend(extra.tolist())
+
+        selected = set(required_indices)
+        selected.update(chosen_indices)
         return sorted(selected)
 
     def _parse_required_indices(self) -> List[int]:
