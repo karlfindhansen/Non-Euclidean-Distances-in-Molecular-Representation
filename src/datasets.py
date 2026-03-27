@@ -10,7 +10,6 @@ from typing import Optional, List, Dict, Any, Set
 from torch_geometric.datasets import QM9
 from ase import Atoms
 from ase.io import write
-from ase.data import atomic_numbers
 from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
@@ -981,7 +980,6 @@ class QM9Dataset:
         scaled_df = pl.DataFrame(scaled_values, schema=columns)
         self.df = self.df.with_columns([scaled_df[col] for col in columns])
     
-
 class MaterialsProject:
     def __init__(
         self,
@@ -989,20 +987,20 @@ class MaterialsProject:
         file_name: str = "stable_oxides.parquet",
         config_path: str = "config/api_key.json",
         sampling_strategy: str = "stratified",
+        stratify_on: str = "band_gap",
         stratify_bins: int = 10,
         sampling_seed: int = 40,
         min_per_bin: int = 1,
-        sampling_buffer: float = 1.5,
     ) -> None:
         self.base_path = base_path
         self.file_name = file_name
         self.file_path = os.path.join(self.base_path, self.file_name)
         self.api_key = self._load_api_key(config_path)
         self.sampling_strategy = sampling_strategy
+        self.stratify_on = stratify_on
         self.stratify_bins = stratify_bins
         self.sampling_seed = sampling_seed
         self.min_per_bin = min_per_bin
-        self.sampling_buffer = sampling_buffer
         self.df = pl.DataFrame()
         os.makedirs(self.base_path, exist_ok=True)
 
@@ -1032,8 +1030,8 @@ class MaterialsProject:
             return self.df
         return self._fetch_from_api(limit)
 
-    def _fetch_from_api(self, limit: int) -> pl.DataFrame:
-        logger.info(f"Fetching all stable oxides from API. Using {self.sampling_strategy} sampling.")
+    def _fetch_from_api(self, limit: Optional[int]) -> pl.DataFrame:
+        logger.info(f"Fetching all stable oxides from API. Using {self.sampling_strategy} sampling on '{self.stratify_on}'.")
 
         if not self.api_key:
             raise ValueError("API Key not found.")
@@ -1056,12 +1054,14 @@ class MaterialsProject:
                 )
             )
 
+            target_size = limit if limit is not None else len(docs)
+
             logger.info(f"Fetched {len(docs)} materials.")
 
             if self.sampling_strategy == "stratified":
-                docs = self._stratified_sample_docs(docs, target_size=limit)
+                docs = self._stratified_sample_docs(docs, target_size=target_size)
             else:
-                docs = docs[:limit]
+                docs = docs[:target_size]
 
             data_list = [
                 self._process_doc(d)
@@ -1078,79 +1078,76 @@ class MaterialsProject:
 
     def _stratified_sample_docs(self, docs: list, target_size: int) -> list:
         """
-        Stratified sampling that treats metals (band_gap = 0) separately.
-        Non-metals are stratified using quantile bins.
+        Pure classical stratified sampling based on equal-width binning of the target continuous variable.
         """
         if target_size <= 0 or not docs:
             return []
 
         rng = np.random.default_rng(self.sampling_seed)
 
-        band_gaps = np.array([
-            float(d.band_gap) if d.band_gap is not None else np.nan
-            for d in docs
-        ])
+        # Safely extract the target feature dynamically
+        try:
+            raw_values = [getattr(d, self.stratify_on) for d in docs]
+            values = np.array([float(v) if v is not None else np.nan for v in raw_values])
+        except AttributeError:
+            logger.warning(f"Attribute '{self.stratify_on}' not found on documents. Falling back to random sampling.")
+            indices = rng.choice(len(docs), size=min(target_size, len(docs)), replace=False)
+            return [docs[i] for i in indices]
 
-        metal_mask = band_gaps == 0
-        nonmetal_mask = band_gaps > 0
+        # Filter out NaNs for stratification purposes
+        valid_indices = np.where(~np.isnan(values))[0]
+        if len(valid_indices) == 0:
+            logger.warning(f"All values for '{self.stratify_on}' are NaN. Falling back to random sampling.")
+            indices = rng.choice(len(docs), size=min(target_size, len(docs)), replace=False)
+            return [docs[i] for i in indices]
 
-        metal_indices = np.where(metal_mask)[0]
-        nonmetal_indices = np.where(nonmetal_mask)[0]
+        valid_values = values[valid_indices]
+        val_min, val_max = valid_values.min(), valid_values.max()
 
-        # --- decide how many metals to keep ---
-        metal_fraction = len(metal_indices) / len(docs)
-        metal_target = int(target_size * metal_fraction)
-        metal_target = min(metal_target, len(metal_indices))
-
-        nonmetal_target = target_size - metal_target
-
-        # --- sample metals randomly ---
-        if metal_target > 0:
-            chosen_metals = rng.choice(metal_indices, size=metal_target, replace=False)
-        else:
-            chosen_metals = np.array([], dtype=int)
-
-        # --- stratify non-metals ---
-        if nonmetal_target <= 0 or len(nonmetal_indices) == 0:
-            selected = chosen_metals.tolist()
+        # If the feature has no variance, fallback to random sampling
+        if val_min == val_max:
+            selected = rng.choice(valid_indices, size=min(target_size, len(valid_indices)), replace=False)
             return [docs[i] for i in selected]
 
-        nonmetal_gaps = band_gaps[nonmetal_indices]
+        # Classical equal-width binning
+        edges = np.linspace(val_min, val_max, self.stratify_bins + 1)
+        edges[-1] += 1e-9  # Slightly bump the rightmost edge to catch the absolute max value
 
-        edges = np.quantile(
-            nonmetal_gaps,
-            np.linspace(0, 1, self.stratify_bins + 1)
-        )
-
-        bins = np.digitize(nonmetal_gaps, edges[1:-1], right=True)
+        bins = np.digitize(valid_values, edges, right=False)
 
         strata = {}
-        for idx, b in zip(nonmetal_indices, bins):
+        for idx, b in zip(valid_indices, bins):
             strata.setdefault(int(b), []).append(idx)
 
-        per_bin = max(nonmetal_target // len(strata), 1)
+        chosen_indices = []
+        total_valid = len(valid_indices)
 
-        chosen_nonmetals = []
+        # Sample proportionally based on the bin's size in the original population
         for indices in strata.values():
-            take = min(per_bin, len(indices))
-            chosen = rng.choice(indices, size=take, replace=False)
-            chosen_nonmetals.extend(chosen.tolist())
+            # Calculate what percentage of the total data lives in this bin
+            proportion = len(indices) / total_valid
+            
+            # Apply that percentage to your target sample size
+            take = int(np.round(target_size * proportion))
+            take = min(take, len(indices))  # Safety check
+            
+            if take > 0:
+                chosen = rng.choice(indices, size=take, replace=False)
+                chosen_indices.extend(chosen.tolist())
 
-        # fill remaining slots
-        remaining_slots = nonmetal_target - len(chosen_nonmetals)
-
+        # Fill any remaining slots due to rounding or small bins
+        remaining_slots = target_size - len(chosen_indices)
         if remaining_slots > 0:
-            remaining = list(set(nonmetal_indices) - set(chosen_nonmetals))
-            extra = rng.choice(
-                remaining,
-                size=min(remaining_slots, len(remaining)),
-                replace=False
-            )
-            chosen_nonmetals.extend(extra.tolist())
+            remaining = list(set(valid_indices) - set(chosen_indices))
+            if remaining:
+                extra = rng.choice(
+                    remaining,
+                    size=min(remaining_slots, len(remaining)),
+                    replace=False
+                )
+                chosen_indices.extend(extra.tolist())
 
-        selected = list(chosen_metals) + chosen_nonmetals
-
-        return [docs[i] for i in selected]
+        return [docs[i] for i in chosen_indices]
 
     def _process_doc(self, d) -> Dict[str, Any]:
         struct = d.structure
@@ -1177,7 +1174,6 @@ class MaterialsProject:
         }
 
     def _get_structures(self) -> List[Structure]:
-        """Reconstructs Pymatgen structures from JSON strings."""
         logger.info("Reconstructing Pymatgen structures from JSON...")
         struct_strings = self.df["raw_structure"].to_list()
         return [Structure.from_dict(json.loads(s)) for s in tqdm(struct_strings, desc="Reconstructing structures")]
@@ -1189,13 +1185,11 @@ class MaterialsProject:
         l_max=6,
         sigma=0.5,
     ) -> None:
-        """Computes and adds SOAP and ACSF descriptors to the DataFrame."""
         structures = self._get_structures()
         
         unique_elements = sorted(list(set(el.symbol for s in structures for el in s.composition.elements)))
         weighting = {el: element(el).atomic_number for el in unique_elements}
         
-        # Compute SOAP
         if "soap_embedding" not in self.df.columns:
             logger.info(f"Computing Periodic SOAP for {len(structures)} structures...")
             soap_engine = SOAP(
@@ -1213,12 +1207,9 @@ class MaterialsProject:
                 }
             )
             soap_features = self._compute_feature(structures, soap_engine, "SOAP")
-            # print the size of the soap features
-            print(f"SOAP features shape: {len(soap_features)} x {len(soap_features[0]) if soap_features else 0}")
             self.df = self.df.with_columns(pl.Series("soap_embedding", soap_features, dtype=pl.List(pl.Float64)))
             logger.success("SOAP embeddings added.")
 
-        # Compute ACSF
         if "acsf_embedding" not in self.df.columns:
             logger.info(f"Computing Periodic ACSF for {len(structures)} structures...")
             acsf_engine = ACSF(
@@ -1227,10 +1218,8 @@ class MaterialsProject:
                 g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
             )
             
-            # 1. Get the raw (n_atoms, n_features) matrices
             raw_acsf_features = self._compute_feature(structures, acsf_engine, "ACSF")
             
-            # 2. Average over the atoms (axis=0) to get a single vector per material
             normalized_acsf = []
             for v in raw_acsf_features:
                 if v is None:
@@ -1238,13 +1227,11 @@ class MaterialsProject:
                 else:
                     arr = np.asarray(v)
                     if arr.ndim == 2:
-                        # Average atomic vectors into a global crystal vector
                         mean_vec = np.mean(arr, axis=0).tolist()
                         normalized_acsf.append(mean_vec)
                     else:
                         normalized_acsf.append(arr.ravel().tolist())
 
-            # 3. Add to Polars
             self.df = self.df.with_columns(
                 pl.Series("acsf_embedding", normalized_acsf, dtype=pl.List(pl.Float64), strict=False)
             )
@@ -1257,8 +1244,6 @@ class MaterialsProject:
         desc_name: str,
         batch_size: int = 32,
     ) -> List[Optional[List[float]]]:
-        """Compute features in batches for better performance and fewer overhead calls."""
-
         features = []
 
         for i in tqdm(
