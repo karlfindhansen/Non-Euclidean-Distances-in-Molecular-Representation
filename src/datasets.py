@@ -1033,15 +1033,10 @@ class MaterialsProject:
         return self._fetch_from_api(limit)
 
     def _fetch_from_api(self, limit: int) -> pl.DataFrame:
-        logger.info(f"Fetching {limit} stable oxides from API. Using {self.sampling_strategy} sampling.")
-        if not self.api_key:
-            raise ValueError("API Key not found. Check your config path.")
+        logger.info(f"Fetching all stable oxides from API. Using {self.sampling_strategy} sampling.")
 
-        fetch_limit = (
-            int(np.ceil(limit * self.sampling_buffer))
-            if self.sampling_strategy == "stratified"
-            else limit
-        )
+        if not self.api_key:
+            raise ValueError("API Key not found.")
 
         with MPRester(self.api_key) as mpr:
             query_kwargs = dict(
@@ -1054,22 +1049,14 @@ class MaterialsProject:
                 ],
             )
 
-            # mp-api versions no longer expose mpr.listen; paginate via search instead.
-            chunk_size = min(max(fetch_limit, 1), 1000)
-            num_chunks = max((fetch_limit + chunk_size - 1) // chunk_size, 1)
-            try:
-                docs = mpr.materials.summary.search(
+            docs = list(
+                mpr.materials.summary.search(
                     **query_kwargs,
-                    chunk_size=chunk_size,
-                    num_chunks=num_chunks,
+                    chunk_size=1000,
                 )
-            except TypeError:
-                try:
-                    docs = mpr.materials.summary.search(**query_kwargs, limit=limit)
-                except TypeError:
-                    docs = mpr.materials.summary.search(**query_kwargs)
+            )
 
-            docs = list(docs)[:fetch_limit]
+            logger.info(f"Fetched {len(docs)} materials.")
 
             if self.sampling_strategy == "stratified":
                 docs = self._stratified_sample_docs(docs, target_size=limit)
@@ -1091,84 +1078,77 @@ class MaterialsProject:
 
     def _stratified_sample_docs(self, docs: list, target_size: int) -> list:
         """
-        Stratified sampling on band_gap using quantile bins.
+        Stratified sampling that treats metals (band_gap = 0) separately.
+        Non-metals are stratified using quantile bins.
         """
         if target_size <= 0 or not docs:
             return []
 
-        values = np.array(
-            [
-                float(d.band_gap) if d.band_gap is not None else np.nan
-                for d in docs
-            ],
-            dtype=float,
+        rng = np.random.default_rng(self.sampling_seed)
+
+        band_gaps = np.array([
+            float(d.band_gap) if d.band_gap is not None else np.nan
+            for d in docs
+        ])
+
+        metal_mask = band_gaps == 0
+        nonmetal_mask = band_gaps > 0
+
+        metal_indices = np.where(metal_mask)[0]
+        nonmetal_indices = np.where(nonmetal_mask)[0]
+
+        # --- decide how many metals to keep ---
+        metal_fraction = len(metal_indices) / len(docs)
+        metal_target = int(target_size * metal_fraction)
+        metal_target = min(metal_target, len(metal_indices))
+
+        nonmetal_target = target_size - metal_target
+
+        # --- sample metals randomly ---
+        if metal_target > 0:
+            chosen_metals = rng.choice(metal_indices, size=metal_target, replace=False)
+        else:
+            chosen_metals = np.array([], dtype=int)
+
+        # --- stratify non-metals ---
+        if nonmetal_target <= 0 or len(nonmetal_indices) == 0:
+            selected = chosen_metals.tolist()
+            return [docs[i] for i in selected]
+
+        nonmetal_gaps = band_gaps[nonmetal_indices]
+
+        edges = np.quantile(
+            nonmetal_gaps,
+            np.linspace(0, 1, self.stratify_bins + 1)
         )
 
-        valid_mask = ~np.isnan(values)
-        if valid_mask.sum() == 0:
-            return docs[:target_size]
+        bins = np.digitize(nonmetal_gaps, edges[1:-1], right=True)
 
-        vals = values[valid_mask]
-        if self.stratify_bins <= 1 or np.all(vals == vals[0]):
-            rng = np.random.default_rng(self.sampling_seed)
-            indices = rng.choice(len(docs), size=min(target_size, len(docs)), replace=False)
-            return [docs[i] for i in indices]
+        strata = {}
+        for idx, b in zip(nonmetal_indices, bins):
+            strata.setdefault(int(b), []).append(idx)
 
-        edges = np.quantile(vals, np.linspace(0, 1, self.stratify_bins + 1))
-        edges = np.unique(edges)
-        if edges.size <= 2:
-            rng = np.random.default_rng(self.sampling_seed)
-            indices = rng.choice(len(docs), size=min(target_size, len(docs)), replace=False)
-            return [docs[i] for i in indices]
+        per_bin = max(nonmetal_target // len(strata), 1)
 
-        bins = np.full(len(docs), -1, dtype=int)
-        bins[valid_mask] = np.digitize(values[valid_mask], edges[1:-1], right=True)
+        chosen_nonmetals = []
+        for indices in strata.values():
+            take = min(per_bin, len(indices))
+            chosen = rng.choice(indices, size=take, replace=False)
+            chosen_nonmetals.extend(chosen.tolist())
 
-        strata: dict[int, list[int]] = {}
-        for i, b in enumerate(bins):
-            if b < 0:
-                continue
-            strata.setdefault(int(b), []).append(i)
+        # fill remaining slots
+        remaining_slots = nonmetal_target - len(chosen_nonmetals)
 
-        counts = {k: len(v) for k, v in strata.items()}
-        num_strata = len(counts)
-        slots = min(target_size, len(docs))
-        min_take = 0
-        if self.min_per_bin > 0 and slots >= num_strata:
-            min_take = self.min_per_bin
+        if remaining_slots > 0:
+            remaining = list(set(nonmetal_indices) - set(chosen_nonmetals))
+            extra = rng.choice(
+                remaining,
+                size=min(remaining_slots, len(remaining)),
+                replace=False
+            )
+            chosen_nonmetals.extend(extra.tolist())
 
-        base_take = {k: min(min_take, counts[k]) for k in counts}
-        remaining_slots = slots - sum(base_take.values())
-        remaining_counts = {k: counts[k] - base_take[k] for k in counts}
-        remaining_total = sum(remaining_counts.values())
-
-        if remaining_slots > 0 and remaining_total > 0:
-            raw = {k: remaining_counts[k] / remaining_total * remaining_slots for k in counts}
-            take = {k: int(np.floor(raw[k])) for k in counts}
-            remainder = remaining_slots - sum(take.values())
-            if remainder > 0:
-                frac = sorted(((raw[k] - take[k], k) for k in counts), reverse=True)
-                for _, k in frac[:remainder]:
-                    take[k] += 1
-        else:
-            take = {k: 0 for k in counts}
-
-        rng = np.random.default_rng(self.sampling_seed)
-        selected = []
-        for k, indices in strata.items():
-            k_take = base_take[k] + take[k]
-            if k_take <= 0:
-                continue
-            if k_take >= len(indices):
-                selected.extend(indices)
-            else:
-                chosen = rng.choice(indices, size=k_take, replace=False)
-                selected.extend(chosen.tolist())
-
-        if len(selected) < slots:
-            remaining = list(set(range(len(docs))) - set(selected))
-            extra = rng.choice(remaining, size=min(slots - len(selected), len(remaining)), replace=False)
-            selected.extend(extra.tolist())
+        selected = list(chosen_metals) + chosen_nonmetals
 
         return [docs[i] for i in selected]
 
