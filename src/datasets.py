@@ -1,31 +1,33 @@
-from utils.file_ops import ensure_directory, validate_columns, validate_size
-from src.features import MolecularFeaturizer
-from src.geometry import GeometryPerturber
-from src.distance import DistanceCalculator
-
+import json
+from mendeleev import element
 import os
 import polars as pl
 import numpy as np
+import selfies as sf
+
+from ase.io import write
 from typing import Optional, List, Dict, Any, Set, Sequence, Union
 from torch_geometric.datasets import QM9
 from ase import Atoms
-from ase.io import write
 from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
-import json
 from tqdm import tqdm 
-import selfies as sf
 from sklearn.preprocessing import StandardScaler
 from pymatgen.core import Structure
 from dscribe.descriptors import SOAP, ACSF
 from pymatgen.io.ase import AseAtomsAdaptor
-from mendeleev import element
-
+from pymatgen.core import Composition
 from transformers import logging as tf_log
+
+from utils.file_ops import ensure_directory, validate_columns, validate_size
+from src.features import MolecularFeaturizer
+from src.geometry import GeometryPerturber
+from src.distance import DistanceCalculator
+
 tf_log.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["REPORT_TO"] = "none"
@@ -982,12 +984,13 @@ class MaterialsProject:
         base_path: str = "data/Materials Project/",
         file_name: str = "materials.parquet",
         config_path: str = "config/api_key.json",
-        sampling_strategy: str = "stratified",
+        sampling_strategy: str = "head",
         stratify_on: Optional[Union[str, Sequence[str]]] = None,
         stratify_bins: int = 10,
         sampling_seed: int = 40,
         min_per_bin: int = 1,
-        add_soap_acsf: bool = True,
+        add_soap: bool = False,
+        add_acsf: bool = False,
     ) -> None:
         self.base_path = base_path
         self.file_name = file_name
@@ -1003,7 +1006,8 @@ class MaterialsProject:
         self.stratify_bins = stratify_bins
         self.sampling_seed = sampling_seed
         self.min_per_bin = min_per_bin
-        self.add_soap_acsf = add_soap_acsf
+        self.add_soap = add_soap
+        self.add_acsf = add_acsf
         self.df = pl.DataFrame()
         os.makedirs(self.base_path, exist_ok=True)
 
@@ -1027,21 +1031,23 @@ class MaterialsProject:
             self.df = pl.read_parquet(self.file_path)
         else:
             # Fetch full dataset, process, and save (skip descriptors if we're sampling)
-            compute_full_descriptors = self.add_soap_acsf and (limit is None)
+            compute_full_descriptors = (self.add_soap or self.add_acsf) and (limit is None)
             self._fetch_from_api(compute_descriptors=compute_full_descriptors)
             computed_full_descriptors = compute_full_descriptors
 
         # If limit is None, or if the requested limit is larger than the dataset, return everything
         if limit is None or limit >= len(self.df):
-            missing = [
-                name for name in ("soap_embedding", "acsf_embedding")
-                if name not in self.df.columns
-            ]
-            if missing and self.add_soap_acsf and not computed_full_descriptors:
+            missing = []
+            if self.add_soap and "soap_embedding" not in self.df.columns:
+                missing.append("soap_embedding")
+            if self.add_acsf and "acsf_embedding" not in self.df.columns:
+                missing.append("acsf_embedding")
+            if missing and (self.add_soap or self.add_acsf) and not computed_full_descriptors:
                 logger.info(
                     f"Descriptors missing from cache ({missing}); computing for ALL data."
                 )
-                self._add_descriptors()
+                if self.add_acsf or self.add_soap:
+                    self._add_descriptors()
                 self.df.write_parquet(self.file_path)
                 logger.success("Descriptors added and full Parquet updated.")
 
@@ -1054,13 +1060,16 @@ class MaterialsProject:
         logger.info(f"Sampling {limit} rows using {self.sampling_strategy} strategy...")
         if self.sampling_strategy == "stratified":
             sampled_df = self._stratified_sample_df(self.df, target_size=limit)
-        else:
-            # Fallback to random sampling if not stratified
+        elif self.sampling_strategy == "head":
+            sampled_df = self.df.head(limit)
+        elif self.sampling_strategy == "random":
             sampled_df = self.df.sample(n=limit, seed=self.sampling_seed)
+        else:
+            raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
 
         self.df = sampled_df
 
-        if self.add_soap_acsf:
+        if self.add_soap or self.add_acsf:
             tag_parts = [f"sample_n{limit}", f"seed{self.sampling_seed}"]
             if self.sampling_strategy:
                 tag_parts.append(self.sampling_strategy)
@@ -1111,7 +1120,7 @@ class MaterialsProject:
         self.df = pl.DataFrame(data_list)
         
         # Compute descriptors for the whole dataset (optional)
-        if compute_descriptors and self.add_soap_acsf:
+        if compute_descriptors and (self.add_soap or self.add_acsf):
             self._add_descriptors()
 
         # Save the full master dataset
@@ -1235,10 +1244,38 @@ class MaterialsProject:
         else:
             c_sys, sg = None, None
 
-        # 3. Return flattened dictionary with safe casts
+        # ---------------------------------------------------------
+        # 3. NEW: Prototype and Bonding Calculations
+        # ---------------------------------------------------------
+        formula = safe_str(get_val("formula_pretty"))
+        anon_formula = None
+        max_en_diff = None
+
+        if formula:
+            try:
+                comp = Composition(formula)
+                
+                # Prototype: Extract generic formula (e.g., ABO3)
+                anon_formula = comp.anonymized_formula
+                
+                # Bonding: Calculate max electronegativity difference
+                elements = comp.elements
+                if len(elements) > 1:
+                    # Get Pauling electronegativity (X), ignoring elements without it (like some noble gases)
+                    ens = [el.X for el in elements if getattr(el, 'X', None) and el.X > 0]
+                    if ens:
+                        max_en_diff = max(ens) - min(ens)
+                elif len(elements) == 1:
+                    max_en_diff = 0.0 # Pure elemental solids have no EN difference
+            except Exception as e:
+                logger.debug(f"Could not compute chemistry features for {formula}: {e}")
+
+        # 4. Return flattened dictionary with safe casts
         return {
             "material_id": safe_str(get_val("material_id")),
-            "formula_pretty": safe_str(get_val("formula_pretty")),
+            "formula_pretty": formula,
+            "anonymized_formula": safe_str(anon_formula), # NEW
+            "max_en_diff": safe_float(max_en_diff),       # NEW
             "energy_per_atom": safe_float(get_val("energy_per_atom")),
             "formation_energy_per_atom": safe_float(get_val("formation_energy_per_atom")),
             "band_gap": safe_float(get_val("band_gap")),
@@ -1274,7 +1311,10 @@ class MaterialsProject:
         output_tag: Optional[str] = None,
         attach_to_df: bool = True,
     ) -> None:
-        from pymatgen.core import Composition
+
+        if not (self.add_soap or self.add_acsf):
+            logger.info("Skipping descriptor computation (add_soap=False and add_acsf=False).")
+            return
         
         # 1. We only attach to the dataframe (no chunk files on disk)
         if output_tag:
@@ -1293,18 +1333,22 @@ class MaterialsProject:
         
         logger.info(f"Found {len(unique_elements)} unique elements. Warning: Feature vectors will be massive.")
 
-        # 3. Engines
-        soap_engine = SOAP(
-            species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, 
-            l_max=l_max, sigma=sigma, sparse=False, average="inner",
-            compression={"mode": "mu2", "species_weighting": weighting}
-        )
+        # 3. Engines (created only if requested)
+        soap_engine = None
+        if self.add_soap:
+            soap_engine = SOAP(
+                species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, 
+                l_max=l_max, sigma=sigma, sparse=False, average="inner",
+                compression={"mode": "mu2", "species_weighting": weighting}
+            )
         
-        acsf_engine = ACSF(
-            species=unique_elements, periodic=True, r_cut=r_cut,
-            g2_params=[[1, 1], [1, 2], [1, 3]],
-            g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
-        )
+        acsf_engine = None
+        if self.add_acsf:
+            acsf_engine = ACSF(
+                species=unique_elements, periodic=True, r_cut=r_cut,
+                g2_params=[[1, 1], [1, 2], [1, 3]],
+                g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
+            )
 
         # 4. Process in Chunks
         total_rows = len(self.df)
@@ -1317,45 +1361,49 @@ class MaterialsProject:
             struct_strings = chunk_df["raw_structure"].to_list()
 
             # --- PROCESS SOAP ---
-            logger.info(f"Computing SOAP chunk {chunk_idx} ({start_row} to {end_row})...")
-            soap_features = self._compute_feature(struct_strings, soap_engine, "SOAP")
-            soap_all.extend(soap_features)
-            del soap_features
+            if self.add_soap:
+                logger.info(f"Computing SOAP chunk {chunk_idx} ({start_row} to {end_row})...")
+                soap_features = self._compute_feature(struct_strings, soap_engine, "SOAP")
+                soap_all.extend(soap_features)
+                del soap_features
 
             # --- PROCESS ACSF ---
-            logger.info(f"Computing ACSF chunk {chunk_idx} ({start_row} to {end_row})...")
-            raw_acsf_features = self._compute_feature(struct_strings, acsf_engine, "ACSF")
+            if self.add_acsf:
+                logger.info(f"Computing ACSF chunk {chunk_idx} ({start_row} to {end_row})...")
+                raw_acsf_features = self._compute_feature(struct_strings, acsf_engine, "ACSF")
 
-            normalized_acsf = []
-            for v in raw_acsf_features:
-                if v is None:
-                    normalized_acsf.append(None)
-                else:
-                    arr = np.asarray(v)
-                    if arr.ndim == 2:
-                        normalized_acsf.append(np.mean(arr, axis=0).tolist())
+                normalized_acsf = []
+                for v in raw_acsf_features:
+                    if v is None:
+                        normalized_acsf.append(None)
                     else:
-                        normalized_acsf.append(arr.ravel().tolist())
+                        arr = np.asarray(v)
+                        if arr.ndim == 2:
+                            normalized_acsf.append(np.mean(arr, axis=0).tolist())
+                        else:
+                            normalized_acsf.append(arr.ravel().tolist())
 
-            acsf_all.extend(normalized_acsf)
+                acsf_all.extend(normalized_acsf)
 
-            del raw_acsf_features
-            del normalized_acsf
+                del raw_acsf_features
+                del normalized_acsf
 
         if attach_to_df:
-            if "soap_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(
-                    pl.Series("soap_embedding", soap_all)
-                )
-            else:
-                logger.info("SOAP embeddings already present in dataframe; skipping attach.")
+            if self.add_soap:
+                if "soap_embedding" not in self.df.columns:
+                    self.df = self.df.with_columns(
+                        pl.Series("soap_embedding", soap_all)
+                    )
+                else:
+                    logger.info("SOAP embeddings already present in dataframe; skipping attach.")
 
-            if "acsf_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(
-                    pl.Series("acsf_embedding", acsf_all)
-                )
-            else:
-                logger.info("ACSF embeddings already present in dataframe; skipping attach.")
+            if self.add_acsf:
+                if "acsf_embedding" not in self.df.columns:
+                    self.df = self.df.with_columns(
+                        pl.Series("acsf_embedding", acsf_all)
+                    )
+                else:
+                    logger.info("ACSF embeddings already present in dataframe; skipping attach.")
 
         logger.success("All descriptors successfully added to dataframe.")
 

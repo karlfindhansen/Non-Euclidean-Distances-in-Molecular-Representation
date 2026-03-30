@@ -135,40 +135,53 @@ def _pairwise_distance_matrix(
 
 class Wasserstein:
     """
-    Computes the Earth Mover's Distance (Wasserstein-1) between molecules,
-    using atomic masses as the distribution weights.
+    Computes the Earth Mover's Distance (Wasserstein-1) between materials.
+    Can use raw 3D atomic positions (via frames) or unaggregated D x N feature matrices.
     """
 
     @staticmethod
-    def compute_distance(frame_i: Atoms, frame_j: Atoms, metric: str = 'sqeuclidean') -> float:
-        pos_i = np.asarray(frame_i.get_positions(), dtype=np.float64)
-        pos_j = np.asarray(frame_j.get_positions(), dtype=np.float64)
+    def compute_feature_distance(feat_i: np.ndarray, feat_j: np.ndarray, metric: str = 'sqeuclidean') -> float:
+        # feat_i is (D, N_atoms). Transpose to (N_atoms, D) for POT library
+        pos_i = feat_i.T
+        pos_j = feat_j.T
 
-        weights_i = np.asarray(frame_i.get_masses(), dtype=np.float64)
-        weights_j = np.asarray(frame_j.get_masses(), dtype=np.float64)
-        
-        weights_i /= weights_i.sum()
-        weights_j /= weights_j.sum()
+        # Give each atom equal weight in the distribution
+        weights_i = np.ones(pos_i.shape[0]) / pos_i.shape[0]
+        weights_j = np.ones(pos_j.shape[0]) / pos_j.shape[0]
 
+        # Cost matrix between all atoms in Material A and Material B
         M = ot.dist(pos_i, pos_j, metric=metric)
 
+        # Compute Earth Mover's Distance
         distance = ot.emd2(weights_i, weights_j, M)
         
         return float(distance)
 
     @classmethod
-    def distance_matrix(cls, frames: Sequence[Atoms], metric: str = 'euclidean') -> np.ndarray:
-        logger.info(
-            f"Computing Wasserstein distance matrix for {len(frames)} frames "
-            f"(ground metric='{metric}')."
-        )
-        n = len(frames)
+    def distance_matrix(
+        cls, 
+        frames: Optional[Sequence] = None, 
+        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        metric: str = 'sqeuclidean'
+    ) -> np.ndarray:
+        
+        if precomputed_feature_matrices is not None:
+            n = len(precomputed_feature_matrices)
+            # Create a simple pair function for the precomputed matrices
+            def pair_fn(i, j):
+                return cls.compute_feature_distance(precomputed_feature_matrices[i], precomputed_feature_matrices[j], metric=metric)
+            print(f"Computing Wasserstein distance matrix for {n} feature matrices...")
+        else:
+            raise NotImplementedError("Please pass precomputed_feature_matrices.")
+
+        # Assuming you have a _pairwise_distance_matrix helper function defined elsewhere
+        # If not, you can just use a nested for-loop here to build the NxN matrix.
         dist_matrix = _pairwise_distance_matrix(
             n=n,
-            pair_fn=lambda i, j: cls.compute_distance(frames[i], frames[j], metric=metric),
+            pair_fn=pair_fn,
             desc="Wasserstein distances",
         )
-        logger.success("Finished Wasserstein distance matrix computation.")
+        
         return dist_matrix
 
 
@@ -302,7 +315,7 @@ class Grassmann:
         method: Literal["qr", "svd"] = "svd",
         features : Literal['soap', 'invariant'] = 'invariant',
         normalized: bool = False,
-        precomputed_matrices: Optional[Sequence[np.ndarray]] = None
+        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
         Maps 3D atomic coordinates to an orthonormal basis in R^n.
@@ -310,8 +323,8 @@ class Grassmann:
         bases = []
         
         # Extract raw (or normalized) features for ALL frames
-        if precomputed_matrices is not None:
-            raw_matrices = precomputed_matrices
+        if precomputed_feature_matrices is not None:
+            raw_matrices = precomputed_feature_matrices
         else:
             if frames is None:
                 raise ValueError("Must provide either 'frames' or 'precomputed_matrices'.")
@@ -354,12 +367,12 @@ class Grassmann:
         method: Literal["qr", "svd"] = "svd",
         features : Literal['soap', 'invariant'] = 'invariant',
         normalized: bool = False,
-        precomputed_matrices: Optional[Sequence[np.ndarray]] = None
+        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
         Computes a symmetric pairwise distance matrix for a molecular trajectory.
         """
-        num_items = len(precomputed_matrices) if precomputed_matrices is not None else len(frames)
+        num_items = len(precomputed_feature_matrices) if precomputed_feature_matrices is not None else len(frames)
         
         # Precompute bases
         bases = cls._get_uk_bases(
@@ -368,7 +381,7 @@ class Grassmann:
             method=method, 
             features=features, 
             normalized=normalized,
-            precomputed_matrices=precomputed_matrices
+            precomputed_feature_matrices=precomputed_feature_matrices
         )
         
         # Initialize an empty symmetric matrix
@@ -397,15 +410,23 @@ class Riemann:
     @classmethod
     def _get_spd_matrices(
         cls,
-        frames,
+        frames: Optional[Sequence['Atoms']],
         regularization: float = 1e-6,
         normalized: bool = False,
+        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Converts frames into SPD covariance matrices.
         """
         # Extract invariant atomic features (optionally normalized)
-        raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
+        if precomputed_feature_matrices is not None:
+            raw_matrices = precomputed_feature_matrices
+            if normalized:
+                logger.info("Using precomputed feature matrices; skipping normalization.")
+        else:
+            if frames is None:
+                raise ValueError("Must provide either 'frames' or 'precomputed_feature_matrices'.")
+            raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
 
         spd_matrices = []
 
@@ -480,17 +501,33 @@ class Riemann:
     @classmethod
     def distance_matrix(
         cls,
-        frames,
+        frames: Optional[Sequence['Atoms']] = None,
         metric: str = "log-euclidean",
         regularization: float = 1e-6,
         normalized: bool = False,
+        feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Computes pairwise Riemannian distance matrix for frames.
         """
+        if feature_matrices is not None:
+            if precomputed_feature_matrices is not None:
+                raise ValueError(
+                    "Provide only one of 'feature_matrices' or 'precomputed_feature_matrices'."
+                )
+            precomputed_feature_matrices = feature_matrices
 
+        if precomputed_feature_matrices is None and frames is None:
+            raise ValueError("Must provide either 'frames' or 'precomputed_feature_matrices'.")
+
+        num_items = (
+            len(precomputed_feature_matrices)
+            if precomputed_feature_matrices is not None
+            else len(frames)
+        )
         logger.info(
-            f"Computing Riemannian distance matrix for {len(frames)} frames "
+            f"Computing Riemannian distance matrix for {num_items} frames "
             f"(metric='{metric}', normalized={normalized})"
         )
 
@@ -506,6 +543,7 @@ class Riemann:
             frames,
             regularization=regularization,
             normalized=normalized,
+            precomputed_feature_matrices=precomputed_feature_matrices,
         )
         n = len(spd_matrices)
 
@@ -519,9 +557,7 @@ class Riemann:
 
             log_mats = cls._log_spd_batch(spd_matrices)
 
-            total_pairs = n * (n - 1) // 2
-
-            with tqdm(total=total_pairs, desc="Riemann distances", unit="pair") as pbar:
+            with tqdm(total=n, desc="Riemann distances", unit="material") as pbar:
 
                 for i in range(n):
                     for j in range(i + 1, n):
@@ -530,7 +566,7 @@ class Riemann:
 
                         dist_matrix[i, j] = dist_matrix[j, i] = d
 
-                        pbar.update(1)
+                    pbar.update(1)
 
         # -------------------------------------------------
         # AFFINE-INVARIANT METRIC
@@ -538,9 +574,7 @@ class Riemann:
 
         else:
 
-            total_pairs = n * (n - 1) // 2
-
-            with tqdm(total=total_pairs, desc="Riemann distances", unit="pair") as pbar:
+            with tqdm(total=n, desc="Riemann distances", unit="material") as pbar:
 
                 for i in range(n):
                     for j in range(i + 1, n):
@@ -551,7 +585,7 @@ class Riemann:
 
                         dist_matrix[i, j] = dist_matrix[j, i] = d
 
-                        pbar.update(1)
+                    pbar.update(1)
 
         logger.success("Finished Riemannian distance matrix computation.")
 

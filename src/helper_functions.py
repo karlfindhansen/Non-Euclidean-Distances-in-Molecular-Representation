@@ -9,11 +9,13 @@ import numpy as np
 from pathlib import Path
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.core import Structure
-from sklearn.manifold import TSNE
+from sklearn.manifold import TSNE, Isomap, MDS
+from sklearn.decomposition import PCA
 from typing import Sequence, Optional, Iterable
 from loguru import logger
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from umap import UMAP
 from ase import Atoms
 
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
@@ -231,17 +233,26 @@ def _open_in_browser(path_or_url):
         print(f"Could not open browser automatically: {exc}")
 
 
-def create_chemiscope_viewer(df, dist_matrix, labels):
-    print("Running t-SNE dimensionality reduction...")
+def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
+    print("Running " + reduction_method + " dimensionality reduction...")
 
-    tsne = TSNE(
-        n_components=2, 
-        metric='precomputed', 
-        init='random',
-        random_state=42, 
-        perplexity=30
-    )
-    tsne_embeddings = tsne.fit_transform(dist_matrix)
+    if reduction_method == 't-SNE':
+        tsne = TSNE(n_components=2, metric='precomputed', init='random', random_state=42, perplexity=30)
+        coords = tsne.fit_transform(dist_matrix)
+    elif reduction_method == 'UMAP':
+        reducer = UMAP(metric='precomputed', random_state=42)
+        coords = reducer.fit_transform(dist_matrix)
+    elif reduction_method == 'PCA':
+        pca = PCA(n_components=2, random_state=42)
+        coords = pca.fit_transform(dist_matrix)
+    elif reduction_method == 'ISOMAP':
+        isomap = Isomap(n_components=2, metric='precomputed')
+        coords = isomap.fit_transform(dist_matrix)
+    elif reduction_method == 'MDS':
+        mds = MDS(n_components=2, metric='precomputed', n_init=4)
+        coords = mds.fit_transform(dist_matrix)
+    else:
+        raise ValueError(f"Unsupported reduction method: {reduction_method}")
 
     print("Converting Pymatgen structures to ASE Atoms for Chemiscope...")
     frames = []
@@ -255,19 +266,27 @@ def create_chemiscope_viewer(df, dist_matrix, labels):
     print("Assembling properties for Chemiscope...")
   
     properties = {
-        "tSNE_1": tsne_embeddings[:, 0],
-        "tSNE_2": tsne_embeddings[:, 1],
+        f"{reduction_method}_1": coords[:, 0],
+        f"{reduction_method}_2": coords[:, 1],
         "Cluster": labels.astype(int),
         "Formula": df["formula_pretty"].to_list(),
         "Band_Gap": df["band_gap"].to_list(),
         "Energy_per_Atom": df["energy_per_atom"].to_list(),
         "Is_Metal": df["is_metal"].to_list(),
+        "crystal_system": df["crystal_system"].to_list(),
+        "Density": df["density"].to_list(),
+        "Space_Group": df["space_group"].to_list(),
+        "energy_above_hull": df["energy_above_hull"].to_list(),
+        "formation_energy_per_atom": df["formation_energy_per_atom"].to_list(),
+        "volume": df["volume"].to_list(),
+        "num_sites": df["num_sites"].to_list(),
+        "max_en_diff":df["max_en_diff"].to_list(),
     }
 
     settings = {
         "map": {
-            "x": {"property": "tSNE_1"},
-            "y": {"property": "tSNE_2"},
+            "x": {"property": f"{reduction_method}_1"},
+            "y": {"property": f"{reduction_method}_2"},
             "color": {"property": "Cluster"},
             #"symbol": "circle",
             "size": {"factor": 35}
@@ -279,19 +298,19 @@ def create_chemiscope_viewer(df, dist_matrix, labels):
 
     print("Generating Chemiscope widget...")
     if hasattr(chemiscope, "write_html"):
-        output_html = "materials_tsne_clustering.html"
+        output_html = f"materials_{reduction_method}_clustering.html"
         chemiscope.write_html(
             output_html,
             frames=frames,
             properties=properties,
             settings=settings,
-            title="Materials Project - SOAP t-SNE Clustering",
+            title=f"Materials Project - SOAP {reduction_method} Clustering",
         )
         print(f"Saved interactive viewer to: {output_html}")
         _open_in_browser(output_html)
         return chemiscope.show(frames=frames, properties=properties, settings=settings)
 
-    output_json = "materials_tsne_clustering.json"
+    output_json = f"materials_{reduction_method}_clustering.json"
     if not hasattr(chemiscope, "write_input"):
         raise AttributeError(
             "chemiscope does not provide write_html or write_input; "
@@ -303,7 +322,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels):
         structures=frames,
         properties=properties,
         settings=settings,
-        metadata={"name": "Materials Project - SOAP t-SNE Clustering"},
+        metadata={"name": f"Materials Project - SOAP {reduction_method} Clustering"},
     )
     print(f"Saved Chemiscope input to: {output_json}")
     viewer = chemiscope.show_input(output_json)
@@ -313,7 +332,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels):
     else:
         print(
             "If the viewer does not open automatically, run "
-            "`chemiscope show materials_tsne_clustering.json`."
+            f"`chemiscope show materials_{reduction_method}_clustering.json`."
         )
     return viewer
 
