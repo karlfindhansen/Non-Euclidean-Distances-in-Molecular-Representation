@@ -32,12 +32,12 @@
 
 ## Results Non-Euclidean
 1. Riemannian
-    - Is projected using UMAP and clustered using complete linking.
+    - Is projected using ISOMAP and clustered using complete linking.
     - Isolates Symmorphic materials. Covariance matrix describes the internal correlation of features of atoms across the unit cell. Symmorphic space groups are those that do not contain glide planes or screw axes—their symmetry operations are strictly point-group operations (rotations, inversions) around a fixed point. 
     - In symmorphic crystals, the atomic environments tend to be highly uniform and follow strict geometric alignments. This creates very "clean," high-variance covariance matrices that look radically different from non-symmorphic (distorted or complex) structures. The Riemannian manifold is exceptionally good at sensing the "shape" of this internal symmetry.
     
 2. Grassmanian:
-    - Is projected using UMAP and clustered using complete linking.
+    - Is projected using ISOMAP and clustered using complete linking.
     - Clusters by linear subspace spanned by atoms. Put materials with symmetrical space groups in same clusters. These often have electronegativites that are close to each other, and high coordination number. 
     - Clusters by differences between features. If some atoms are very heavy but has low electronegativity, they will tilt the subspace that will be isolated. 
 

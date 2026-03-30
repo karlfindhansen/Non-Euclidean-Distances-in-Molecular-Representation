@@ -63,7 +63,7 @@ class QM9Dataset:
         self,
         root: str = "data/QM9",
         filename: str = "dataset_cleaned.parquet",
-        subset_size: int = 2000,
+        limit: int = 2000,
         required_mol_ids: Optional[List[str]] = None,
         embed_seed: int = 40,
         sampling_strategy: str = "stratified",
@@ -76,7 +76,7 @@ class QM9Dataset:
         self.root = root
         self.filename = filename
         self.file_path = os.path.join(root, filename)
-        self.subset_size = subset_size
+        self.subset_size = limit
         self.required_mol_ids = required_mol_ids or []
         self.embed_seed = embed_seed
         self.sampling_strategy = sampling_strategy
