@@ -38,7 +38,8 @@
     
 2. Grassmanian:
     - Is projected using UMAP and clustered using complete linking.
-    - ...
+    - Clusters by linear subspace spanned by atoms. Put materials with symmetrical space groups in same clusters. These often have electronegativites that are close to each other, and high coordination number. 
+    - Clusters by differences between features. If some atoms are very heavy but has low electronegativity, they will tilt the subspace that will be isolated. 
 
 3. Wasserstein:
     - Projection and linking are not important.
