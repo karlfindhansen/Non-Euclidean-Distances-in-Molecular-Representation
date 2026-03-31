@@ -98,11 +98,11 @@ class QM9Dataset:
         RDLogger.DisableLog("rdApp.error")
 
     def _select_qm9_indices(self, dataset: QM9) -> List[int]:
-        """Selects QM9 indices using a proportional stratified sampling scheme."""
-        if self.sampling_strategy not in {"stratified", "head"}:
+        """Selects QM9 indices using the configured sampling strategy."""
+        if self.sampling_strategy not in {"stratified", "head", "random"}:
             raise ValueError(
                 f"Unsupported sampling_strategy='{self.sampling_strategy}'. "
-                "Use 'stratified' or 'head'."
+                "Use 'stratified', 'random', or 'head'."
             )
 
         if self.sampling_strategy == "head":
@@ -120,6 +120,25 @@ class QM9Dataset:
                 f"{sorted(out_of_range)}"
             )
             required_indices = {i for i in required_indices if 0 <= i < len(dataset)}
+
+        if self.sampling_strategy == "random":
+            n = len(dataset)
+            if n == 0:
+                return []
+            target_size = int(np.ceil(self.subset_size * self.sampling_buffer))
+            slots = max(target_size - len(required_indices), 0)
+            if slots <= 0:
+                return sorted(required_indices)
+
+            available = [i for i in range(n) if i not in required_indices]
+            rng = np.random.default_rng(self.sampling_seed)
+            if not available:
+                return sorted(required_indices)
+            take = min(slots, len(available))
+            chosen = rng.choice(available, size=take, replace=False)
+            selected = set(required_indices)
+            selected.update(chosen.tolist())
+            return sorted(selected)
             
         valid_stratify_keys = set(self.QM9_TARGETS) | {"num_atoms"}
         invalid = [k for k in self.stratify_by if k not in valid_stratify_keys]
@@ -437,10 +456,16 @@ class QM9Dataset:
             selected_set = set(selected_indices)
             max_selected = max(selected_indices) if selected_indices else -1
             processed = 0
-            logger.info(
-                "Stratified sampling enabled. "
-                f"Selected {len(selected_indices)} indices from QM9."
-            )
+            if self.sampling_strategy == "stratified":
+                logger.info(
+                    "Stratified sampling enabled. "
+                    f"Selected {len(selected_indices)} indices from QM9."
+                )
+            else:
+                logger.info(
+                    "Random sampling enabled. "
+                    f"Selected {len(selected_indices)} indices from QM9."
+                )
             for i, data in enumerate(dataset):
                 if processed >= len(selected_set) and i > max_selected:
                     break
