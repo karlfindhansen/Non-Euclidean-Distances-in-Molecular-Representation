@@ -1,4 +1,5 @@
-import os
+import itertools
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -6,13 +7,20 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 import polars as pl
-from loguru import logger
+import pandas as pd
+import seaborn as sns
 
+from tqdm import tqdm
+from pymatgen.core import Element, Molecule, Structure
+from pymatgen.io.ase import AseAtomsAdaptor
+from ase import Atoms
+from ase.neighborlist import neighbor_list
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.manifold import TSNE, Isomap
 from sklearn.decomposition import PCA
+from loguru import logger
 from umap import UMAP
 from scipy.spatial.distance import pdist, squareform
 from scipy.cluster.hierarchy import linkage as scipy_linkage, dendrogram
@@ -85,6 +93,185 @@ def get_overall_qm9_coherence(df: pl.DataFrame, labels: np.ndarray) -> Tuple[Dic
     average_coherence = float(np.mean(list(results.values())))
     return results, average_coherence
 
+
+def build_invariant_matrix_qm9(
+    df: pl.DataFrame, 
+    feature_keys: list
+) -> np.ndarray:
+    """
+    Directly extracts pre-computed invariant physicochemical and geometric 
+    features from the QM9 Polars DataFrame.
+    """
+    return df.select(feature_keys).to_numpy()
+
+def evaluate_invariant_combinations_qm9(df: pl.DataFrame, linkage: str = "average", k_min: int = 2, k_max: int = 20):
+    """
+    Tests EVERY mathematical combination of 9 pre-computed QM9 invariants (511 total), 
+    finds the optimal k via DB score, and records the chemical coherence.
+    """
+    # 9 Native QM9 Invariant Features (replaces the ASE atom-by-atom extraction)
+    all_features = [
+        "mol_weight",           # Mass
+        "avg_bond_length",      # Local Geometry
+        "num_rings",            # Topology
+        "num_rotatable_bonds",  # Flexibility
+        "fraction_csp3",        # 3D Saturation/Geometry
+        "h_bond_donors",        # Electronic/Bonding
+        "h_bond_acceptors",     # Electronic/Bonding
+        "mu",                   # Dipole moment
+        "alpha"                 # Polarizability
+    ]
+    
+    combinations_to_test = []
+    for r in range(1, len(all_features) + 1):
+        for combo in itertools.combinations(all_features, r):
+            combinations_to_test.append(list(combo))
+
+    logger.info(f"Generated {len(combinations_to_test)} feature combinations to test.")
+    
+    results = []
+    k_range = range(k_min, k_max + 1)
+
+    for feature_keys in tqdm(combinations_to_test, desc="Evaluating Combinations"):
+        combo_name = " + ".join(feature_keys)
+        
+        # Super fast extraction directly from Polars
+        feature_matrix = build_invariant_matrix_qm9(df, feature_keys=feature_keys)
+        
+        # Scale features
+        #scaler = StandardScaler()
+        #scaled_matrix = scaler.fit_transform(feature_matrix)
+        dist_matrix = squareform(pdist(feature_matrix, metric='euclidean'))
+        
+        best_k = None
+        best_db = np.inf
+        best_labels = None
+        
+        for k in k_range:
+            labels = hierachial_clustering(dist_matrix, k, linkage=linkage)
+            db = davies_bouldin_score(feature_matrix, labels)
+            if db < best_db:
+                best_db = db
+                best_k = k
+                best_labels = labels
+                
+        # Evaluate chemical coherence
+        chem_scores, avg_coherence = get_overall_qm9_coherence(df, best_labels)
+        
+        results.append({
+            "Combination": combo_name,
+            "Feature Count": len(feature_keys),
+            "Optimal k": best_k,
+            "DB Score": best_db,
+            "Overall Chemical Coherence": avg_coherence
+        })
+
+    results_df = pd.DataFrame(results).sort_values(by="Overall Chemical Coherence", ascending=False)
+    
+    csv_path = Path(f"figures/qm9/clustering/hierarchical/ablation_results_full_{linkage}.csv")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(csv_path, index=False)
+    logger.success(f"Saved full ablation results (CSV) to {csv_path}")
+    
+    top_20 = results_df.head(20)
+    
+    plt.figure(figsize=(12, 10))
+    sns.barplot(
+        data=top_20, 
+        x="Overall Chemical Coherence", 
+        y="Combination", 
+        hue="Combination",
+        palette="viridis",
+        legend=False
+    )
+    plt.title(f"QM9 Top 20 Feature Combinations by Chemical Coherence\n(Hierarchical, linkage={linkage})", fontsize=14)
+    plt.xlabel("Overall Chemical Coherence (Higher is Better)")
+    plt.ylabel("Feature Combination")
+    
+    for index, row in enumerate(top_20.itertuples()):
+        plt.text(row._5 + 0.005, index, f"Best k={row._3}", va='center', color='black', fontsize=9)
+
+    plt.tight_layout()
+    out_path = Path(f"figures/qm9/clustering/hierarchical/ablation_study_top20_{linkage}.png")
+    plt.savefig(out_path, dpi=300)
+    logger.success(f"Saved top 20 ablation plot to {out_path}")
+
+def plot_best_ablation_radar_qm9(
+    df: pl.DataFrame, 
+    output_dir: Path = Path("figures/qm9/clustering/hierarchical")
+):
+    """
+    Reads the saved ablation CSVs, re-evaluates the absolute best combination 
+    vs the 9-feature baseline, and plots a comparative radar chart.
+    """
+    logger.info("Generating comparative radar plot for optimal ablation features...")
+    
+    avg_csv = output_dir / "ablation_results_full_average.csv"
+    comp_csv = output_dir / "ablation_results_full_complete.csv"
+
+    if not avg_csv.exists() or not comp_csv.exists():
+        logger.error("Ablation CSVs not found. Please run evaluate_invariant_combinations_qm9 first.")
+        return
+
+    df_avg = pd.read_csv(avg_csv)
+    df_comp = pd.read_csv(comp_csv)
+
+    # Helper function to quickly re-cluster a specific row and get its radar scores
+    def _get_radar_scores_for_row(row, linkage):
+        features = row["Combination"].split(" + ")
+        k = int(row["Optimal k"])
+
+        # Rebuild and scale
+        feat_matrix = build_invariant_matrix_qm9(df, feature_keys=features)
+        scaler = StandardScaler()
+        scaled = scaler.fit_transform(feat_matrix)
+        dist = squareform(pdist(scaled, metric='euclidean'))
+
+        # Cluster and evaluate
+        labels = hierachial_clustering(dist, k, linkage=linkage)
+        chem_scores, _ = get_overall_qm9_coherence(df, labels)
+        
+        # Format for radar plotting
+        return _build_qm9_radar_values(chem_scores)[1] # Returns just the values array
+
+    # 1. Get the Best vs Baseline for AVERAGE linkage
+    best_avg_row = df_avg.iloc[0]
+    base_avg_row = df_avg[df_avg["Feature Count"] == 9].iloc[0]
+    
+    vals_best_avg = _get_radar_scores_for_row(best_avg_row, "average")
+    vals_base_avg = _get_radar_scores_for_row(base_avg_row, "average")
+
+    # 2. Get the Best vs Baseline for COMPLETE linkage
+    best_comp_row = df_comp.iloc[0]
+    base_comp_row = df_comp[df_comp["Feature Count"] == 9].iloc[0]
+    
+    vals_best_comp = _get_radar_scores_for_row(best_comp_row, "complete")
+    vals_base_comp = _get_radar_scores_for_row(base_comp_row, "complete")
+
+    # The labels for the radar axes (always the same)
+    labels = _build_qm9_radar_values(get_overall_qm9_coherence(df, np.zeros(len(df)))[0])[0]
+
+    # 3. Build the Series dictionaries
+    left_series = {
+        f"Optimal ({best_avg_row['Feature Count']} features, k={best_avg_row['Optimal k']})": vals_best_avg,
+        f"Baseline (9 features, k={base_avg_row['Optimal k']})": vals_base_avg
+    }
+    
+    right_series = {
+        f"Optimal ({best_comp_row['Feature Count']} features, k={best_comp_row['Optimal k']})": vals_best_comp,
+        f"Baseline (9 features, k={base_comp_row['Optimal k']})": vals_base_comp
+    }
+
+    # 4. Plot using your existing pair function
+    _plot_radar_pair(
+        "QM9 Chemical Coherence: Optimal vs Baseline Invariants",
+        ("Average Linkage", labels, left_series),
+        ("Complete Linkage", labels, right_series),
+        out_path=output_dir / "ablation_best_vs_baseline_radar.png",
+        dpi=300
+    )
+    logger.success(f"Saved comparative radar plot to {output_dir / 'ablation_best_vs_baseline_radar.png'}")
+
 # ---------------------------------------------------------------------------
 # 2. General Clustering & Reduction Utilities
 # ---------------------------------------------------------------------------
@@ -105,6 +292,7 @@ def _soap_embeddings(df: pl.DataFrame):
     soap_array = np.array(df["soap_embedding"].to_list())
     reducers = get_reducers()
     return {
+        "soap_raw": soap_array,
         "soap_pca": reducers["pca"].fit_transform(soap_array),
         "soap_tsne": reducers["tsne"].fit_transform(soap_array),
         "soap_umap": reducers["umap"].fit_transform(soap_array),
@@ -212,17 +400,29 @@ def _plot_radar_series(ax, labels, values, series_label=None):
     ax.set_yticklabels([])
 
 def _plot_radar_pair(title, left, right, out_path: Optional[Path] = None, dpi: int = 300):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6), subplot_kw={"polar": True})
-    fig.suptitle(title, fontsize=14)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7), subplot_kw={"polar": True})
+    
+    fig.suptitle(title, fontsize=16, y=1.05) 
+    
     for ax, (name, labels, series) in zip(axes, [left, right]):
         for series_label, values in series.items():
             _plot_radar_series(ax, labels, values, series_label=series_label)
-        ax.set_title(name, fontsize=10)
-        ax.legend(loc="upper right", fontsize=8, frameon=False)
-    plt.tight_layout()
+            
+        ax.set_title(name, fontsize=12, pad=25) 
+        ax.tick_params(axis='x', pad=20, labelsize=9)
+        
+        ax.legend(
+            loc="upper right", 
+            bbox_to_anchor=(1.35, 1.15),
+            fontsize=9, 
+            frameon=False
+        )
+        
+    plt.tight_layout(rect=[0, 0, 0.95, 1]) 
+    
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(out_path, dpi=dpi)
+        plt.savefig(out_path, dpi=dpi, bbox_inches='tight')
     plt.close()
 
 def _plot_radar_quad(title, quad_items, out_path: Optional[Path] = None, dpi: int = 300):
@@ -328,11 +528,22 @@ def plot_hierarchical_radar_plots(df: pl.DataFrame, k_min: int = 2, k_max: int =
             "chem": (f"Hierarchical {linkage} - chemical", chem_labels, chem_series),
         }
 
-    _plot_radar_quad(
-        "Hierarchical - complete vs average",
-        [linkage_outputs["complete"]["eval"], linkage_outputs["complete"]["chem"],
-         linkage_outputs["average"]["eval"], linkage_outputs["average"]["chem"]],
-        out_path=output_dir / "hierarchical_radar_quad.png",
+    # Plot 1: Metrics (Complete vs. Average)
+    _plot_radar_pair(
+        "QM9 Hierarchical Clustering - Evaluation Metrics",
+        linkage_outputs["complete"]["eval"],
+        linkage_outputs["average"]["eval"],
+        out_path=output_dir / "hierarchical_radar_metrics.png",
+        dpi=300,
+    )
+
+    # Plot 2: Chemical Features (Complete vs. Average)
+    _plot_radar_pair(
+        "QM9 Hierarchical Clustering - Chemical Cohesion",
+        linkage_outputs["complete"]["chem"],
+        linkage_outputs["average"]["chem"],
+        out_path=output_dir / "hierarchical_radar_chemical.png",
+        dpi=300,
     )
 
 def plot_kmeans_radar_plots(df: pl.DataFrame, k_min: int = 2, k_max: int = 20, output_dir: Path = Path("figures/qm9/clustering/kmeans/soap_reduced")):
@@ -359,18 +570,18 @@ def plot_kmeans_radar_plots(df: pl.DataFrame, k_min: int = 2, k_max: int = 20, o
             title=f"{name} (kmeans) - evaluation"
         )
 
-        k_elbow = _kneedle_elbow(np.array(list(k_range)), inertias)
-        labels_in = labels_by_k[k_elbow]
-        
-        eval_triplets[f"{name} (inertia k={k_elbow})"] = (
-            silhouette_score(emb, labels_in), 
-            calinski_harabasz_score(emb, labels_in), 
+        k_db = list(k_range)[int(np.argmin(db_scores))]
+        labels_in = labels_by_k[k_db]
+
+        eval_triplets[f"{name} (db k={k_db})"] = (
+            silhouette_score(emb, labels_in),
+            calinski_harabasz_score(emb, labels_in),
             _invert_db_score(davies_bouldin_score(emb, labels_in))
         )
         
         chem_scores_in, _ = get_overall_qm9_coherence(df, labels_in)
         chem_labels, chem_values = _build_qm9_radar_values(chem_scores_in)
-        chem_series[f"{name} (inertia k={k_elbow})"] = chem_values
+        chem_series[f"{name} (db k={k_db})"] = chem_values
 
     if eval_triplets:
         sils, chs, dbs = (np.array([v[i] for v in eval_triplets.values()]) for i in range(3))
@@ -417,12 +628,17 @@ def plot_hierarchical_dendrograms(df: pl.DataFrame, linkage_method: str = "avera
 if __name__ == "__main__":
     # Ensure add_soap=True so the _soap_embeddings function has data to work with!
     qm9 = QM9Dataset(
-        limit=10_000, 
+        limit=1000, 
         sampling_strategy="stratified", 
         stratify_by=["num_atoms", "gap"]
     )
     df = qm9.load()
     logger.info(f"Loaded QM9 with {len(df)} molecules.")
+
+    logger.info("Running Feature Ablation Study for QM9 Invariant Aggregated...")
+    evaluate_invariant_combinations_qm9(df, linkage="average")
+    evaluate_invariant_combinations_qm9(df, linkage="complete")
+    plot_best_ablation_radar_qm9(df)
 
     # Paths for QM9 figures
     hierarchical_dir = Path("figures/qm9/clustering/hierarchical/soap_reduced")

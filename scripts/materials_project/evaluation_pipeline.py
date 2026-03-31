@@ -1,9 +1,9 @@
-import json
-from kmedoids import KMedoids
-from pathlib import Path
-import hashlib
 from typing import Optional, Dict
+from pathlib import Path
 
+import hashlib
+import json
+import itertools
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -13,7 +13,6 @@ import pandas as pd
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.core import Structure
 from sklearn.cluster import AgglomerativeClustering, KMeans
-from sklearn.discriminant_analysis import unique_labels
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from sklearn.manifold import TSNE, Isomap
 from sklearn.decomposition import PCA
@@ -26,6 +25,7 @@ from ase import Atoms
 from ase.neighborlist import neighbor_list
 from pymatgen.core import Element
 from loguru import logger
+from kmedoids import KMedoids
 
 from src.datasets import MaterialsProject, QM9Dataset
 from src.non_euclidean import _compute_invariant_feature_matrix as invariant_matrix
@@ -208,16 +208,14 @@ def get_overall_chemical_coherence(df, labels):
 
     return results, average_coherence
 
-def _compute_invariant_feature_matrix_materials(frame: Atoms, cutoff: float = 3.0, aggregated=False) -> np.ndarray:
-    """
-    Maps a periodic material to a D x N matrix of invariant physical features.
-    D is the fixed ambient dimension. N is the number of atoms in the unit/super cell.
-    """
-    # 1. Periodic neighbor list calculation
-    # "ijd" returns: center atom index, neighbor atom index, and distance
-    # ASE automatically respects the periodic boundary conditions (pbc=True) of the frame
+def _compute_invariant_feature_matrix_materials(
+    frame: Atoms, 
+    cutoff: float = 3.0, 
+    aggregated: bool = False,
+    feature_keys: Optional[list] = ["z", "en", "coord", "avg_neighbor_dist", "vol_per_atom"]
+) -> np.ndarray:
+    
     i_list, j_list, d_list = neighbor_list("ijd", frame, cutoff)
-
     neighbors = {i: [] for i in range(len(frame))}
     distances = {i: [] for i in range(len(frame))}
 
@@ -226,64 +224,139 @@ def _compute_invariant_feature_matrix_materials(frame: Atoms, cutoff: float = 3.
         distances[i].append(d)
 
     features = []
-    
-    # 2. Global invariant: Volume per atom
-    # Replaces the Center of Mass distance, providing a scale-invariant packing metric
     vol_per_atom = frame.get_volume() / len(frame)
 
-    # 3. Iterate over atoms to build the invariant matrix
+    # 10 Available Features : ""z", "en", "coord", "avg_neighbor_dist", "vol_per_atom", "mass", "rad", "mendeleev", "group", "row""
+
     for i, atom in enumerate(frame):
         z = atom.number
         el = Element.from_Z(z)
         
-        # Safely extract elemental properties (some noble gases lack Pauling electronegativity)
+        # Safely extract properties
         en = el.X if getattr(el, 'X', None) else 0.0
         rad = el.atomic_radius if getattr(el, 'atomic_radius', None) else 0.0
-        mass = atom.mass
-
-        # 4. Local geometric invariants
+        mass = float(el.atomic_mass)
+        mendeleev = el.mendeleev_no
+        group = el.group
+        row = el.row
+        
         coord = len(neighbors[i])
-
         if coord > 0:
-            avg_neighbor_z = float(np.mean(neighbors[i]))
             avg_neighbor_dist = float(np.mean(distances[i]))
         else:
-            avg_neighbor_z = 0.0
             avg_neighbor_dist = 0.0
 
-        # Assemble D-dimensional feature vector (D=8)
-        feat_vector = [
-            z,                  # Fundamental chemistry
-            en,                 # Bonding behavior
-            coord,              # Local geometry type
-            avg_neighbor_dist,  # Local bond strength/size
-            vol_per_atom        # Global crystal packing
-        ]
+        # Pool of all 10 features
+        feature_pool = {
+            "z": z,
+            "en": en,
+            "coord": coord,
+            "avg_neighbor_dist": avg_neighbor_dist,
+            "vol_per_atom": vol_per_atom,
+            "mass": mass,
+            "rad": rad,
+            "mendeleev": mendeleev,
+            "group": group,
+            "row": row
+        }
 
+        feat_vector = [feature_pool[k] for k in feature_keys]
         features.append(feat_vector)
 
     if aggregated:
-        # Create the D x N matrix
         atom_matrix = np.array(features).T 
-
-        # 5. AGGREGATION STEP: Collapse N atoms into fixed statistical features
-
-        # Calculate the mean and standard deviation across the atoms (axis=1)
         mean_features = np.mean(atom_matrix, axis=1)
         std_features = np.std(atom_matrix, axis=1)
+        return np.concatenate([mean_features, std_features])
         
-        # You can also add min/max if you want to capture the extremes!
-        # min_features = np.min(atom_matrix, axis=1)
-        # max_features = np.max(atom_matrix, axis=1)
-        
-        # Concatenate into a flat, fixed-length 1D array (Length: 16)
-        crystal_features = np.concatenate([mean_features, std_features])
-        return crystal_features
-        
-    # Return transposed to match D x N shape requirements
     return np.array(features).T
 
-def build_invariant_matrix(df, cutoff: float = 3.0, aggregated: bool = False) -> list:
+def evaluate_invariant_combinations(df: pl.DataFrame, linkage: str = "average", k_min: int = 2, k_max: int = 20):
+    """
+    Tests every combination of 10 invariant features (1023 total), 
+    finds the optimal k via DB score, and records the chemical coherence.
+    """
+    all_features = [
+        "z", "en", "coord", "avg_neighbor_dist", "vol_per_atom",
+        "mass", "rad", "mendeleev", "group", "row"
+    ]
+    
+    # Generate all combinations of length 1 to 10
+    combinations_to_test = []
+    for r in range(1, len(all_features) + 1):
+        for combo in itertools.combinations(all_features, r):
+            combinations_to_test.append(list(combo))
+
+    logger.info(f"Generated {len(combinations_to_test)} feature combinations to test.")
+    
+    results = []
+    k_range = range(k_min, k_max + 1)
+
+    # Wrap in tqdm for a massive progress bar
+    for feature_keys in tqdm(combinations_to_test, desc="Evaluating Combinations"):
+        combo_name = " + ".join(feature_keys)
+        
+        feature_matrix = build_invariant_matrix(df, aggregated=True, feature_keys=feature_keys)
+        feature_matrix = np.array(feature_matrix)
+        
+        dist_matrix = squareform(pdist(feature_matrix, metric='euclidean'))
+        
+        best_k = None
+        best_db = np.inf
+        best_labels = None
+        
+        for k in k_range:
+            labels = hierachial_clustering(dist_matrix, k, linkage=linkage)
+            db = davies_bouldin_score(feature_matrix, labels)
+            if db < best_db:
+                best_db = db
+                best_k = k
+                best_labels = labels
+                
+        chem_scores, avg_coherence = get_overall_chemical_coherence(df, best_labels)
+        
+        results.append({
+            "Combination": combo_name,
+            "Feature Count": len(feature_keys),
+            "Optimal k": best_k,
+            "DB Score": best_db,
+            "Overall Chemical Coherence": avg_coherence
+        })
+
+    # Sort results to find the winners
+    results_df = pd.DataFrame(results).sort_values(by="Overall Chemical Coherence", ascending=False)
+    
+    # Save the full 1023 row dataframe to a CSV for your records
+    csv_path = Path(f"figures/materials/clustering/hierarchical/ablation_results_full_{linkage}.csv")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(csv_path, index=False)
+    logger.success(f"Saved full ablation results (CSV) to {csv_path}")
+    
+    # Plot ONLY the top 20 for readability
+    top_20 = results_df.head(20)
+    
+    plt.figure(figsize=(12, 10))
+    sns.barplot(
+        data=top_20, 
+        x="Overall Chemical Coherence", 
+        y="Combination", 
+        hue="Combination",
+        palette="viridis",
+        legend=False
+    )
+    plt.title(f"Top 20 Feature Combinations by Chemical Coherence\n(Hierarchical, linkage={linkage})", fontsize=14)
+    plt.xlabel("Overall Chemical Coherence (Higher is Better)")
+    plt.ylabel("Feature Combination")
+    
+    for index, row in enumerate(top_20.itertuples()):
+        plt.text(row._5 + 0.005, index, f"Best k={row._3}", va='center', color='black', fontsize=9)
+
+    plt.tight_layout()
+    out_path = Path(f"figures/materials/clustering/hierarchical/ablation_study_top20_{linkage}.png")
+    plt.savefig(out_path, dpi=300)
+    logger.success(f"Saved top 20 ablation plot to {out_path}")
+
+def build_invariant_matrix(df, cutoff: float = 3.0, aggregated: bool = False, feature_keys: Optional[list] = ["z", "en", "coord", "avg_neighbor_dist", "vol_per_atom"]) -> list:
     """
     Iterates through the materials dataframe, converts JSON structures to ASE Atoms, 
     and computes the D x N invariant feature matrix for each material.
@@ -299,7 +372,7 @@ def build_invariant_matrix(df, cutoff: float = 3.0, aggregated: bool = False) ->
         atoms = adaptor.get_atoms(struct)
         
         # 3. Compute the D x N invariant matrix
-        matrix = _compute_invariant_feature_matrix_materials(atoms, cutoff=cutoff, aggregated=aggregated)
+        matrix = _compute_invariant_feature_matrix_materials(atoms, cutoff=cutoff, aggregated=aggregated, feature_keys=feature_keys)
         
         invariant_matrices.append(matrix)
         
@@ -365,17 +438,30 @@ def _plot_radar_series(ax, labels, values, series_label=None):
     ax.set_yticklabels([])
 
 def _plot_radar_pair(title, left, right, out_path: Optional[Path] = None, dpi: int = 300):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6), subplot_kw={"polar": True})
-    fig.suptitle(title, fontsize=14)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7), subplot_kw={"polar": True})
+    
+    fig.suptitle(title, fontsize=16, y=1.05) 
+    
     for ax, (name, labels, series) in zip(axes, [left, right]):
         for series_label, values in series.items():
             _plot_radar_series(ax, labels, values, series_label=series_label)
-        ax.set_title(name, fontsize=10)
-        ax.legend(loc="upper right", fontsize=8, frameon=False)
-    plt.tight_layout()
+            
+        ax.set_title(name, fontsize=12, pad=25) 
+        
+        ax.tick_params(axis='x', pad=20, labelsize=9)
+        
+        ax.legend(
+            loc="upper right", 
+            bbox_to_anchor=(1.35, 1.15),
+            fontsize=9, 
+            frameon=False
+        )
+        
+    plt.tight_layout(rect=[0, 0, 0.95, 1]) 
+    
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(out_path, dpi=dpi)
+        plt.savefig(out_path, dpi=dpi, bbox_inches='tight')
         logger.info(f"Saved plot to {out_path}")
     plt.close()
 
@@ -395,10 +481,42 @@ def _plot_radar_quad(title, quad_items, out_path: Optional[Path] = None, dpi: in
         logger.info(f"Saved plot to {out_path}")
     plt.close()
 
+def plot_invariant_aggregated_dendrograms(
+    df: pl.DataFrame,
+    linkage_method: str = "average",
+    output_dir: Path = Path("figures/materials/clustering/hierarchical/dendrograms/invariant"),
+):
+    """Plots a single, standalone dendrogram for the invariant_aggregated distance matrix."""
+    dist_mats = get_distance_matrices_non_euclidean(df)
+    
+    if "invariant_aggregated" not in dist_mats:
+        logger.error("invariant_aggregated distance matrix not found!")
+        return
+        
+    dist_matrix = dist_mats["invariant_aggregated"]
+
+    plt.figure(figsize=(10, 6))
+    plt.title(f"Hierarchical Dendrogram - Invariant Aggregated (linkage={linkage_method})", fontsize=14)
+
+    condensed = squareform(dist_matrix, checks=False)
+    Z = scipy_linkage(condensed, method=linkage_method)
+    dendrogram(Z, no_labels=True, color_threshold=None)
+    
+    plt.xlabel("Samples")
+    plt.ylabel("Distance")
+    plt.tight_layout()
+
+    out_path = output_dir / f"dendrogram_invariant_aggregated_{linkage_method}.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=300)
+    logger.info(f"Saved invariant aggregated dendrogram to {out_path}")
+    plt.close()
+
 def _soap_embeddings(df: pl.DataFrame):
     soap_array = np.array(df["soap_embedding"].to_list())
     reducers = get_reducers()
     return {
+        "soap_raw": soap_array,
         "soap_pca": reducers["pca"].fit_transform(soap_array),
         "soap_tsne": reducers["tsne"].fit_transform(soap_array),
         "soap_umap": reducers["umap"].fit_transform(soap_array),
@@ -550,16 +668,21 @@ def plot_hierarchical_radar_plots(
             "chem": (f"Hierarchical {linkage} - chemical", chem_labels, chem_series),
         }
 
-    quad_items = [
+    # Plot 1: Metrics (Complete vs. Average)
+    _plot_radar_pair(
+        "Hierarchical Clustering - Evaluation Metrics",
         linkage_outputs["complete"]["eval"],
-        linkage_outputs["complete"]["chem"],
         linkage_outputs["average"]["eval"],
+        out_path=output_dir / "hierarchical_radar_metrics.png",
+        dpi=300,
+    )
+
+    # Plot 2: Chemical Features (Complete vs. Average)
+    _plot_radar_pair(
+        "Hierarchical Clustering - Chemical Cohesion",
+        linkage_outputs["complete"]["chem"],
         linkage_outputs["average"]["chem"],
-    ]
-    _plot_radar_quad(
-        "Hierarchical - complete vs average",
-        quad_items,
-        out_path=output_dir / "hierarchical_radar_quad.png",
+        out_path=output_dir / "hierarchical_radar_chemical.png",
         dpi=300,
     )
 
@@ -591,15 +714,15 @@ def plot_kmeans_radar_plots(
             dpi=300,
         )
 
-        k_elbow = _kneedle_elbow(np.array(k_list), inertias)
-        labels_in = labels_by_k[k_elbow]
+        k_db = k_list[int(np.argmin(db_scores))]
+        labels_in = labels_by_k[k_db]
         sil_i = silhouette_score(emb, labels_in)
         ch_i = calinski_harabasz_score(emb, labels_in)
         db_i = davies_bouldin_score(emb, labels_in)
-        eval_triplets[f"{name} (inertia k={k_elbow})"] = (sil_i, ch_i, _invert_db_score(db_i))
+        eval_triplets[f"{name} (db k={k_db})"] = (sil_i, ch_i, _invert_db_score(db_i))
         chem_scores_in, _ = get_overall_chemical_coherence(df, labels_in)
         chem_labels, chem_values = _build_chem_radar_values(chem_scores_in)
-        chem_series[f"{name} (inertia k={k_elbow})"] = chem_values
+        chem_series[f"{name} (db k={k_db})"] = chem_values
 
     if eval_triplets:
         sils = np.array([v[0] for v in eval_triplets.values()])
@@ -689,12 +812,14 @@ def get_distance_matrices_soap(
     soap_umap = reducers['umap'].fit_transform(soap_array)
     soap_isomap = reducers['isomap'].fit_transform(soap_array)
 
+    distance_raw_soap_matrix = squareform(pdist(soap_array, metric='euclidean'))
     distance_pca_soap_matrix = squareform(pdist(soap_pca, metric='euclidean'))
     distance_tsne_soap_matrix = squareform(pdist(soap_tsne, metric='euclidean'))
     distance_umap_soap_matrix = squareform(pdist(soap_umap, metric='euclidean'))
     distance_isomap_soap_matrix = squareform(pdist(soap_isomap, metric='euclidean'))
 
     soap_distances = {
+        "soap_raw": distance_raw_soap_matrix,
         "soap_pca": distance_pca_soap_matrix,
         "soap_tsne": distance_tsne_soap_matrix,
         "soap_umap": distance_umap_soap_matrix,
@@ -730,10 +855,14 @@ def get_distance_matrices_non_euclidean(
 
     frames = get_ase_frames(df)
     precomputed_feature_matrices = build_invariant_matrix(df, aggregated=False)
-    precomputed_feature_matrices_aggregated = build_invariant_matrix(df, aggregated=True)
+    precomputed_feature_matrices_average_aggregated = build_invariant_matrix(df, aggregated=True, feature_keys=["en", "avg_neighbor_dist", "rad", "group"])
+    precomputed_feature_matrices_complete_aggregated = build_invariant_matrix(df, aggregated=True, feature_keys=["en", "z", "mendeleev", "group", "row"])
 
-    distance_invariant_matrix_aggregated = squareform(
-        pdist(precomputed_feature_matrices_aggregated, metric='euclidean')
+    distance_invariant_average_matrix_aggregated = squareform(
+        pdist(precomputed_feature_matrices_average_aggregated, metric='euclidean')
+    )
+    distance_invariant_complete_matrix_aggregated = squareform(
+        pdist(precomputed_feature_matrices_complete_aggregated, metric='euclidean')
     )
     
     distance_invariant_matrix_riemann = Riemann.distance_matrix(
@@ -750,7 +879,8 @@ def get_distance_matrices_non_euclidean(
     #distance_topological_sliced_wasserstein_matrix = PersistentHomology.distance_matrix(frames=frames, metric="sliced-wasserstein", max_homology_dim=2)
 
     invariant_distances = {
-        "invariant_aggregated": distance_invariant_matrix_aggregated,
+        "invariant_avg_aggregated": distance_invariant_average_matrix_aggregated,
+        "invariant_complete_aggregated": distance_invariant_complete_matrix_aggregated,
         "invariant_riemann": distance_invariant_matrix_riemann,
         "invariant_grassmann": distance_invariant_matrix_grassmann,
         "invariant_wasserstein": distance_invariant_matrix_wasserstein,
@@ -799,18 +929,31 @@ def get_distance_matrices(
 if __name__ == '__main__':
 
     mp = MaterialsProject(add_soap=True, add_acsf=False, stratify_on=["band_gap", "energy_above_hull"], sampling_strategy="stratified")
-    df = mp.load(limit=5000)
+    df = mp.load(limit=250)
 
     hierarchical_dir = Path("figures/materials/clustering/hierarchical/soap_reduced")
     dendrogram_dir = hierarchical_dir / "dendrograms"
     kmeans_dir = Path("figures/materials/clustering/kmeans/soap_reduced")
+    
+    invariant_dendrogram_dir = Path("figures/materials/clustering/hierarchical/dendrograms/invariant")
+
+    #evaluate_invariant_combinations(df, linkage="average", k_min=2, k_max=20)
+    #evaluate_invariant_combinations(df, linkage="complete", k_min=2, k_max=20)
+
+    logger.info("Generating Invariant Aggregated hierarchical dendrograms...")
+    plot_invariant_aggregated_dendrograms(df, linkage_method="average", output_dir=invariant_dendrogram_dir)
+    plot_invariant_aggregated_dendrograms(df, linkage_method="complete", output_dir=invariant_dendrogram_dir)
 
     logger.info("Generating hierarchical radar plots...")
     plot_hierarchical_radar_plots(df, k_min=2, k_max=20, output_dir=hierarchical_dir)
+    
     logger.info("Generating kmeans radar plots...")
     plot_kmeans_radar_plots(df, k_min=2, k_max=20, output_dir=kmeans_dir)
-    logger.info("Generating hierarchical dendrograms...")
+    
+    logger.info("Generating SOAP hierarchical dendrograms...")
     plot_hierarchical_dendrograms(df, linkage_method="average", output_dir=dendrogram_dir)
     plot_hierarchical_dendrograms(df, linkage_method="complete", output_dir=dendrogram_dir)
-
     
+    logger.info("Generating Invariant Aggregated hierarchical dendrograms...")
+    plot_invariant_aggregated_dendrograms(df, linkage_method="average", output_dir=invariant_dendrogram_dir)
+    plot_invariant_aggregated_dendrograms(df, linkage_method="complete", output_dir=invariant_dendrogram_dir)
