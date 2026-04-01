@@ -10,6 +10,7 @@ from pathlib import Path
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.core import Structure
 from sklearn.manifold import TSNE, Isomap, MDS
+from geomstats.learning.pca import TangentPCA
 from sklearn.decomposition import PCA
 from typing import Sequence, Optional, Iterable
 from loguru import logger
@@ -251,6 +252,9 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     elif reduction_method == 'MDS':
         mds = MDS(n_components=2, metric='precomputed', n_init=4)
         coords = mds.fit_transform(dist_matrix)
+    elif reduction_method == 'PGA':
+        pga = TangentPCA(n_components=2)
+        coords = pga.fit_transform(dist_matrix)
     else:
         raise ValueError(f"Unsupported reduction method: {reduction_method}")
 
