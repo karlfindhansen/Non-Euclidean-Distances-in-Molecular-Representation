@@ -10,13 +10,16 @@ import seaborn as sns
 import polars as pl
 import pandas as pd
 
+from hdbscan.validity import validity_index
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.core import Structure, Element
 from sklearn.cluster import DBSCAN, KMeans, SpectralClustering
-from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from sklearn.manifold import TSNE, Isomap
+from dbcv import dbcv
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import kneighbors_graph
 from umap import UMAP
 from scipy.spatial.distance import pdist, squareform
 from scipy.cluster.hierarchy import cophenet, fcluster
@@ -31,9 +34,37 @@ from src.datasets import MaterialsProject
 
 INVARIANT_FEATURES = [
     "z", "en", "coord", "avg_neighbor_dist", "vol_per_atom", "mass", "rad",
-    "mendeleev", "group", "row", "std_neighbor_dist", "min_neighbor_dist",
+    "mendeleev", "std_neighbor_dist", "min_neighbor_dist",
     "max_neighbor_dist", "ea", "ion_en", "vdw_rad", "melt_pt", "mol_vol",
 ]
+
+def _compute_gap_statistic(X: np.ndarray, k: int, orig_inertia: float, n_refs: int = 5) -> float:
+    """Computes the Gap Statistic comparing original inertia to uniform reference distributions."""
+    if orig_inertia == 0:
+        return 0.0
+    ref_dispersions = []
+    min_vals, max_vals = np.min(X, axis=0), np.max(X, axis=0)
+    for _ in range(n_refs):
+        random_data = np.random.uniform(min_vals, max_vals, size=X.shape)
+        ref_kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42).fit(random_data)
+        ref_dispersions.append(ref_kmeans.inertia_)
+    return np.log(np.mean(ref_dispersions)) - np.log(orig_inertia)
+
+def _compute_ncut(X: np.ndarray, labels: np.ndarray, n_neighbors: int = 10) -> float:
+    """Computes the Normalized Cut (NCut) using a k-NN affinity graph."""
+    A = kneighbors_graph(X, n_neighbors=n_neighbors, mode='connectivity', include_self=False).toarray()
+    A = 0.5 * (A + A.T) # Make symmetric
+    degree = np.sum(A, axis=1)
+    
+    ncut = 0.0
+    unique_labels = set(labels) - {-1} # exclude noise if present
+    for c in unique_labels:
+        mask = (labels == c)
+        cut = np.sum(A[mask][:, ~mask])
+        vol = np.sum(degree[mask])
+        if vol > 0:
+            ncut += cut / vol
+    return ncut
 
 
 def get_overall_chemical_coherence(df, labels):
@@ -137,8 +168,6 @@ def _compute_invariant_feature_matrix_materials(
         rad = el.atomic_radius if getattr(el, "atomic_radius", None) else 0.0
         mass = float(el.atomic_mass)
         mendeleev = el.mendeleev_no if getattr(el, "mendeleev_no", None) else 0
-        group = el.group if getattr(el, "group", None) else 0
-        row = el.row if getattr(el, "row", None) else 0
 
         ea = getattr(el, "electron_affinity", 0.0) or 0.0
         ion_list = getattr(el, "ionization_energies", [])
@@ -164,7 +193,7 @@ def _compute_invariant_feature_matrix_materials(
         feature_pool = {
             "z": z, "en": en, "coord": coord, "avg_neighbor_dist": avg_neighbor_dist,
             "vol_per_atom": vol_per_atom, "mass": mass, "rad": rad,
-            "mendeleev": mendeleev, "group": group, "row": row,
+            "mendeleev": mendeleev,
             "std_neighbor_dist": std_neighbor_dist,
             "min_neighbor_dist": min_neighbor_dist,
             "max_neighbor_dist": max_neighbor_dist,
@@ -451,7 +480,7 @@ def evaluate_kmeans_combinations(
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
-    using K-Means clustering with elbow-based k selection.
+    using K-Means clustering with Davies-Bouldin-based k selection.
     """
     results = []
     k_range = list(range(k_min, k_max + 1))
@@ -463,30 +492,40 @@ def evaluate_kmeans_combinations(
         for name, emb in tqdm(items, desc="Evaluating KMeans (SOAP)"):
             scaled_matrix = _scaled_matrix(emb)
 
-            inertias = []
             silhouettes = []
+            ch_scores = []
+            db_scores = []
+            inertias = []
+            gap_scores = []
             labels_by_k = {}
 
             for k in k_range:
                 kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42)
                 labels = kmeans.fit_predict(scaled_matrix)
                 labels_by_k[k] = labels
+                
+                sil = silhouette_score(scaled_matrix, labels)
+                silhouettes.append(sil)
+                ch_scores.append(calinski_harabasz_score(scaled_matrix, labels))
+                db_scores.append(davies_bouldin_score(scaled_matrix, labels))
                 inertias.append(kmeans.inertia_)
-                silhouettes.append(silhouette_score(scaled_matrix, labels))
+                gap_scores.append(_compute_gap_statistic(scaled_matrix, k, kmeans.inertia_))
 
-            best_k = _kneedle_elbow(np.array(k_range), np.array(inertias))
-            best_labels = labels_by_k[best_k]
-            best_sil = silhouettes[k_range.index(best_k)]
-            best_db = davies_bouldin_score(scaled_matrix, best_labels)
+            best_k_sil = k_range[int(np.argmax(silhouettes))]
+            best_k_gap = k_range[int(np.argmax(gap_scores))]
 
+            best_labels = labels_by_k[best_k_sil] 
+            
             _, avg_coherence = get_overall_chemical_coherence(df, best_labels)
 
             results.append({
                 "Combination": name,
                 "Feature Count": scaled_matrix.shape[1],
-                "Optimal k (Elbow)": best_k,
-                "Davies-Bouldin": best_db,
-                "Silhouette": best_sil,
+                "Optimal k (Silhouette)": best_k_sil,
+                "Optimal k (Gap)": best_k_gap,
+                "Gap Statistic": gap_scores[k_range.index(best_k_gap)],
+                "Davies-Bouldin": db_scores[k_range.index(best_k_sil)],
+                "Silhouette": silhouettes[k_range.index(best_k_sil)],
                 "Overall Chemical Coherence": avg_coherence,
             })
     else:
@@ -502,37 +541,49 @@ def evaluate_kmeans_combinations(
         logger.info(f"Reduced KMeans search space to {len(combinations_to_test)} combinations.")
 
         output_dir = Path("figures/materials/clustering/kmeans")
-        logger.info("--- KMEANS STAGE 2 & 3: Statistical Evaluation & Auto-Elbow ---")
+        logger.info("--- KMEANS STAGE 2 & 3: Statistical Evaluation & DB Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating KMeans"):
             combo_name = " + ".join(feature_keys)
 
             scaled_matrix = _scaled_invariant_matrix(df, feature_keys)
 
-            inertias = []
             silhouettes = []
+            ch_scores = []
+            db_scores = []
+            inertias = []
+            gap_scores = []
             labels_by_k = {}
 
             for k in k_range:
                 kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42)
                 labels = kmeans.fit_predict(scaled_matrix)
                 labels_by_k[k] = labels
+                
+                sil = silhouette_score(scaled_matrix, labels)
+                silhouettes.append(sil)
+                ch_scores.append(calinski_harabasz_score(scaled_matrix, labels))
+                db_scores.append(davies_bouldin_score(scaled_matrix, labels))
                 inertias.append(kmeans.inertia_)
-                silhouettes.append(silhouette_score(scaled_matrix, labels))
+                gap_scores.append(_compute_gap_statistic(scaled_matrix, k, kmeans.inertia_))
 
-            best_k = _kneedle_elbow(np.array(k_range), np.array(inertias))
-            best_labels = labels_by_k[best_k]
-            best_sil = silhouettes[k_range.index(best_k)]
-            best_db = davies_bouldin_score(scaled_matrix, best_labels)
+            best_k_sil = k_range[int(np.argmax(silhouettes))]
+            best_k_gap = k_range[int(np.argmax(gap_scores))]
+            best_k_db = k_range[int(np.argmin(db_scores))]
 
+            best_labels = labels_by_k[best_k_sil] 
+            
             _, avg_coherence = get_overall_chemical_coherence(df, best_labels)
 
             results.append({
                 "Combination": combo_name,
-                "Feature Count": len(feature_keys),
-                "Optimal k (Elbow)": best_k,
-                "Davies-Bouldin": best_db,
-                "Silhouette": best_sil,
+                "Feature Count": scaled_matrix.shape[1],
+                "Optimal k (Silhouette)": best_k_sil,
+                "Optimal k (Gap)": best_k_gap,
+                "Gap Statistic": gap_scores[k_range.index(best_k_gap)],
+                "Davies-Bouldin": db_scores[k_range.index(best_k_sil)],
+                "Optimal k (DB)": best_k_db,
+                "Silhouette": silhouettes[k_range.index(best_k_sil)],
                 "Overall Chemical Coherence": avg_coherence,
             })
 
@@ -567,7 +618,7 @@ def evaluate_kmeans_combinations(
     plt.ylabel("Feature Combination")
 
     for index, (_, row) in enumerate(top_20.iterrows()):
-        annot_text = f"k={int(row['Optimal k (Elbow)'])} | DB: {row['Davies-Bouldin']:.2f}"
+        annot_text = f"k={int(row['Optimal k (DB)'])} | DB: {row['Davies-Bouldin']:.2f}"
         plt.text(row["Silhouette"] + 0.005, index, annot_text, va="center", color="black", fontsize=9)
 
     plt.tight_layout()
@@ -598,7 +649,7 @@ def evaluate_spectral_combinations(
             scaled_matrix = _scaled_matrix(emb)
 
             best_k = None
-            best_db = np.inf
+            best_ncut = np.inf
             best_sil = -1.0
             best_labels = None
 
@@ -614,11 +665,11 @@ def evaluate_spectral_combinations(
                     labels = spectral.fit_predict(scaled_matrix)
                     if len(np.unique(labels)) > 1:
                         sil = silhouette_score(scaled_matrix, labels)
-                        db = davies_bouldin_score(scaled_matrix, labels)
+                        current_ncut = _compute_ncut(scaled_matrix, labels)
 
-                        if sil > best_sil:
+                        if current_ncut < best_ncut:
+                            best_ncut = current_ncut
                             best_sil = sil
-                            best_db = db
                             best_k = k
                             best_labels = labels
                 except Exception:
@@ -630,10 +681,10 @@ def evaluate_spectral_combinations(
             _, avg_coherence = get_overall_chemical_coherence(df, best_labels)
 
             results.append({
-                "Combination": name,
+                "Combination": name, # or 'name' for SOAP
                 "Feature Count": scaled_matrix.shape[1],
-                "Optimal k": best_k,
-                "Davies-Bouldin": best_db,
+                "Optimal k (NCut)": best_k,
+                "NCut Score": best_ncut,
                 "Silhouette": best_sil,
                 "Overall Chemical Coherence": avg_coherence,
             })
@@ -658,7 +709,7 @@ def evaluate_spectral_combinations(
             scaled_matrix = _scaled_invariant_matrix(df, feature_keys)
 
             best_k = None
-            best_db = np.inf
+            best_ncut = np.inf
             best_sil = -1.0
             best_labels = None
 
@@ -674,27 +725,26 @@ def evaluate_spectral_combinations(
                     labels = spectral.fit_predict(scaled_matrix)
                     if len(np.unique(labels)) > 1:
                         sil = silhouette_score(scaled_matrix, labels)
-                        db = davies_bouldin_score(scaled_matrix, labels)
+                        current_ncut = _compute_ncut(scaled_matrix, labels)
 
-                        if sil > best_sil:
+                        if current_ncut < best_ncut:
+                            best_ncut = current_ncut
                             best_sil = sil
-                            best_db = db
                             best_k = k
                             best_labels = labels
                 except Exception:
                     continue
 
             if best_labels is None:
-                logger.warning(f"Combination [{combo_name}] produced invalid graph components. Skipping.")
                 continue
 
             _, avg_coherence = get_overall_chemical_coherence(df, best_labels)
 
             results.append({
                 "Combination": combo_name,
-                "Feature Count": len(feature_keys),
-                "Optimal k": best_k,
-                "Davies-Bouldin": best_db,
+                "Feature Count": scaled_matrix.shape[1],
+                "Optimal k (NCut)": best_k,
+                "NCut Score": best_ncut,
                 "Silhouette": best_sil,
                 "Overall Chemical Coherence": avg_coherence,
             })
@@ -751,7 +801,7 @@ def evaluate_dbscan_combinations(
     using DBSCAN and eps sweep.
     """
     if eps_values is None:
-        eps_values = [0.25, 0.5, 0.75, 1.0, 1.25]
+        eps_values = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
 
     results = []
 
@@ -762,9 +812,12 @@ def evaluate_dbscan_combinations(
 
         for name, emb in tqdm(items, desc="Evaluating DBSCAN (SOAP)"):
             scaled_matrix = _scaled_matrix(emb)
+            rng = np.random.default_rng(42) 
+            noise = rng.normal(0, 1e-8, scaled_matrix.shape)
+            scaled_matrix = scaled_matrix + noise
 
             best_eps = None
-            best_db = np.inf
+            best_dbcv = -np.inf
             best_sil = -1.0
             best_labels = None
             best_noise_ratio = 1.0
@@ -780,11 +833,11 @@ def evaluate_dbscan_combinations(
 
                 if n_clusters >= 2 and noise_ratio <= 0.50:
                     sil = silhouette_score(scaled_matrix, labels)
-                    db = davies_bouldin_score(scaled_matrix, labels)
+                    current_dbcv = validity_index(scaled_matrix, labels)
 
-                    if sil > best_sil:
+                    if current_dbcv > best_dbcv:
+                        best_dbcv = current_dbcv
                         best_sil = sil
-                        best_db = db
                         best_eps = eps
                         best_labels = labels
                         best_noise_ratio = noise_ratio
@@ -801,7 +854,7 @@ def evaluate_dbscan_combinations(
                 "Optimal eps": best_eps,
                 "Num Clusters": best_n_clusters,
                 "Noise Ratio": best_noise_ratio,
-                "Davies-Bouldin": best_db,
+                "DBCV Score": best_dbcv,
                 "Silhouette": best_sil,
                 "Overall Chemical Coherence": avg_coherence,
             })
@@ -824,9 +877,12 @@ def evaluate_dbscan_combinations(
             combo_name = " + ".join(feature_keys)
 
             scaled_matrix = _scaled_invariant_matrix(df, feature_keys)
+            rng = np.random.default_rng(42)
+            noise = rng.normal(0, 1e-8, scaled_matrix.shape)
+            scaled_matrix = scaled_matrix + noise
 
             best_eps = None
-            best_db = np.inf
+            best_dbcv = -np.inf
             best_sil = -1.0
             best_labels = None
             best_noise_ratio = 1.0
@@ -842,11 +898,11 @@ def evaluate_dbscan_combinations(
 
                 if n_clusters >= 2 and noise_ratio <= 0.50:
                     sil = silhouette_score(scaled_matrix, labels)
-                    db = davies_bouldin_score(scaled_matrix, labels)
+                    current_dbcv = validity_index(scaled_matrix, labels)
 
-                    if sil > best_sil:
+                    if current_dbcv > best_dbcv:
+                        best_dbcv = current_dbcv
                         best_sil = sil
-                        best_db = db
                         best_eps = eps
                         best_labels = labels
                         best_noise_ratio = noise_ratio
@@ -859,11 +915,11 @@ def evaluate_dbscan_combinations(
 
             results.append({
                 "Combination": combo_name,
-                "Feature Count": len(feature_keys),
+                "Feature Count": scaled_matrix.shape[1],
                 "Optimal eps": best_eps,
                 "Num Clusters": best_n_clusters,
                 "Noise Ratio": best_noise_ratio,
-                "Davies-Bouldin": best_db,
+                "DBCV Score": best_dbcv,
                 "Silhouette": best_sil,
                 "Overall Chemical Coherence": avg_coherence,
             })
@@ -995,14 +1051,14 @@ if __name__ == "__main__":
         stratify_on=["band_gap", "energy_above_hull"],
         sampling_strategy="stratified",
     )
-    df = mp.load(limit=150)
+    df = mp.load(limit=400)
 
     # Invariant-only evaluations
-    # evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20)
-    # evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20)
-    # evaluate_kmeans_combinations(df, k_min=2, k_max=20)
-    # evaluate_spectral_combinations(df, k_min=2, k_max=20)
-    # evaluate_dbscan_combinations(df, min_samples=3)
+    #evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20)
+    #evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20)
+    #evaluate_kmeans_combinations(df, k_min=2, k_max=20)
+    #evaluate_spectral_combinations(df, k_min=2, k_max=20)
+    evaluate_dbscan_combinations(df, min_samples=3)
 
     # SOAP evaluations using the same functions
     evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20, mode="soap")

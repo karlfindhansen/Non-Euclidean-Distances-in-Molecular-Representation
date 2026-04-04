@@ -238,10 +238,16 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     print("Running " + reduction_method + " dimensionality reduction...")
 
     if reduction_method == 't-SNE':
-        tsne = TSNE(n_components=2, metric='precomputed', init='random', random_state=42, perplexity=30)
+        if dist_matrix.shape[1] != dist_matrix.shape[0]:
+            tsne = TSNE(n_components=2, metric='euclidean', init='random', random_state=42, perplexity=30)
+        else:
+            tsne = TSNE(n_components=2, metric='precomputed', init='random', random_state=42, perplexity=30)
         coords = tsne.fit_transform(dist_matrix)
     elif reduction_method == 'UMAP':
-        reducer = UMAP(metric='precomputed', random_state=42)
+        if dist_matrix.shape[1] != dist_matrix.shape[0]:
+            reducer = UMAP(metric='euclidean', random_state=42)
+        else:
+            reducer = UMAP(metric='precomputed', random_state=42)
         coords = reducer.fit_transform(dist_matrix)
     elif reduction_method == 'PCA':
         pca = PCA(n_components=2, random_state=42)
@@ -285,6 +291,8 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         "volume": df["volume"].to_list(),
         "num_sites": df["num_sites"].to_list(),
         "max_en_diff":df["max_en_diff"].to_list(),
+        "avg_bond_length": df["avg_bond_length"].to_list(),
+        "max_bond_length": df["max_bond_length"].to_list(),
     }
 
     settings = {

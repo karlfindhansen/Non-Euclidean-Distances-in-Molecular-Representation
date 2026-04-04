@@ -11,11 +11,13 @@ dependencies = [
     "chemiscope>=1.0.0",
     "chemprop>=2.2.2",
     "crystal-toolkit>=2025.10.8",
+    "dbcv",
     "dscribe>=2.1.2",
     "fairchem-core>=2.7.1",
     "geomstats>=2.8.0",
     "gudhi>=3.11.0",
     "h5py>=3.15.1",
+    "hdbscan>=0.8.42",
     "ipykernel>=7.1.0",
     "kmedoids>=0.5.4",
     "lmdb>=1.7.5",
@@ -47,3 +49,4 @@ dependencies = [
 
 [tool.uv.sources]
 mapsim = { git = "https://github.com/mapequation/map-equation-similarity" }
+dbcv = { git = "https://github.com/FelSiq/DBCV.git" }

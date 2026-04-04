@@ -1231,6 +1231,58 @@ class MaterialsProject:
         # Select rows from polars DataFrame using integer indexing
         return df[chosen_indices]
 
+    @staticmethod
+    def _compute_bond_length_stats(
+        struct: Structure,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """
+        Approximate average and maximum bond length (Angstrom) from a periodic structure.
+        Uses the nearest-neighbor distance per site with an adaptive cutoff.
+        """
+        if struct is None or len(struct) == 0:
+            return None, None
+
+        cutoffs = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]
+        neighbors = None
+        for r in cutoffs:
+            try:
+                all_neighbors = struct.get_all_neighbors(r)
+            except Exception:
+                continue
+            if any(len(nlist) > 0 for nlist in all_neighbors):
+                neighbors = all_neighbors
+                break
+
+        if neighbors is None:
+            return None, None
+
+        nearest_distances = []
+        for nlist in neighbors:
+            if not nlist:
+                continue
+            distances = []
+            for nn in nlist:
+                dist = getattr(nn, "nn_distance", None)
+                if dist is None:
+                    dist = getattr(nn, "distance", None)
+
+                if callable(dist):
+                    try:
+                        dist = dist()
+                    except TypeError:
+                        # Some objects (e.g., PeriodicSite) require an argument.
+                        dist = None
+
+                if dist is not None:
+                    distances.append(float(dist))
+            if distances:
+                nearest_distances.append(min(distances))
+
+        if not nearest_distances:
+            return None, None
+
+        return float(np.mean(nearest_distances)), float(np.max(nearest_distances))
+
     def _process_doc(self, d) -> Dict[str, Any]:
         # Helper to safely extract data whether 'd' is a dict or an MP-API object
         def get_val(key):
@@ -1257,6 +1309,7 @@ class MaterialsProject:
             struct = Structure.from_dict(raw_struct)
             
         lat = struct.lattice
+        avg_bond_length, max_bond_length = self._compute_bond_length_stats(struct)
 
         # 2. Symmetry Handling
         sym = get_val("symmetry")
@@ -1318,6 +1371,8 @@ class MaterialsProject:
             "volume": safe_float(struct.volume),
             "num_sites": int(len(struct)),
             "energy_above_hull": safe_float(get_val("energy_above_hull")),
+            "avg_bond_length": safe_float(avg_bond_length),
+            "max_bond_length": safe_float(max_bond_length),
         }
 
     def _get_structures(self) -> List[Structure]:
