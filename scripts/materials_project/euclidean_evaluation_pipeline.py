@@ -16,7 +16,6 @@ from pymatgen.core import Structure, Element
 from sklearn.cluster import DBSCAN, KMeans, SpectralClustering
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from sklearn.manifold import TSNE, Isomap
-from dbcv import dbcv
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import kneighbors_graph
@@ -29,14 +28,57 @@ from ase import Atoms
 from ase.neighborlist import neighbor_list
 from loguru import logger
 
-from src.datasets import MaterialsProject
+from src.datasets import MaterialsProject, QM9Dataset
 
 
-INVARIANT_FEATURES = [
+INVARIANT_FEATURES_MATERIALS = [
     "z", "en", "coord", "avg_neighbor_dist", "vol_per_atom", "mass", "rad",
     "mendeleev", "std_neighbor_dist", "min_neighbor_dist",
     "max_neighbor_dist", "ea", "ion_en", "vdw_rad", "melt_pt", "mol_vol",
 ]
+INVARIANT_FEATURES_QM9 = [
+    "z", "en", "coord", "avg_neighbor_dist", "mass", "rad",
+    "mendeleev", "std_neighbor_dist", "min_neighbor_dist",
+    "max_neighbor_dist", "ea", "ion_en", "vdw_rad",
+]
+# Backward compatible alias (defaults to materials).
+INVARIANT_FEATURES = INVARIANT_FEATURES_MATERIALS
+
+
+def _detect_dataset_kind(df: pl.DataFrame) -> str:
+    if "raw_structure" in df.columns or "material_id" in df.columns:
+        return "materials"
+    if "mol_id" in df.columns or "canonical_smiles" in df.columns or "smiles" in df.columns:
+        return "qm9"
+    return "unknown"
+
+
+def _default_invariant_features(df: pl.DataFrame) -> List[str]:
+    kind = _detect_dataset_kind(df)
+    if kind == "materials":
+        return INVARIANT_FEATURES_MATERIALS
+    if kind == "qm9":
+        return INVARIANT_FEATURES_QM9
+    return INVARIANT_FEATURES
+
+
+_QM9_FRAMES_CACHE: Dict[str, List[Atoms]] = {}
+
+
+def _qm9_frames_cache_key(df: pl.DataFrame) -> str:
+    if "mol_id" in df.columns:
+        ids = df["mol_id"].cast(pl.Utf8).to_list()
+        joined = "|".join(ids)
+        return hashlib.md5(joined.encode("utf-8")).hexdigest()
+    if "canonical_smiles" in df.columns:
+        smiles = df["canonical_smiles"].cast(pl.Utf8).to_list()
+        joined = "|".join(smiles)
+        return hashlib.md5(joined.encode("utf-8")).hexdigest()
+    if "smiles" in df.columns:
+        smiles = df["smiles"].cast(pl.Utf8).to_list()
+        joined = "|".join(smiles)
+        return hashlib.md5(joined.encode("utf-8")).hexdigest()
+    return hashlib.md5(str(len(df)).encode("utf-8")).hexdigest()
 
 def _compute_gap_statistic(X: np.ndarray, k: int, orig_inertia: float, n_refs: int = 5) -> float:
     """Computes the Gap Statistic comparing original inertia to uniform reference distributions."""
@@ -67,10 +109,8 @@ def _compute_ncut(X: np.ndarray, labels: np.ndarray, n_neighbors: int = 10) -> f
     return ncut
 
 
-def get_overall_chemical_coherence(df, labels):
-    df = df.with_columns(pl.Series(name="labels", values=labels))
-
-    continuous_features = [
+def _infer_coherence_features(df: pl.DataFrame) -> Tuple[List[str], Optional[str]]:
+    materials_cont = [
         "band_gap",
         "density",
         "energy_per_atom",
@@ -78,11 +118,38 @@ def get_overall_chemical_coherence(df, labels):
         "volume",
         "energy_above_hull",
     ]
+    if all(c in df.columns for c in materials_cont) and "is_metal" in df.columns:
+        return materials_cont, "is_metal"
 
-    discrete_feature = "is_metal"
+    qm9_cont_default = [
+        "gap", "homo", "lumo", "u0", "u", "h", "g", "cv", "mu", "alpha", "zpve", "r2"
+    ]
+    qm9_cont = [c for c in qm9_cont_default if c in df.columns]
+    if qm9_cont:
+        return qm9_cont, None
+
+    return [], None
+
+
+def get_overall_chemical_coherence(
+    df,
+    labels,
+    continuous_features: Optional[List[str]] = None,
+    discrete_feature: Optional[str] = None,
+):
+    df = df.with_columns(pl.Series(name="labels", values=labels))
+
+    if continuous_features is None and discrete_feature is None:
+        continuous_features, discrete_feature = _infer_coherence_features(df)
+
+    if not continuous_features and not discrete_feature:
+        return {}, float("nan")
 
     scaler = StandardScaler()
-    scaled_values = scaler.fit_transform(df.select(continuous_features).to_numpy())
+    if continuous_features:
+        scaled_values = scaler.fit_transform(df.select(continuous_features).to_numpy())
+    else:
+        scaled_values = np.empty((df.height, 0))
 
     df_scaled = df.with_columns(
         [
@@ -93,37 +160,43 @@ def get_overall_chemical_coherence(df, labels):
 
     cluster_sizes = df_scaled.group_by("labels").agg(pl.len().alias("count"))
 
-    cluster_std = (
-        df_scaled
-        .group_by("labels")
-        .agg([
-            pl.col(f).std().fill_null(0.0).alias(f)
-            for f in continuous_features
-        ])
-    )
-
-    cluster_coherence = cluster_std.with_columns(
-        [(1 / (1 + pl.col(f))).alias(f) for f in continuous_features]
-    )
-
-    metal_coherence = (
-        df_scaled
-        .group_by("labels")
-        .agg(
-            pl.col(discrete_feature).mean().alias("metal_fraction")
+    if continuous_features:
+        cluster_std = (
+            df_scaled
+            .group_by("labels")
+            .agg([
+                pl.col(f).std().fill_null(0.0).alias(f)
+                for f in continuous_features
+            ])
         )
-        .with_columns(
-            pl.max_horizontal(
-                pl.col("metal_fraction"),
-                1 - pl.col("metal_fraction")
-            ).alias(discrete_feature)
+
+        cluster_coherence = cluster_std.with_columns(
+            [(1 / (1 + pl.col(f))).alias(f) for f in continuous_features]
         )
-        .select(["labels", discrete_feature])
-    )
+    else:
+        cluster_coherence = df_scaled.select("labels").unique()
+
+    if discrete_feature:
+        metal_coherence = (
+            df_scaled
+            .group_by("labels")
+            .agg(
+                pl.col(discrete_feature).mean().alias("metal_fraction")
+            )
+            .with_columns(
+                pl.max_horizontal(
+                    pl.col("metal_fraction"),
+                    1 - pl.col("metal_fraction")
+                ).alias(discrete_feature)
+            )
+            .select(["labels", discrete_feature])
+        )
+    else:
+        metal_coherence = None
 
     cluster_scores = (
         cluster_coherence
-        .join(metal_coherence, on="labels")
+        .join(metal_coherence, on="labels") if metal_coherence is not None else cluster_coherence
         .join(cluster_sizes, on="labels")
     )
 
@@ -131,7 +204,7 @@ def get_overall_chemical_coherence(df, labels):
 
     results = {}
 
-    for feature in continuous_features + [discrete_feature]:
+    for feature in continuous_features + ([discrete_feature] if discrete_feature else []):
         values = cluster_scores[feature].to_numpy()
         results[feature] = float(np.average(values, weights=weights))
 
@@ -158,7 +231,13 @@ def _compute_invariant_feature_matrix_materials(
         distances[i].append(d)
 
     features = []
-    vol_per_atom = frame.get_volume() / len(frame)
+    if len(frame) == 0:
+        vol_per_atom = 0.0
+    else:
+        try:
+            vol_per_atom = float(frame.get_volume()) / len(frame)
+        except Exception:
+            vol_per_atom = 0.0
 
     for i, atom in enumerate(frame):
         z = atom.number
@@ -216,32 +295,101 @@ def _compute_invariant_feature_matrix_materials(
     return np.array(features).T
 
 
+def _build_qm9_frames_from_df(
+    df: pl.DataFrame,
+    seed: int = 40,
+    invariant: bool = True,
+) -> List[Atoms]:
+    smiles_col = "canonical_smiles" if "canonical_smiles" in df.columns else "smiles"
+    if smiles_col not in df.columns:
+        raise ValueError("QM9 embedding requires a smiles column.")
+
+    frames: List[Atoms] = []
+    for row in df.iter_rows(named=True):
+        smiles = row[smiles_col]
+        mol_id = row.get("mol_id")
+        mol = QM9Dataset._embed_molecule(
+            smiles=smiles,
+            seed=seed,
+            invariant=invariant,
+        )
+        if mol is None:
+            raise ValueError(f"QM9 embedding failed for mol_id={mol_id} smiles={smiles}")
+
+        conf = mol.GetConformer()
+        symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
+        positions = conf.GetPositions()
+        charges = np.array(
+            [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
+            dtype=np.float64,
+        )
+
+        atoms = Atoms(symbols=symbols, positions=positions)
+        atoms.set_initial_charges(charges)
+        atoms.arrays["partial_charge"] = charges
+        atoms.arrays["mass"] = atoms.get_masses()
+        if mol_id is not None:
+            atoms.info["mol_id"] = mol_id
+        atoms.info["smiles"] = smiles
+        frames.append(atoms)
+
+    return frames
+
+
 def build_invariant_matrix(
     df: pl.DataFrame,
     cutoff: float = 3.0,
     aggregated: bool = False,
     feature_keys: Optional[list] = None,
+    frames: Optional[List[Atoms]] = None,
+    qm9_seed: int = 40,
+    qm9_invariant: bool = True,
+    cache_qm9_frames: bool = True,
 ) -> list:
     """
-    Iterates through the materials dataframe, converts JSON structures to ASE Atoms,
-    and computes the D x N invariant feature matrix for each material.
+    Iterates through the materials/QM9 dataframe, converts structures (or embeds molecules)
+    to ASE Atoms, and computes the D x N invariant feature matrix for each item.
     """
     if feature_keys is None:
-        feature_keys = INVARIANT_FEATURES
+        feature_keys = _default_invariant_features(df)
 
-    adaptor = AseAtomsAdaptor()
     invariant_matrices = []
+    kind = _detect_dataset_kind(df)
 
-    for struct_json in df["raw_structure"]:
-        struct = Structure.from_dict(json.loads(struct_json))
-        atoms = adaptor.get_atoms(struct)
-        matrix = _compute_invariant_feature_matrix_materials(
-            atoms,
-            cutoff=cutoff,
-            aggregated=aggregated,
-            feature_keys=feature_keys,
-        )
-        invariant_matrices.append(matrix)
+    if frames is None and kind == "qm9":
+        cache_key = _qm9_frames_cache_key(df)
+        if cache_qm9_frames and cache_key in _QM9_FRAMES_CACHE:
+            frames = _QM9_FRAMES_CACHE[cache_key]
+        else:
+            frames = _build_qm9_frames_from_df(
+                df,
+                seed=qm9_seed,
+                invariant=qm9_invariant,
+            )
+            if cache_qm9_frames:
+                _QM9_FRAMES_CACHE[cache_key] = frames
+
+    if frames is not None:
+        for atoms in frames:
+            matrix = _compute_invariant_feature_matrix_materials(
+                atoms,
+                cutoff=cutoff,
+                aggregated=aggregated,
+                feature_keys=feature_keys,
+            )
+            invariant_matrices.append(matrix)
+    else:
+        adaptor = AseAtomsAdaptor()
+        for struct_json in df["raw_structure"]:
+            struct = Structure.from_dict(json.loads(struct_json))
+            atoms = adaptor.get_atoms(struct)
+            matrix = _compute_invariant_feature_matrix_materials(
+                atoms,
+                cutoff=cutoff,
+                aggregated=aggregated,
+                feature_keys=feature_keys,
+            )
+            invariant_matrices.append(matrix)
 
     return invariant_matrices
 
@@ -320,6 +468,7 @@ def evaluate_hierarchical_combinations(
     k_max: int = 20,
     features: Optional[List[str]] = None,
     mode: str = "invariant",
+    output_base_dir: str = "figures/materials/clustering",
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -330,7 +479,7 @@ def evaluate_hierarchical_combinations(
 
     if mode == "soap":
         items = _soap_items(df)
-        output_dir = Path("figures/materials/clustering/hierarchical/soap_reduced")
+        output_dir = Path(output_base_dir) / "hierarchical" / "soap_reduced"
         logger.info("--- HIERARCHICAL (SOAP) ---")
         for name, emb in tqdm(items, desc="Evaluating Hierarchical (SOAP)"):
             scaled_matrix = _scaled_matrix(emb)
@@ -371,7 +520,7 @@ def evaluate_hierarchical_combinations(
             })
     else:
         if features is None:
-            features = INVARIANT_FEATURES
+            features = _default_invariant_features(df)
 
         logger.info("--- HIERARCHICAL STAGE 1: Preliminary Feature Screening ---")
         screened_features, dropped = _screen_correlated_invariant_features(df, features)
@@ -381,7 +530,7 @@ def evaluate_hierarchical_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced hierarchical search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path("figures/materials/clustering/hierarchical")
+        output_dir = Path(output_base_dir) / "hierarchical"
         logger.info("--- HIERARCHICAL STAGE 2 & 3: Statistical Evaluation & k Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating Hierarchical"):
@@ -477,6 +626,7 @@ def evaluate_kmeans_combinations(
     k_max: int = 20,
     features: Optional[List[str]] = None,
     mode: str = "invariant",
+    output_base_dir: str = "figures/materials/clustering",
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -487,7 +637,7 @@ def evaluate_kmeans_combinations(
 
     if mode == "soap":
         items = _soap_items(df)
-        output_dir = Path("figures/materials/clustering/kmeans/soap_reduced")
+        output_dir = Path(output_base_dir) / "kmeans" / "soap_reduced"
         logger.info("--- KMEANS (SOAP) ---")
         for name, emb in tqdm(items, desc="Evaluating KMeans (SOAP)"):
             scaled_matrix = _scaled_matrix(emb)
@@ -530,7 +680,7 @@ def evaluate_kmeans_combinations(
             })
     else:
         if features is None:
-            features = INVARIANT_FEATURES
+            features = _default_invariant_features(df)
 
         logger.info("--- KMEANS STAGE 1: Preliminary Feature Screening ---")
         screened_features, dropped = _screen_correlated_invariant_features(df, features)
@@ -540,7 +690,7 @@ def evaluate_kmeans_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced KMeans search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path("figures/materials/clustering/kmeans")
+        output_dir = Path(output_base_dir) / "kmeans"
         logger.info("--- KMEANS STAGE 2 & 3: Statistical Evaluation & DB Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating KMeans"):
@@ -617,8 +767,9 @@ def evaluate_kmeans_combinations(
     plt.xlabel("Silhouette Score (Higher is Better)")
     plt.ylabel("Feature Combination")
 
+    k_col = "Optimal k (DB)" if "Optimal k (DB)" in top_20.columns else "Optimal k (Silhouette)"
     for index, (_, row) in enumerate(top_20.iterrows()):
-        annot_text = f"k={int(row['Optimal k (DB)'])} | DB: {row['Davies-Bouldin']:.2f}"
+        annot_text = f"k={int(row[k_col])} | DB: {row['Davies-Bouldin']:.2f}"
         plt.text(row["Silhouette"] + 0.005, index, annot_text, va="center", color="black", fontsize=9)
 
     plt.tight_layout()
@@ -633,6 +784,7 @@ def evaluate_spectral_combinations(
     k_max: int = 20,
     features: Optional[List[str]] = None,
     mode: str = "invariant",
+    output_base_dir: str = "figures/materials/clustering",
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -643,7 +795,7 @@ def evaluate_spectral_combinations(
 
     if mode == "soap":
         items = _soap_items(df)
-        output_dir = Path("figures/materials/clustering/spectral/soap_reduced")
+        output_dir = Path(output_base_dir) / "spectral" / "soap_reduced"
         logger.info("--- SPECTRAL (SOAP) ---")
         for name, emb in tqdm(items, desc="Evaluating Spectral (SOAP)"):
             scaled_matrix = _scaled_matrix(emb)
@@ -690,7 +842,7 @@ def evaluate_spectral_combinations(
             })
     else:
         if features is None:
-            features = INVARIANT_FEATURES
+            features = _default_invariant_features(df)
 
         logger.info("--- SPECTRAL STAGE 1: Preliminary Feature Screening ---")
         screened_features, dropped = _screen_correlated_invariant_features(df, features)
@@ -700,7 +852,7 @@ def evaluate_spectral_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced Spectral search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path("figures/materials/clustering/spectral")
+        output_dir = Path(output_base_dir) / "spectral"
         logger.info("--- SPECTRAL STAGE 2 & 3: Statistical Evaluation & k Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating Spectral"):
@@ -780,7 +932,7 @@ def evaluate_spectral_combinations(
     plt.ylabel("Feature Combination")
 
     for index, (_, row) in enumerate(top_20.iterrows()):
-        annot_text = f"k={int(row['Optimal k'])} | DB: {row['Davies-Bouldin']:.2f}"
+        annot_text = f"k={int(row['Optimal k (NCut)'])} | NCut: {row['NCut Score']:.3f}"
         plt.text(row["Silhouette"] + 0.005, index, annot_text, va="center", color="black", fontsize=9)
 
     plt.tight_layout()
@@ -795,6 +947,7 @@ def evaluate_dbscan_combinations(
     min_samples: int = 5,
     features: Optional[List[str]] = None,
     mode: str = "invariant",
+    output_base_dir: str = "figures/materials/clustering",
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -807,7 +960,7 @@ def evaluate_dbscan_combinations(
 
     if mode == "soap":
         items = _soap_items(df)
-        output_dir = Path("figures/materials/clustering/dbscan/soap_reduced")
+        output_dir = Path(output_base_dir) / "dbscan" / "soap_reduced"
         logger.info("--- DBSCAN (SOAP) ---")
 
         for name, emb in tqdm(items, desc="Evaluating DBSCAN (SOAP)"):
@@ -860,7 +1013,7 @@ def evaluate_dbscan_combinations(
             })
     else:
         if features is None:
-            features = INVARIANT_FEATURES
+            features = _default_invariant_features(df)
 
         logger.info("--- DBSCAN STAGE 1: Preliminary Feature Screening ---")
         screened_features, dropped = _screen_correlated_invariant_features(df, features)
@@ -870,7 +1023,7 @@ def evaluate_dbscan_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced DBSCAN search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path("figures/materials/clustering/dbscan")
+        output_dir = Path(output_base_dir) / "dbscan"
         logger.info("--- DBSCAN STAGE 2 & 3: Statistical Evaluation & Eps Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating DBSCAN"):
@@ -990,6 +1143,10 @@ def _distance_cache_key(df: pl.DataFrame, cache_tag: Optional[str] = None) -> st
         ids = df["material_id"].cast(pl.Utf8).to_list()
         joined = "|".join(ids)
         digest = hashlib.md5(joined.encode("utf-8")).hexdigest()
+    elif "mol_id" in df.columns:
+        ids = df["mol_id"].cast(pl.Utf8).to_list()
+        joined = "|".join(ids)
+        digest = hashlib.md5(joined.encode("utf-8")).hexdigest()
     else:
         digest = hashlib.md5(str(len(df)).encode("utf-8")).hexdigest()
     return f"{base}_{len(df)}_{digest[:12]}"
@@ -1054,10 +1211,10 @@ if __name__ == "__main__":
     df = mp.load(limit=400)
 
     # Invariant-only evaluations
-    #evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20)
-    #evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20)
-    #evaluate_kmeans_combinations(df, k_min=2, k_max=20)
-    #evaluate_spectral_combinations(df, k_min=2, k_max=20)
+    evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20)
+    evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20)
+    evaluate_kmeans_combinations(df, k_min=2, k_max=20)
+    evaluate_spectral_combinations(df, k_min=2, k_max=20)
     evaluate_dbscan_combinations(df, min_samples=3)
 
     # SOAP evaluations using the same functions
