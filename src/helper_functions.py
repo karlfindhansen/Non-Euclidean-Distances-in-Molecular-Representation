@@ -234,8 +234,95 @@ def _open_in_browser(path_or_url):
         print(f"Could not open browser automatically: {exc}")
 
 
+def _build_chemiscope_frames(df: pl.DataFrame, qm9_seed: int = 40, qm9_invariant: bool = True):
+    """Build ASE frames for either materials (raw_structure) or QM9 (smiles)."""
+    if "raw_structure" in df.columns:
+        frames = []
+        adaptor = AseAtomsAdaptor()
+        for struct_json in df["raw_structure"]:
+            struct = Structure.from_dict(json.loads(struct_json))
+            frames.append(adaptor.get_atoms(struct))
+        return frames, list(range(df.height)), "materials"
+
+    smiles_col = "canonical_smiles" if "canonical_smiles" in df.columns else "smiles" if "smiles" in df.columns else None
+    if smiles_col is None:
+        raise ValueError("DataFrame must contain either 'raw_structure' or a SMILES column.")
+
+    # Local import avoids circular imports at module load time.
+    from src.datasets import QM9Dataset
+
+    frames = []
+    valid_indices = []
+    for i, row in enumerate(df.iter_rows(named=True)):
+        smiles = row.get(smiles_col)
+        mol_id = row.get("mol_id")
+        if not smiles:
+            continue
+
+        mol = QM9Dataset._embed_molecule(smiles=smiles, seed=qm9_seed, invariant=qm9_invariant)
+        if mol is None:
+            logger.warning(f"QM9 embedding failed for mol_id={mol_id} smiles={smiles}")
+            continue
+
+        conf = mol.GetConformer()
+        symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
+        positions = conf.GetPositions()
+        charges = np.array(
+            [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
+            dtype=np.float64,
+        )
+
+        atoms = Atoms(symbols=symbols, positions=positions)
+        atoms.set_initial_charges(charges)
+        atoms.arrays["partial_charge"] = charges
+        atoms.arrays["mass"] = atoms.get_masses()
+        if mol_id is not None:
+            atoms.info["mol_id"] = mol_id
+        atoms.info["smiles"] = smiles
+        frames.append(atoms)
+        valid_indices.append(i)
+
+    return frames, valid_indices, "qm9"
+
+
 def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     print("Running " + reduction_method + " dimensionality reduction...")
+
+    dist_matrix = np.asarray(dist_matrix)
+    labels = np.asarray(labels)
+    if labels.shape[0] != df.height:
+        raise ValueError(
+            f"labels length ({labels.shape[0]}) must match dataframe rows ({df.height})."
+        )
+
+    print("Converting structures/molecules to ASE Atoms for Chemiscope...")
+    frames, valid_indices, dataset_kind = _build_chemiscope_frames(df)
+    if not frames:
+        raise ValueError("No valid structures/molecules could be converted for Chemiscope.")
+
+    # Keep dataframe/labels/distances aligned with successfully built frames.
+    if len(valid_indices) != df.height:
+        df = df[valid_indices]
+        labels = labels[valid_indices]
+        if dist_matrix.ndim == 2:
+            if dist_matrix.shape[0] == dist_matrix.shape[1]:
+                dist_matrix = dist_matrix[np.ix_(valid_indices, valid_indices)]
+            else:
+                dist_matrix = dist_matrix[valid_indices]
+
+    if dist_matrix.shape[0] != len(frames):
+        min_n = min(dist_matrix.shape[0], len(frames), labels.shape[0], df.height)
+        logger.warning(
+            "Chemiscope alignment mismatch; truncating to first "
+            f"{min_n} entries (frames={len(frames)}, dist={dist_matrix.shape}, labels={labels.shape[0]}, df={df.height})."
+        )
+        frames = frames[:min_n]
+        labels = labels[:min_n]
+        df = df.head(min_n)
+        if dist_matrix.ndim == 2 and dist_matrix.shape[0] == dist_matrix.shape[1]:
+            dist_matrix = dist_matrix[:min_n, :min_n]
+        else:
+            dist_matrix = dist_matrix[:min_n]
 
     if reduction_method == 't-SNE':
         if dist_matrix.shape[1] != dist_matrix.shape[0]:
@@ -264,36 +351,53 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     else:
         raise ValueError(f"Unsupported reduction method: {reduction_method}")
 
-    print("Converting Pymatgen structures to ASE Atoms for Chemiscope...")
-    frames = []
-    adaptor = AseAtomsAdaptor()
-    
-    for struct_json in df["raw_structure"]:
-        struct = Structure.from_dict(json.loads(struct_json))
-        atoms = adaptor.get_atoms(struct)
-        frames.append(atoms)
-
     print("Assembling properties for Chemiscope...")
-  
+
     properties = {
         f"{reduction_method}_1": coords[:, 0],
         f"{reduction_method}_2": coords[:, 1],
         "Cluster": labels.astype(int),
-        "Formula": df["formula_pretty"].to_list(),
-        "Band_Gap": df["band_gap"].to_list(),
-        "Energy_per_Atom": df["energy_per_atom"].to_list(),
-        "Is_Metal": df["is_metal"].to_list(),
-        "crystal_system": df["crystal_system"].to_list(),
-        "Density": df["density"].to_list(),
-        "Space_Group": df["space_group"].to_list(),
-        "energy_above_hull": df["energy_above_hull"].to_list(),
-        "formation_energy_per_atom": df["formation_energy_per_atom"].to_list(),
-        "volume": df["volume"].to_list(),
-        "num_sites": df["num_sites"].to_list(),
-        "max_en_diff":df["max_en_diff"].to_list(),
-        "avg_bond_length": df["avg_bond_length"].to_list(),
-        "max_bond_length": df["max_bond_length"].to_list(),
     }
+
+    if dataset_kind == "materials":
+        materials_cols = {
+            "Formula": "formula_pretty",
+            "Band_Gap": "band_gap",
+            "Energy_per_Atom": "energy_per_atom",
+            "Is_Metal": "is_metal",
+            "crystal_system": "crystal_system",
+            "Density": "density",
+            "Space_Group": "space_group",
+            "energy_above_hull": "energy_above_hull",
+            "formation_energy_per_atom": "formation_energy_per_atom",
+            "volume": "volume",
+            "num_sites": "num_sites",
+            "max_en_diff": "max_en_diff",
+            "avg_bond_length": "avg_bond_length",
+            "max_bond_length": "max_bond_length",
+            "material_id": "material_id",
+        }
+        for prop_name, col_name in materials_cols.items():
+            if col_name in df.columns:
+                properties[prop_name] = df[col_name].to_list()
+    else:
+        qm9_cols = {
+            "mol_id": "mol_id",
+            "Formula": "formula",
+            "smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
+            "num_atoms": "num_atoms",
+            "structure_class": "structure_class",
+            "functional_groups": "functional_groups",
+            "gap": "gap",
+            "homo": "homo",
+            "lumo": "lumo",
+            "mu": "mu",
+            "alpha": "alpha",
+            "avg_bond_length": "avg_bond_length",
+        }
+        for prop_name, col_name in qm9_cols.items():
+            if col_name in df.columns:
+                properties[prop_name] = df[col_name].to_list()
 
     settings = {
         "map": {
@@ -303,26 +407,29 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             #"symbol": "circle",
             "size": {"factor": 35}
         },
-        "structure": [
-            {"keepOrientation": True, "supercell": [2, 2, 2]}
-        ]
+        "structure": [{"keepOrientation": True}],
     }
+    if dataset_kind == "materials":
+        settings["structure"][0]["supercell"] = [2, 2, 2]
 
     print("Generating Chemiscope widget...")
+    title_prefix = "Materials Project" if dataset_kind == "materials" else "QM9"
+    output_prefix = "materials" if dataset_kind == "materials" else "qm9"
+
     if hasattr(chemiscope, "write_html"):
-        output_html = f"materials_{reduction_method}_clustering.html"
+        output_html = f"{output_prefix}_{reduction_method}_clustering.html"
         chemiscope.write_html(
             output_html,
             frames=frames,
             properties=properties,
             settings=settings,
-            title=f"Materials Project - SOAP {reduction_method} Clustering",
+            title=f"{title_prefix} - {reduction_method} Clustering",
         )
         print(f"Saved interactive viewer to: {output_html}")
         _open_in_browser(output_html)
         return chemiscope.show(frames=frames, properties=properties, settings=settings)
 
-    output_json = f"materials_{reduction_method}_clustering.json"
+    output_json = f"{output_prefix}_{reduction_method}_clustering.json"
     if not hasattr(chemiscope, "write_input"):
         raise AttributeError(
             "chemiscope does not provide write_html or write_input; "
@@ -334,7 +441,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         structures=frames,
         properties=properties,
         settings=settings,
-        metadata={"name": f"Materials Project - SOAP {reduction_method} Clustering"},
+        metadata={"name": f"{title_prefix} - {reduction_method} Clustering"},
     )
     print(f"Saved Chemiscope input to: {output_json}")
     viewer = chemiscope.show_input(output_json)
@@ -344,7 +451,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     else:
         print(
             "If the viewer does not open automatically, run "
-            f"`chemiscope show materials_{reduction_method}_clustering.json`."
+            f"`chemiscope show {output_prefix}_{reduction_method}_clustering.json`."
         )
     return viewer
 

@@ -302,7 +302,7 @@ def _build_qm9_frames_from_df(
 ) -> List[Atoms]:
     smiles_col = "canonical_smiles" if "canonical_smiles" in df.columns else "smiles"
     if smiles_col not in df.columns:
-        raise ValueError("QM9 embedding requires a smiles column.")
+        logger.warning("QM9 embedding requires a smiles column.")
 
     frames: List[Atoms] = []
     for row in df.iter_rows(named=True):
@@ -314,7 +314,8 @@ def _build_qm9_frames_from_df(
             invariant=invariant,
         )
         if mol is None:
-            raise ValueError(f"QM9 embedding failed for mol_id={mol_id} smiles={smiles}")
+            logger.warning(f"QM9 embedding failed for mol_id={mol_id} smiles={smiles}")
+            continue
 
         conf = mol.GetConformer()
         symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
