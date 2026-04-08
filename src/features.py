@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.distance import pdist
 import polars as pl
 import torch
+
 import selfies as sf
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -11,6 +12,7 @@ from transformers import AutoTokenizer, AutoModel
 from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
+from mendeleev import element
 from dscribe.descriptors import SOAP, ACSF, CoulombMatrix
 
 class MolecularFeaturizer:
@@ -158,10 +160,11 @@ class MolecularFeaturizer:
         if species is None: species = ["C", "H", "O", "N", "F"]
         
         logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max})...")
-        
+        unique_elements = set(species)
+        weighting = {el: element(el).atomic_number for el in unique_elements}
         soap_engine = SOAP(
             species=species, periodic=False, 
-            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma
+            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, average='inner', compression={"mode": "mu2", "species_weighting": weighting}
         )
 
         def _compute_single_soap(s):

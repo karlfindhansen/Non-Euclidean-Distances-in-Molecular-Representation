@@ -326,11 +326,11 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
 
     if reduction_method == 't-SNE':
         if dist_matrix.shape[1] != dist_matrix.shape[0]:
-            tsne = TSNE(n_components=2, metric='euclidean', init='random', random_state=42, perplexity=30)
+            tsne = TSNE(n_components=2, random_state=42)
         else:
-            tsne = TSNE(n_components=2, metric='precomputed', init='random', random_state=42, perplexity=30)
+            tsne = TSNE(n_components=2, metric='precomputed',random_state=42)
         coords = tsne.fit_transform(dist_matrix)
-    elif reduction_method == 'UMAP':
+    elif reduction_method in ['UMAP', 'umap']:
         if dist_matrix.shape[1] != dist_matrix.shape[0]:
             reducer = UMAP(metric='euclidean', random_state=42)
         else:
@@ -386,6 +386,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             "Formula": "formula",
             "smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
             "num_atoms": "num_atoms",
+            "coordination": "coordination",
             "structure_class": "structure_class",
             "functional_groups": "functional_groups",
             "gap": "gap",

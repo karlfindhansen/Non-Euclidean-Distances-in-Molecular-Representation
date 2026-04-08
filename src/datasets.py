@@ -105,6 +105,8 @@ class QM9Dataset:
         self.df = pl.DataFrame()
         self.scaler = StandardScaler()
         self.is_scaled = False
+        self._electron_affinity_cache: Dict[int, float] = {}
+        self._ionization_energy_cache: Dict[int, float] = {}
         
         ensure_directory(self.root)
         
@@ -394,6 +396,28 @@ class QM9Dataset:
         fraction_csp1 = float(num_sp_carbons / denom_c)
         fraction_csp2 = float(num_sp2_carbons / denom_c)
         fraction_csp3 = float(num_sp3_carbons / denom_c)
+        coordination = float(np.mean([atom.GetDegree() for atom in mol.GetAtoms()])) if mol.GetNumAtoms() > 0 else 0.0
+        electron_affinities = []
+        ionization_energies = []
+        for atom in mol.GetAtoms():
+            atomic_num = int(atom.GetAtomicNum())
+            if atomic_num not in self._electron_affinity_cache:
+                try:
+                    ea_val = getattr(element(atomic_num), "electron_affinity", 0.0) or 0.0
+                    self._electron_affinity_cache[atomic_num] = float(ea_val)
+                except Exception:
+                    self._electron_affinity_cache[atomic_num] = 0.0
+            if atomic_num not in self._ionization_energy_cache:
+                try:
+                    ion_list = getattr(element(atomic_num), "ionenergies", None)
+                    first_ion = ion_list.get(1, 0.0) if isinstance(ion_list, dict) else 0.0
+                    self._ionization_energy_cache[atomic_num] = float(first_ion or 0.0)
+                except Exception:
+                    self._ionization_energy_cache[atomic_num] = 0.0
+            electron_affinities.append(self._electron_affinity_cache[atomic_num])
+            ionization_energies.append(self._ionization_energy_cache[atomic_num])
+        election_affinity = float(np.mean(electron_affinities)) if electron_affinities else 0.0
+        ionization_energies_value = float(np.mean(ionization_energies)) if ionization_energies else 0.0
 
         mol_dict = {
             "mol_id": f"qm9_{i}",
@@ -409,11 +433,14 @@ class QM9Dataset:
             "mol_weight": int(Descriptors.MolWt(mol)),
             "logp": int(Descriptors.MolLogP(mol)),
             "tpsa": int(Descriptors.TPSA(mol)),
+            "election_affinity": election_affinity,
+            "ionization_energies": ionization_energies_value,
 
             # Structural/Complexity Descriptors
             "num_heavy_atoms": int(mol.GetNumHeavyAtoms()),
             "num_rings": int(rdMolDescriptors.CalcNumRings(mol)),
             "num_aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(mol)),
+            "coordination": coordination,
 
             # Flexibility/Complexity & newly added string/graph complexity metrics
             "num_rotatable_bonds": int(Descriptors.NumRotatableBonds(mol)),
@@ -465,9 +492,85 @@ class QM9Dataset:
         else:
             full_df = self._process_raw_qm9()
 
-        self.df = self._sample_qm9_df(full_df, self.subset_size)
-        self._add_requested_descriptors()
+        needs_non_null_descriptor_filter = self._requires_non_null_descriptor_rows()
+        if not needs_non_null_descriptor_filter:
+            self.df = self._sample_qm9_df(full_df, self.subset_size)
+            self._add_requested_descriptors()
+            return self.df
+
+        candidate_target = int(
+            min(
+                full_df.height,
+                max(
+                    self.subset_size,
+                    np.ceil(self.subset_size * self.sampling_buffer),
+                ),
+            )
+        )
+        attempt = 0
+        while True:
+            attempt += 1
+            self.df = self._sample_qm9_df(full_df, candidate_target)
+            self._add_requested_descriptors()
+            self._drop_rows_with_null_required_descriptors()
+
+            if self.df.height >= self.subset_size:
+                self.df = self.df.head(self.subset_size)
+                logger.info(
+                    "QM9 descriptor null-filtering complete: "
+                    f"attempts={attempt}, requested_limit={self.subset_size}, returned_rows={self.df.height}."
+                )
+                return self.df
+
+            if candidate_target >= full_df.height:
+                logger.warning(
+                    "Unable to reach requested QM9 limit after filtering null descriptor rows. "
+                    f"requested_limit={self.subset_size}, returned_rows={self.df.height}, "
+                    f"descriptor_cols={self._required_descriptor_columns()}."
+                )
+                return self.df
+
+            candidate_target = int(
+                min(
+                    full_df.height,
+                    max(candidate_target + 1, np.ceil(candidate_target * 1.5)),
+                )
+            )
+            logger.info(
+                "QM9 descriptor filtering needs more candidates; resampling with larger pool "
+                f"(attempt={attempt}, next_candidate_target={candidate_target})."
+            )
+
         return self.df
+
+    def _required_descriptor_columns(self) -> List[str]:
+        cols: List[str] = []
+        if self.add_soap_embedding_flag:
+            cols.append("soap_embedding")
+        if self.add_acsf_embedding_flag:
+            cols.append("acsf_embedding")
+        return cols
+
+    def _requires_non_null_descriptor_rows(self) -> bool:
+        return len(self._required_descriptor_columns()) > 0
+
+    def _drop_rows_with_null_required_descriptors(self) -> None:
+        required_cols = [c for c in self._required_descriptor_columns() if c in self.df.columns]
+        if not required_cols:
+            return
+
+        before = self.df.height
+        mask = pl.lit(True)
+        for col_name in required_cols:
+            mask = mask & pl.col(col_name).is_not_null() & (pl.col(col_name).list.len() > 0)
+
+        self.df = self.df.filter(mask)
+        dropped = before - self.df.height
+        if dropped > 0:
+            logger.info(
+                "Dropped QM9 rows with null/empty descriptor vectors: "
+                f"dropped={dropped}, remaining={self.df.height}, descriptor_cols={required_cols}."
+            )
 
     def _process_raw_qm9(self) -> pl.DataFrame:
         """Downloads and cleans ALL raw QM9 data from Torch Geometric, then caches to parquet."""

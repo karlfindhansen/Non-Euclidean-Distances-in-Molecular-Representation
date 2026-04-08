@@ -16,7 +16,7 @@ from pymatgen.core import Structure, Element
 from sklearn.cluster import DBSCAN, KMeans, SpectralClustering
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from sklearn.manifold import TSNE, Isomap
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, KernelPCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import kneighbors_graph
 from umap import UMAP
@@ -41,6 +41,31 @@ INVARIANT_FEATURES_QM9 = [
     "mendeleev", "std_neighbor_dist", "min_neighbor_dist",
     "max_neighbor_dist", "ea", "ion_en", "vdw_rad",
 ]
+
+CHEMICAL_INVARIANT_FEATURES = {
+    "z",
+    "mass",
+    "rad",
+    "mendeleev",
+    "vdw_rad",
+    "melt_pt",
+    "mol_vol",
+}
+ELECTRONIC_INVARIANT_FEATURES = {
+    "en",
+    "ea",
+    "ion_en",
+}
+STRUCTURAL_INVARIANT_FEATURES = {
+    "coord",
+    "avg_neighbor_dist",
+    "std_neighbor_dist",
+    "min_neighbor_dist",
+    "max_neighbor_dist",
+    "vol_per_atom",
+}
+
+MAX_SOAP_N_COMPONENTS = 50
 # Backward compatible alias (defaults to materials).
 INVARIANT_FEATURES = INVARIANT_FEATURES_MATERIALS
 
@@ -413,10 +438,18 @@ def _screen_correlated_invariant_features(
 
 
 def _iter_invariant_combinations(features: List[str]) -> List[List[str]]:
+    def _has_required_categories(combo: tuple) -> bool:
+        combo_set = set(combo)
+        has_chemical = any(f in CHEMICAL_INVARIANT_FEATURES for f in combo_set)
+        has_electronic = any(f in ELECTRONIC_INVARIANT_FEATURES for f in combo_set)
+        has_structural = any(f in STRUCTURAL_INVARIANT_FEATURES for f in combo_set)
+        return has_chemical and has_electronic and has_structural
+
     combinations_to_test = []
     for r in range(1, len(features) + 1):
         for combo in itertools.combinations(features, r):
-            combinations_to_test.append(list(combo))
+            if _has_required_categories(combo):
+                combinations_to_test.append(list(combo))
     return combinations_to_test
 
 
@@ -445,20 +478,55 @@ def _kneedle_elbow(ks: np.ndarray, values: np.ndarray) -> int:
     return int(ks[idx])
 
 
-def _soap_embeddings(df: pl.DataFrame) -> Dict[str, np.ndarray]:
+def _valid_soap_component_counts(n_samples: int, candidates: Optional[List[int]] = None) -> List[int]:
+    raw_candidates = candidates if candidates is not None else [i for i in range(2, MAX_SOAP_N_COMPONENTS + 1)]
+    cleaned = sorted(
+        {
+            int(c)
+            for c in raw_candidates
+            if isinstance(c, (int, np.integer)) and 2 <= int(c) <= MAX_SOAP_N_COMPONENTS
+        }
+    )
+    if n_samples <= 2:
+        return []
+    return [c for c in cleaned if c < n_samples]
+
+
+def _soap_embeddings(
+    df: pl.DataFrame,
+    n_components_list: Optional[List[int]] = None,
+) -> Dict[str, np.ndarray]:
     soap_array = np.array(df["soap_embedding"].to_list())
-    reducers = get_reducers()
-    return {
-        "soap_raw": soap_array,
-        "soap_pca": reducers["pca"].fit_transform(soap_array),
-        "soap_tsne": reducers["tsne"].fit_transform(soap_array),
-        "soap_umap": reducers["umap"].fit_transform(soap_array),
-        "soap_isomap": reducers["isomap"].fit_transform(soap_array),
-    }
+    embeddings: Dict[str, np.ndarray] = {"soap_raw": soap_array}
+
+    valid_components = _valid_soap_component_counts(
+        n_samples=len(soap_array),
+        candidates=n_components_list,
+    )
+
+    for n_components in valid_components:
+        reducers = get_reducers(n_components=n_components)
+        for reducer_name, reducer in reducers.items():
+            key = f"soap_{reducer_name}_c{n_components}"
+            try:
+                reduced = reducer.fit_transform(soap_array)
+                embeddings[key] = reduced
+                # Backward-compatible aliases for legacy consumers.
+                if n_components == 3:
+                    embeddings[f"soap_{reducer_name}"] = reduced
+            except Exception as e:
+                logger.warning(
+                    f"Skipping SOAP reducer '{reducer_name}' at n_components={n_components}: {e}"
+                )
+
+    return embeddings
 
 
-def _soap_items(df: pl.DataFrame) -> List[Tuple[str, np.ndarray]]:
-    embeddings = _soap_embeddings(df)
+def _soap_items(
+    df: pl.DataFrame,
+    n_components_list: Optional[List[int]] = None,
+) -> List[Tuple[str, np.ndarray]]:
+    embeddings = _soap_embeddings(df, n_components_list=n_components_list)
     return list(embeddings.items())
 
 
@@ -470,6 +538,7 @@ def evaluate_hierarchical_combinations(
     features: Optional[List[str]] = None,
     mode: str = "invariant",
     output_base_dir: str = "figures/materials/clustering",
+    soap_n_components: Optional[List[int]] = None,
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -479,7 +548,7 @@ def evaluate_hierarchical_combinations(
     k_range = range(k_min, k_max + 1)
 
     if mode == "soap":
-        items = _soap_items(df)
+        items = _soap_items(df, n_components_list=soap_n_components)
         output_dir = Path(output_base_dir) / "hierarchical" / "soap_reduced"
         logger.info("--- HIERARCHICAL (SOAP) ---")
         for name, emb in tqdm(items, desc="Evaluating Hierarchical (SOAP)"):
@@ -531,7 +600,7 @@ def evaluate_hierarchical_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced hierarchical search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path(output_base_dir) / "hierarchical"
+        output_dir = Path(output_base_dir) / "hierarchical" / "invariant_features"
         logger.info("--- HIERARCHICAL STAGE 2 & 3: Statistical Evaluation & k Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating Hierarchical"):
@@ -580,8 +649,8 @@ def evaluate_hierarchical_combinations(
         logger.warning("No hierarchical results produced.")
         return
 
-    valid_models = results_df[results_df["Cophenetic Corr"] > 0.8]
-    valid_models = valid_models[valid_models["Silhouette"] > 0.6]
+    valid_models = results_df[results_df["Cophenetic Corr"] > 0.6]
+    valid_models = valid_models[valid_models["Silhouette"] > 0.4]
     valid_models = valid_models.sort_values(by="Silhouette", ascending=False)
 
     if valid_models.empty:
@@ -628,6 +697,7 @@ def evaluate_kmeans_combinations(
     features: Optional[List[str]] = None,
     mode: str = "invariant",
     output_base_dir: str = "figures/materials/clustering",
+    soap_n_components: Optional[List[int]] = None,
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -637,7 +707,7 @@ def evaluate_kmeans_combinations(
     k_range = list(range(k_min, k_max + 1))
 
     if mode == "soap":
-        items = _soap_items(df)
+        items = _soap_items(df, n_components_list=soap_n_components)
         output_dir = Path(output_base_dir) / "kmeans" / "soap_reduced"
         logger.info("--- KMEANS (SOAP) ---")
         for name, emb in tqdm(items, desc="Evaluating KMeans (SOAP)"):
@@ -691,7 +761,7 @@ def evaluate_kmeans_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced KMeans search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path(output_base_dir) / "kmeans"
+        output_dir = Path(output_base_dir) / "kmeans" / "invariant_features"
         logger.info("--- KMEANS STAGE 2 & 3: Statistical Evaluation & DB Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating KMeans"):
@@ -707,8 +777,14 @@ def evaluate_kmeans_combinations(
             labels_by_k = {}
 
             for k in k_range:
+                
                 kmeans = KMeans(n_clusters=k, n_init="auto", random_state=42)
                 labels = kmeans.fit_predict(scaled_matrix)
+
+                if labels is None or len(np.unique(labels)) < 2:
+                    logger.warning(f"Combination [{combo_name}] with k={k} produced zero variance or invalid clusters. Skipping this k.")
+                    continue
+
                 labels_by_k[k] = labels
                 
                 sil = silhouette_score(scaled_matrix, labels)
@@ -717,6 +793,10 @@ def evaluate_kmeans_combinations(
                 db_scores.append(davies_bouldin_score(scaled_matrix, labels))
                 inertias.append(kmeans.inertia_)
                 gap_scores.append(_compute_gap_statistic(scaled_matrix, k, kmeans.inertia_))
+
+            if not silhouettes:
+                logger.warning(f"Combination [{combo_name}] produced no valid clusterings across all k. Skipping.")
+                continue
 
             best_k_sil = k_range[int(np.argmax(silhouettes))]
             best_k_gap = k_range[int(np.argmax(gap_scores))]
@@ -743,7 +823,7 @@ def evaluate_kmeans_combinations(
         logger.warning("No KMeans results produced.")
         return
 
-    valid_models = results_df[results_df["Silhouette"] > 0.6].sort_values(by="Silhouette", ascending=False)
+    valid_models = results_df[results_df["Silhouette"] > 0.4].sort_values(by="Silhouette", ascending=False)
     if valid_models.empty:
         logger.warning("No KMeans combinations met the Silhouette threshold. Falling back to simple sorting.")
         valid_models = results_df.sort_values(by="Silhouette", ascending=False)
@@ -786,6 +866,7 @@ def evaluate_spectral_combinations(
     features: Optional[List[str]] = None,
     mode: str = "invariant",
     output_base_dir: str = "figures/materials/clustering",
+    soap_n_components: Optional[List[int]] = None,
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
@@ -795,7 +876,7 @@ def evaluate_spectral_combinations(
     k_range = list(range(k_min, k_max + 1))
 
     if mode == "soap":
-        items = _soap_items(df)
+        items = _soap_items(df, n_components_list=soap_n_components)
         output_dir = Path(output_base_dir) / "spectral" / "soap_reduced"
         logger.info("--- SPECTRAL (SOAP) ---")
         for name, emb in tqdm(items, desc="Evaluating Spectral (SOAP)"):
@@ -853,7 +934,7 @@ def evaluate_spectral_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced Spectral search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path(output_base_dir) / "spectral"
+        output_dir = Path(output_base_dir) / "spectral" / "invariant_features"
         logger.info("--- SPECTRAL STAGE 2 & 3: Statistical Evaluation & k Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating Spectral"):
@@ -907,7 +988,7 @@ def evaluate_spectral_combinations(
         logger.warning("No Spectral results produced.")
         return
 
-    valid_models = results_df[results_df["Silhouette"] > 0.6].sort_values(by="Silhouette", ascending=False)
+    valid_models = results_df[results_df["Silhouette"] > 0.4].sort_values(by="Silhouette", ascending=False)
     if valid_models.empty:
         logger.warning("No Spectral combinations met the Silhouette threshold. Falling back to simple sorting.")
         valid_models = results_df.sort_values(by="Silhouette", ascending=False)
@@ -945,22 +1026,27 @@ def evaluate_spectral_combinations(
 def evaluate_dbscan_combinations(
     df: pl.DataFrame,
     eps_values: Optional[List[float]] = None,
-    min_samples: int = 5,
+    min_samples_values: Optional[List[int]] = None,
     features: Optional[List[str]] = None,
     mode: str = "invariant",
     output_base_dir: str = "figures/materials/clustering",
+    soap_n_components: Optional[List[int]] = None,
 ):
     """
     Tests invariant feature combinations (mode="invariant") or SOAP projections (mode="soap")
-    using DBSCAN and eps sweep.
+    using DBSCAN and eps/min_samples sweep.
     """
     if eps_values is None:
         eps_values = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    if min_samples_values is None:
+        min_samples_values = [2, 3, 5, 8, 10],
+    else:
+        min_samples_values = sorted(set(min_samples_values))
 
     results = []
 
     if mode == "soap":
-        items = _soap_items(df)
+        items = _soap_items(df, n_components_list=soap_n_components)
         output_dir = Path(output_base_dir) / "dbscan" / "soap_reduced"
         logger.info("--- DBSCAN (SOAP) ---")
 
@@ -974,28 +1060,35 @@ def evaluate_dbscan_combinations(
             best_dbcv = -np.inf
             best_sil = -1.0
             best_labels = None
+            best_min_samples = None
             best_noise_ratio = 1.0
             best_n_clusters = 0
 
-            for eps in eps_values:
-                dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-                labels = dbscan.fit_predict(scaled_matrix)
+            for min_samples_candidate in min_samples_values:
+                for eps in eps_values:
+                    dbscan = DBSCAN(eps=eps, min_samples=min_samples_candidate)
+                    labels = dbscan.fit_predict(scaled_matrix)
 
-                noise_ratio = np.sum(labels == -1) / len(labels)
-                valid_clusters = set(labels) - {-1}
-                n_clusters = len(valid_clusters)
+                    noise_ratio = np.sum(labels == -1) / len(labels)
+                    valid_clusters = set(labels) - {-1}
+                    n_clusters = len(valid_clusters)
 
-                if n_clusters >= 2 and noise_ratio <= 0.50:
-                    sil = silhouette_score(scaled_matrix, labels)
-                    current_dbcv = validity_index(scaled_matrix, labels)
+                    if n_clusters >= 2 and noise_ratio <= 0.50:
+                        sil = silhouette_score(scaled_matrix, labels)
+                        try:
+                            current_dbcv = validity_index(scaled_matrix, labels)
+                        except ValueError as e:
+                            logger.warning(f"Error occurred while computing DBCV for combination {name}: {e}")
+                            continue
 
-                    if current_dbcv > best_dbcv:
-                        best_dbcv = current_dbcv
-                        best_sil = sil
-                        best_eps = eps
-                        best_labels = labels
-                        best_noise_ratio = noise_ratio
-                        best_n_clusters = n_clusters
+                        if current_dbcv > best_dbcv:
+                            best_dbcv = current_dbcv
+                            best_sil = sil
+                            best_eps = eps
+                            best_labels = labels
+                            best_min_samples = min_samples_candidate
+                            best_noise_ratio = noise_ratio
+                            best_n_clusters = n_clusters
 
             if best_labels is None:
                 continue
@@ -1006,6 +1099,7 @@ def evaluate_dbscan_combinations(
                 "Combination": name,
                 "Feature Count": scaled_matrix.shape[1],
                 "Optimal eps": best_eps,
+                "Optimal min_samples": best_min_samples,
                 "Num Clusters": best_n_clusters,
                 "Noise Ratio": best_noise_ratio,
                 "DBCV Score": best_dbcv,
@@ -1024,7 +1118,7 @@ def evaluate_dbscan_combinations(
         combinations_to_test = _iter_invariant_combinations(screened_features)
         logger.info(f"Reduced DBSCAN search space to {len(combinations_to_test)} combinations.")
 
-        output_dir = Path(output_base_dir) / "dbscan"
+        output_dir = Path(output_base_dir) / "dbscan" / "invariant_features"
         logger.info("--- DBSCAN STAGE 2 & 3: Statistical Evaluation & Eps Selection ---")
 
         for feature_keys in tqdm(combinations_to_test, desc="Evaluating DBSCAN"):
@@ -1039,28 +1133,31 @@ def evaluate_dbscan_combinations(
             best_dbcv = -np.inf
             best_sil = -1.0
             best_labels = None
+            best_min_samples = None
             best_noise_ratio = 1.0
             best_n_clusters = 0
 
-            for eps in eps_values:
-                dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-                labels = dbscan.fit_predict(scaled_matrix)
+            for min_samples_candidate in min_samples_values:
+                for eps in eps_values:
+                    dbscan = DBSCAN(eps=eps, min_samples=min_samples_candidate)
+                    labels = dbscan.fit_predict(scaled_matrix)
 
-                noise_ratio = np.sum(labels == -1) / len(labels)
-                valid_clusters = set(labels) - {-1}
-                n_clusters = len(valid_clusters)
+                    noise_ratio = np.sum(labels == -1) / len(labels)
+                    valid_clusters = set(labels) - {-1}
+                    n_clusters = len(valid_clusters)
 
-                if n_clusters >= 2 and noise_ratio <= 0.50:
-                    sil = silhouette_score(scaled_matrix, labels)
-                    current_dbcv = validity_index(scaled_matrix, labels)
+                    if n_clusters >= 2 and noise_ratio <= 0.50:
+                        sil = silhouette_score(scaled_matrix, labels)
+                        current_dbcv = validity_index(scaled_matrix, labels)
 
-                    if current_dbcv > best_dbcv:
-                        best_dbcv = current_dbcv
-                        best_sil = sil
-                        best_eps = eps
-                        best_labels = labels
-                        best_noise_ratio = noise_ratio
-                        best_n_clusters = n_clusters
+                        if current_dbcv > best_dbcv:
+                            best_dbcv = current_dbcv
+                            best_sil = sil
+                            best_eps = eps
+                            best_labels = labels
+                            best_min_samples = min_samples_candidate
+                            best_noise_ratio = noise_ratio
+                            best_n_clusters = n_clusters
 
             if best_labels is None:
                 continue
@@ -1071,6 +1168,7 @@ def evaluate_dbscan_combinations(
                 "Combination": combo_name,
                 "Feature Count": scaled_matrix.shape[1],
                 "Optimal eps": best_eps,
+                "Optimal min_samples": best_min_samples,
                 "Num Clusters": best_n_clusters,
                 "Noise Ratio": best_noise_ratio,
                 "DBCV Score": best_dbcv,
@@ -1081,7 +1179,7 @@ def evaluate_dbscan_combinations(
     results_df = pd.DataFrame(results)
 
     if results_df.empty:
-        logger.error("No DBSCAN combinations yielded valid clusters with <50% noise. Try adjusting eps_values or min_samples.")
+        logger.error("No DBSCAN combinations yielded valid clusters with <50% noise. Try adjusting eps_values or min_samples_values.")
         return
 
     valid_models = results_df[results_df["Silhouette"] > 0.4].sort_values(by="Silhouette", ascending=False)
@@ -1111,7 +1209,10 @@ def evaluate_dbscan_combinations(
     plt.ylabel("Feature Combination")
 
     for index, (_, row) in enumerate(top_20.iterrows()):
-        annot_text = f"eps={row['Optimal eps']} | k={int(row['Num Clusters'])} | Noise: {row['Noise Ratio']:.1%}"
+        annot_text = (
+            f"eps={row['Optimal eps']} | min_samples={int(row['Optimal min_samples'])} "
+            f"| k={int(row['Num Clusters'])} | Noise: {row['Noise Ratio']:.1%}"
+        )
         plt.text(row["Silhouette"] + 0.005, index, annot_text, va="center", color="black", fontsize=9)
 
     plt.tight_layout()
@@ -1120,12 +1221,18 @@ def evaluate_dbscan_combinations(
     logger.success(f"Saved top 20 DBSCAN ablation plot to {out_path}")
 
 
-def get_reducers():
-    tsne = TSNE(n_components=3)
-    pca = PCA(n_components=3)
-    umap = UMAP(n_components=3)
-    isomap = Isomap(n_components=3)
-    return {"tsne": tsne, "pca": pca, "umap": umap, "isomap": isomap}
+def get_reducers(n_components: int = 10):
+    """
+    Reducers safe for downstream K-Means / DBSCAN clustering.
+    Notice the default n_components is higher here!
+    """
+    pca = PCA(n_components=n_components)
+    # Polynomial kernel matches the math of the SOAP power spectrum
+    kpca = KernelPCA(n_components=n_components, kernel='poly', fit_inverse_transform=True)
+    umap_reducer = UMAP(n_components=n_components, metric='euclidean')
+    isomap = Isomap(n_components=n_components)
+    
+    return {"pca": pca, "kpca": kpca, "umap": umap_reducer, "isomap": isomap}
 
 
 def _soap_distance_matrices(embeddings: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -1209,18 +1316,22 @@ if __name__ == "__main__":
         stratify_on=["band_gap", "energy_above_hull"],
         sampling_strategy="stratified",
     )
-    df = mp.load(limit=400)
+    df = mp.load(limit=1000)
 
     # Invariant-only evaluations
-    evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20)
-    evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20)
-    evaluate_kmeans_combinations(df, k_min=2, k_max=20)
-    evaluate_spectral_combinations(df, k_min=2, k_max=20)
-    evaluate_dbscan_combinations(df, min_samples=3)
+    # evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20)
+    # evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20)
+    # evaluate_kmeans_combinations(df, k_min=2, k_max=20)
+    # evaluate_spectral_combinations(df, k_min=2, k_max=20)
+    # evaluate_dbscan_combinations(df, min_samples_values=[2, 3, 5, 8, 10])
 
     # SOAP evaluations using the same functions
-    evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20, mode="soap")
-    evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20, mode="soap")
-    evaluate_kmeans_combinations(df, k_min=2, k_max=20, mode="soap")
-    evaluate_spectral_combinations(df, k_min=2, k_max=20, mode="soap")
-    evaluate_dbscan_combinations(df, min_samples=3, mode="soap")
+    # evaluate_hierarchical_combinations(df, linkage="average", k_min=2, k_max=20, mode="soap")
+    # evaluate_hierarchical_combinations(df, linkage="complete", k_min=2, k_max=20, mode="soap")
+    # evaluate_kmeans_combinations(df, k_min=2, k_max=20, mode="soap")
+    # evaluate_spectral_combinations(df, k_min=2, k_max=20, mode="soap")
+    evaluate_dbscan_combinations(
+        df,
+        min_samples_values=[2, 3, 5, 8, 10],
+        mode="soap",
+    )
