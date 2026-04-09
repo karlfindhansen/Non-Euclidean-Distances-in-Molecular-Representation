@@ -53,36 +53,36 @@ if __name__ == "__main__":
     # )
 
     # SOAP evaluations using the same methods
-    # evaluate_hierarchical_combinations(
-    #     df,
-    #     linkage="average",
-    #     k_min=2,
-    #     k_max=20,
-    #     mode="soap",
-    #     output_base_dir=output_base_dir,
-    # )
-    # evaluate_hierarchical_combinations(
-    #     df,
-    #     linkage="complete",
-    #     k_min=2,
-    #     k_max=20,
-    #     mode="soap",
-    #     output_base_dir=output_base_dir,
-    # )
-    # evaluate_kmeans_combinations(
-    #     df,
-    #     k_min=2,
-    #     k_max=20,
-    #     mode="soap",
-    #     output_base_dir=output_base_dir,
-    # )
-    # evaluate_spectral_combinations(
-    #     df,
-    #     k_min=2,
-    #     k_max=20,
-    #     mode="soap",
-    #     output_base_dir=output_base_dir,
-    # )
+    evaluate_hierarchical_combinations(
+        df,
+        linkage="average",
+        k_min=2,
+        k_max=20,
+        mode="soap",
+        output_base_dir=output_base_dir,
+    )
+    evaluate_hierarchical_combinations(
+        df,
+        linkage="complete",
+        k_min=2,
+        k_max=20,
+        mode="soap",
+        output_base_dir=output_base_dir,
+    )
+    evaluate_kmeans_combinations(
+        df,
+        k_min=2,
+        k_max=20,
+        mode="soap",
+        output_base_dir=output_base_dir,
+    )
+    evaluate_spectral_combinations(
+        df,
+        k_min=2,
+        k_max=20,
+        mode="soap",
+        output_base_dir=output_base_dir,
+    )
     evaluate_dbscan_combinations(
         df,
         min_samples_values=[2, 3, 5, 8, 10],

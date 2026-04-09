@@ -11,7 +11,7 @@ from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.core import Structure
 from sklearn.manifold import TSNE, Isomap, MDS
 from geomstats.learning.pca import TangentPCA
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, KernelPCA
 from typing import Sequence, Optional, Iterable
 from loguru import logger
 from rdkit import Chem
@@ -339,6 +339,18 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     elif reduction_method == 'PCA':
         pca = PCA(n_components=2, random_state=42)
         coords = pca.fit_transform(dist_matrix)
+    elif reduction_method in ['KPCA', 'kpca']:
+        if dist_matrix.shape[1] == dist_matrix.shape[0]:
+            # Distances are converted to an RBF affinity for precomputed-kernel KPCA.
+            d2 = np.square(dist_matrix.astype(np.float64))
+            non_zero = d2[d2 > 0]
+            gamma = 1.0 / np.median(non_zero) if non_zero.size else 1.0
+            kernel = np.exp(-gamma * d2)
+            kpca = KernelPCA(n_components=2, kernel='precomputed', random_state=42)
+            coords = kpca.fit_transform(kernel)
+        else:
+            kpca = KernelPCA(n_components=2, random_state=42)
+            coords = kpca.fit_transform(dist_matrix)
     elif reduction_method == 'ISOMAP':
         isomap = Isomap(n_components=2, metric='precomputed')
         coords = isomap.fit_transform(dist_matrix)

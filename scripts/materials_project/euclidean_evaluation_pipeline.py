@@ -649,8 +649,8 @@ def evaluate_hierarchical_combinations(
         logger.warning("No hierarchical results produced.")
         return
 
-    valid_models = results_df[results_df["Cophenetic Corr"] > 0.6]
-    valid_models = valid_models[valid_models["Silhouette"] > 0.4]
+    valid_models = results_df[results_df["Cophenetic Corr"] > 0.5]
+    valid_models = valid_models[valid_models["Silhouette"] > 0.2]
     valid_models = valid_models.sort_values(by="Silhouette", ascending=False)
 
     if valid_models.empty:
@@ -823,7 +823,7 @@ def evaluate_kmeans_combinations(
         logger.warning("No KMeans results produced.")
         return
 
-    valid_models = results_df[results_df["Silhouette"] > 0.4].sort_values(by="Silhouette", ascending=False)
+    valid_models = results_df[results_df["Silhouette"] > 0.2].sort_values(by="Silhouette", ascending=False)
     if valid_models.empty:
         logger.warning("No KMeans combinations met the Silhouette threshold. Falling back to simple sorting.")
         valid_models = results_df.sort_values(by="Silhouette", ascending=False)
@@ -988,7 +988,7 @@ def evaluate_spectral_combinations(
         logger.warning("No Spectral results produced.")
         return
 
-    valid_models = results_df[results_df["Silhouette"] > 0.4].sort_values(by="Silhouette", ascending=False)
+    valid_models = results_df[results_df["Silhouette"] > 0.2].sort_values(by="Silhouette", ascending=False)
     if valid_models.empty:
         logger.warning("No Spectral combinations met the Silhouette threshold. Falling back to simple sorting.")
         valid_models = results_df.sort_values(by="Silhouette", ascending=False)
@@ -1182,7 +1182,7 @@ def evaluate_dbscan_combinations(
         logger.error("No DBSCAN combinations yielded valid clusters with <50% noise. Try adjusting eps_values or min_samples_values.")
         return
 
-    valid_models = results_df[results_df["Silhouette"] > 0.4].sort_values(by="Silhouette", ascending=False)
+    valid_models = results_df[results_df["Silhouette"] > 0.2].sort_values(by="Silhouette", ascending=False)
 
     if valid_models.empty:
         logger.warning("No DBSCAN combinations met the Silhouette threshold. Falling back to simple sorting.")
