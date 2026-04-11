@@ -69,6 +69,123 @@ MAX_SOAP_N_COMPONENTS = 50
 # Backward compatible alias (defaults to materials).
 INVARIANT_FEATURES = INVARIANT_FEATURES_MATERIALS
 
+def build_universal_matrix(
+    df: pl.DataFrame,
+    cutoff: float = 3.0,
+    aggregated: bool = False,
+    frames: Optional[List[Atoms]] = None,
+    qm9_seed: int = 40,
+    qm9_invariant: bool = True,
+    cache_qm9_frames: bool = True,
+) -> List[np.ndarray]:
+    """
+    Generates the Universal Atomic Matrix. 
+    Set aggregated=True for Euclidean baseline.
+    Set aggregated=False for Grassmann/Riemann/Wasserstein.
+    """
+    invariant_matrices = []
+    kind = _detect_dataset_kind(df)
+
+    if frames is None and kind == "qm9":
+        cache_key = _qm9_frames_cache_key(df)
+        if cache_qm9_frames and cache_key in _QM9_FRAMES_CACHE:
+            frames = _QM9_FRAMES_CACHE[cache_key]
+        else:
+            frames = _build_qm9_frames_from_df(
+                df,
+                seed=qm9_seed,
+                invariant=qm9_invariant,
+            )
+            if cache_qm9_frames:
+                _QM9_FRAMES_CACHE[cache_key] = frames
+
+    if frames is not None:
+        for atoms in frames:
+            matrix = _compute_universal_atomic_matrix(
+                atoms,
+                cutoff=cutoff,
+                aggregated=aggregated,
+            )
+            invariant_matrices.append(matrix)
+    else:
+        # Materials Project branch
+        from pymatgen.io.ase import AseAtomsAdaptor
+        import json
+        from pymatgen.core import Structure
+        
+        adaptor = AseAtomsAdaptor()
+        for struct_json in df["raw_structure"]:
+            struct = Structure.from_dict(json.loads(struct_json))
+            atoms = adaptor.get_atoms(struct)
+            matrix = _compute_universal_atomic_matrix(
+                atoms,
+                cutoff=cutoff,
+                aggregated=aggregated,
+            )
+            invariant_matrices.append(matrix)
+
+    return invariant_matrices
+
+def _compute_universal_atomic_matrix(
+    atoms: Atoms, 
+    cutoff: float = 3.0, 
+    aggregated: bool = False
+) -> np.ndarray:
+    """
+    Builds the N x D Universal Atomic Matrix for manifold comparison.
+    If aggregated=False, returns (N, 6).
+    If aggregated=True, returns (1, 12) [mean and std dev].
+    """
+    N = len(atoms)
+    if N == 0:
+        return np.array([])
+
+    # 1. Translation Invariance: Center the Spatial Coordinates
+    #positions = atoms.get_positions()
+    #centroid = np.mean(positions, axis=0)
+    #centered_positions = positions - centroid  # Shape: (N, 3)
+
+    # 2. Structural Geometry: Coordination Number
+    i_indices, _ = neighbor_list('ij', atoms, cutoff)
+    coordination = np.zeros(N)
+    for i in i_indices:
+        coordination[i] += 1
+    coordination = coordination.reshape(-1, 1)  # Shape: (N, 1)
+
+    # 3. Chemical & Electronic Identity: Mendeleev & Ionization
+    mendeleev = np.zeros((N, 1))
+    ionization = np.zeros((N, 1))
+
+    for i, atom in enumerate(atoms):
+        try:
+            el = Element(atom.symbol)
+            mendeleev[i, 0] = el.mendeleev_no
+            # Handle elements missing ionization energy gracefully
+            ie = el.ionization_energies[0] if el.ionization_energies else 0.0
+            ionization[i, 0] = ie
+        except Exception as e:
+            logger.warning(f"Failed to extract properties for {atom.symbol}: {e}")
+            mendeleev[i, 0] = 0.0
+            ionization[i, 0] = 0.0
+
+    # 4. Assemble the Universal N x 6 Matrix
+    # Columns: [X, Y, Z, Coord, Mendeleev, Ionization]
+    atomic_matrix = np.hstack([
+        #centered_positions, 
+        coordination, 
+        mendeleev, 
+        ionization
+    ])
+
+    # 5. Route based on Geometry (Squash for Euclidean, keep N for Manifolds)
+    if aggregated:
+        # Euclidean Path: Squash N dimension into mean and std dev (1 x 12 vector)
+        means = np.mean(atomic_matrix, axis=0)
+        stds = np.std(atomic_matrix, axis=0)
+        return np.concatenate([means, stds]).reshape(1, -1)
+    else:
+        # Manifold Path: Return raw N x 6 point cloud
+        return atomic_matrix
 
 def _detect_dataset_kind(df: pl.DataFrame) -> str:
     if "raw_structure" in df.columns or "material_id" in df.columns:

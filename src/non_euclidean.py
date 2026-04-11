@@ -1,4 +1,5 @@
 from typing import Dict, List, Sequence, Literal, Optional
+import signal
 
 import numpy as np
 import ot
@@ -38,6 +39,8 @@ def _compute_invariant_feature_matrix(frame: Atoms, cutoff: float = 1.8) -> np.n
         rad = covalent_radii[z]
         el = Element.from_Z(z)
         en = el.X if el.X else 0.0
+        mendeleev = el.mendeleev_no if el.mendeleev_no else 0
+        ion_en = el.ionization_energy if el.ionization_energy else 0.0
 
         mass = atom.mass
 
@@ -53,27 +56,20 @@ def _compute_invariant_feature_matrix(frame: Atoms, cutoff: float = 1.8) -> np.n
             avg_neighbor_z = 0
             avg_neighbor_dist = 0
 
-        # D = 8 fixed, invariant features. 
-        # You can expand this to include SOAP or local coordination.
         feat_vector = [
-            z,
-            rad,
-            en,
-            mass,
-            dist_to_com,
-            #coord,
-            #avg_neighbor_z,
-            #avg_neighbor_dist
+            coord,
+            mendeleev,
+            ion_en,
         ]
 
         features.append(feat_vector)
-
+    #logger.info(f"Computed invariant feature matrix consisting of coordination, mendeleev, and ionization energy for frame with {len(frame)} atoms.")
     return np.array(features).T
 
 
 def _compute_feature_matrices(
     frames: Sequence[Atoms],
-    normalized: bool = False,
+    normalized: bool = True,
 ) -> List[np.ndarray]:
     """
     Builds invariant feature matrices for all frames.
@@ -168,11 +164,15 @@ class Wasserstein:
         if precomputed_feature_matrices is not None:
             n = len(precomputed_feature_matrices)
             # Create a simple pair function for the precomputed matrices
-            def pair_fn(i, j):
-                return cls.compute_feature_distance(precomputed_feature_matrices[i], precomputed_feature_matrices[j], metric=metric)
             print(f"Computing Wasserstein distance matrix for {n} feature matrices...")
         else:
-            raise NotImplementedError("Please pass precomputed_feature_matrices.")
+            precomputed_feature_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
+            n = len(precomputed_feature_matrices)
+            print(f"Computing Wasserstein distance matrix for {n} feature matrices...")
+            #raise NotImplementedError("Please pass precomputed_feature_matrices.")
+
+        def pair_fn(i, j):
+            return cls.compute_feature_distance(precomputed_feature_matrices[i], precomputed_feature_matrices[j], metric=metric)
 
         # Assuming you have a _pairwise_distance_matrix helper function defined elsewhere
         # If not, you can just use a nested for-loop here to build the NxN matrix.
@@ -314,7 +314,7 @@ class Grassmann:
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd",
         features : Literal['soap', 'invariant'] = 'invariant',
-        normalized: bool = False,
+        normalized: bool = True,
         precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
@@ -354,10 +354,33 @@ class Grassmann:
         """
         Computes the Geodesic (arc-length) distance on the Grassmannian.
         Calculated as the L2 norm of the principal angles between subspaces.
+        Includes numerical safeguards for ill-conditioned subspaces.
         """
-        # Principal angles represent the 'rotations' needed to align two subspaces
-        angles = subspace_angles(U1, U2)
-        return float(np.linalg.norm(angles))
+        try:
+            # Ensure bases are properly orthonormal (re-orthogonalize via QR)
+            U1_safe, _ = np.linalg.qr(U1)
+            U2_safe, _ = np.linalg.qr(U2)
+            U1_safe = U1_safe[:, :U1.shape[1]]
+            U2_safe = U2_safe[:, :U2.shape[1]]
+            
+            # Compute principal angles with default tolerance
+            angles = subspace_angles(U1_safe, U2_safe)
+            
+            # Clip small numerical errors
+            angles = np.clip(angles, 0, np.pi / 2)
+            return float(np.linalg.norm(angles))
+        except Exception as e:
+            # Fallback: compute distance via singular values of U1^T @ U2
+            logger.debug(f"Grassmann distance computation fell back to SVD method: {e}")
+            try:
+                _, s, _ = np.linalg.svd(U1.T @ U2, full_matrices=False)
+                # Distance from principal angles via singular values
+                s_clipped = np.clip(s, -1.0, 1.0)
+                angles = np.arccos(s_clipped)
+                return float(np.linalg.norm(angles))
+            except Exception as e2:
+                logger.warning(f"All Grassmann distance methods failed: {e2}. Returning max distance.")
+                return float(np.pi / 2)
 
     @classmethod
     def distance_matrix(
@@ -366,7 +389,7 @@ class Grassmann:
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd",
         features : Literal['soap', 'invariant'] = 'invariant',
-        normalized: bool = False,
+        normalized: bool = True,
         precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
@@ -478,6 +501,9 @@ class Riemann:
 
         d(A,B) = || log(A) - log(B) ||_F
         """
+        if np.allclose(logC1, logC2, rtol=1e-05, atol=1e-08):
+            return 0.0
+        
         return float(np.linalg.norm(logC1 - logC2, ord="fro"))
 
     # ---------------------------------------------------------
@@ -490,6 +516,9 @@ class Riemann:
         d(A,B) = sqrt( sum( log(lambda_i)^2 ) )
         where lambda_i are generalized eigenvalues.
         """
+
+        if np.allclose(C1, C2, rtol=1e-05, atol=1e-08):
+            return 0.0
 
         eigvals = eigvalsh(C1, C2)
         eigvals = np.clip(eigvals, 1e-12, None)
@@ -582,6 +611,9 @@ class Riemann:
                         d = cls._distance_affine_invariant(
                             spd_matrices[i], spd_matrices[j]
                         )
+
+                        if np.isinf(d):
+                            d = 0.0
 
                         dist_matrix[i, j] = dist_matrix[j, i] = d
 

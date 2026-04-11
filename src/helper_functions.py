@@ -328,7 +328,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         if dist_matrix.shape[1] != dist_matrix.shape[0]:
             tsne = TSNE(n_components=2, random_state=42)
         else:
-            tsne = TSNE(n_components=2, metric='precomputed',random_state=42)
+            tsne = TSNE(n_components=2, metric='precomputed',init='random', random_state=42)
         coords = tsne.fit_transform(dist_matrix)
     elif reduction_method in ['UMAP', 'umap']:
         if dist_matrix.shape[1] != dist_matrix.shape[0]:
@@ -355,10 +355,10 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         isomap = Isomap(n_components=2, metric='precomputed')
         coords = isomap.fit_transform(dist_matrix)
     elif reduction_method == 'MDS':
-        mds = MDS(n_components=2, metric='precomputed', n_init=4)
+        mds = MDS(n_components=2, metric='precomputed', random_state=42)
         coords = mds.fit_transform(dist_matrix)
     elif reduction_method == 'PGA':
-        pga = TangentPCA(n_components=2)
+        pga = TangentPCA(n_components=2, space="metric")
         coords = pga.fit_transform(dist_matrix)
     else:
         raise ValueError(f"Unsupported reduction method: {reduction_method}")

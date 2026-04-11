@@ -11,7 +11,8 @@ import seaborn as sns
 import kmedoids
 
 from loguru import logger
-from sklearn.cluster import AffinityPropagation, DBSCAN, SpectralClustering
+from scipy.linalg import logm, expm, sqrtm, inv
+from sklearn.cluster import AffinityPropagation, DBSCAN, KMeans, SpectralClustering
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
@@ -33,6 +34,148 @@ DEFAULT_DBSCAN_MIN_SAMPLES = [2, 3, 5, 8, 10]
 DEFAULT_AP_PREFERENCE_QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75]
 DEFAULT_AP_DAMPING_VALUES = [0.60, 0.70, 0.80, 0.90]
 
+# ==============================================================================
+# TRUE K-MEANS MANIFOLD IMPLEMENTATIONS
+# ==============================================================================
+
+def log_euclidean_kmeans(spd_matrices: np.ndarray, n_clusters: int, random_state: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Standard K-Means using the Log-Euclidean metric.
+    """
+    n_samples, d, _ = spd_matrices.shape
+    
+    # Map to tangent space using existing function
+    log_mats = Riemann._log_spd_batch(spd_matrices)
+    flattened_logs = log_mats.reshape(n_samples, -1)
+    
+    # Run Euclidean K-Means on the tangent space vectors
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    labels = kmeans.fit_predict(flattened_logs)
+    
+    # Map centroids back to the SPD manifold (Exponential map)
+    centroids_spd = []
+    for center in kmeans.cluster_centers_:
+        center_matrix = center.reshape(d, d)
+        eigvals, eigvecs = np.linalg.eigh(center_matrix)
+        exp_C = eigvecs @ np.diag(np.exp(eigvals)) @ eigvecs.T
+        centroids_spd.append(exp_C)
+        
+    return labels, np.array(centroids_spd)
+
+
+def affine_invariant_frechet_mean(spd_matrices: Sequence[np.ndarray], max_iter: int = 50, tol: float = 1e-6) -> np.ndarray:
+    """
+    Computes the Fréchet mean of a set of SPD matrices under the Affine-Invariant metric.
+    """
+    M = np.mean(spd_matrices, axis=0)
+    
+    for _ in range(max_iter):
+        M_half = sqrtm(M)
+        M_inv_half = inv(M_half)
+        
+        tangent_vectors = []
+        for C in spd_matrices:
+            whitened_C = M_inv_half @ C @ M_inv_half
+            whitened_C = (whitened_C + whitened_C.T) / 2.0 
+            tangent_vectors.append(logm(whitened_C))
+            
+        mean_tangent = np.mean(tangent_vectors, axis=0)
+        mean_tangent = (mean_tangent + mean_tangent.T) / 2.0 
+        
+        if np.linalg.norm(mean_tangent, ord='fro') < tol:
+            break
+            
+        M = M_half @ expm(mean_tangent) @ M_half
+        M = (M + M.T) / 2.0 
+        
+    return M
+
+
+def grassmann_karcher_mean(subspaces: Sequence[np.ndarray], max_iter: int = 50, tol: float = 1e-5) -> np.ndarray:
+    """
+    Computes the Karcher mean of a list of orthonormal bases (subspaces) on the Grassmannian.
+    """
+    M = subspaces[0]
+    
+    for _ in range(max_iter):
+        gradient = np.zeros_like(M)
+        
+        for U in subspaces:
+            U_proj = M.T @ U
+            U_orth = U - M @ U_proj
+            
+            try:
+                direction_matrix = U_orth @ np.linalg.inv(U_proj)
+            except np.linalg.LinAlgError:
+                continue 
+                
+            X, S, Yh = np.linalg.svd(direction_matrix, full_matrices=False)
+            tangent_vec = X @ np.diag(np.arctan(S)) @ Yh
+            gradient += tangent_vec
+            
+        gradient /= len(subspaces)
+        if np.linalg.norm(gradient) < tol:
+            break
+            
+        U_grad, S_grad, Vh_grad = np.linalg.svd(gradient, full_matrices=False)
+        cos_S = np.diag(np.cos(S_grad))
+        sin_S = np.diag(np.sin(S_grad))
+        
+        M = M @ Vh_grad.T @ cos_S + U_grad @ sin_S
+        M = M @ Vh_grad 
+        M, _ = np.linalg.qr(M)
+        
+    return M
+
+
+def riemannian_kmeans(
+    items: Sequence[np.ndarray], 
+    n_clusters: int, 
+    manifold: str, 
+    max_iter: int = 30,
+    random_state: int = 42
+) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """
+    Custom K-Means loop utilizing Fréchet/Karcher means.
+    """
+    np.random.seed(random_state)
+    n = len(items)
+    
+    initial_indices = np.random.choice(n, n_clusters, replace=False)
+    centroids = [items[i] for i in initial_indices]
+    labels = np.zeros(n, dtype=int)
+    
+    if manifold == "riemann":
+        dist_fn = Riemann._distance_affine_invariant
+        mean_fn = affine_invariant_frechet_mean
+    elif manifold == "grassmann":
+        dist_fn = Grassmann._distance
+        mean_fn = grassmann_karcher_mean
+    else:
+        raise ValueError("Manifold must be 'riemann' or 'grassmann'")
+
+    for iteration in range(max_iter):
+        old_labels = labels.copy()
+        
+        for i, item in enumerate(items):
+            distances = [dist_fn(item, c) for c in centroids]
+            labels[i] = np.argmin(distances)
+            
+        if np.array_equal(labels, old_labels) and iteration > 0:
+            break
+            
+        for k in range(n_clusters):
+            cluster_items = [items[j] for j in range(n) if labels[j] == k]
+            if len(cluster_items) == 0:
+                centroids[k] = items[np.random.randint(0, n)]
+                continue
+            centroids[k] = mean_fn(cluster_items)
+            
+    return labels, centroids
+
+# ==============================================================================
+# PIPELINE HELPER FUNCTIONS
+# ==============================================================================
 
 def _normalize_feature_matrices(feature_matrices: Sequence[np.ndarray]) -> List[np.ndarray]:
     if not feature_matrices:
@@ -92,10 +235,6 @@ def _safe_silhouette(dist_matrix: np.ndarray, labels: np.ndarray) -> Optional[fl
 
 
 def _distance_profile_features(dist_matrix: np.ndarray) -> np.ndarray:
-    """
-    Treat each sample's distances to all other samples as its feature vector.
-    This gives us a stable Euclidean representation for indices like DBI.
-    """
     return np.asarray(dist_matrix, dtype=np.float64)
 
 
@@ -114,9 +253,6 @@ def _spectral_eigengap_heuristic(
     affinity: np.ndarray,
     k_range: Sequence[int],
 ) -> Tuple[Optional[int], Optional[float]]:
-    """
-    Use the normalized graph Laplacian eigengap as a k suggestion for spectral clustering.
-    """
     if not k_range:
         return None, None
 
@@ -144,6 +280,9 @@ def _spectral_eigengap_heuristic(
 
     return best_k, best_gap if np.isfinite(best_gap) else None
 
+# ==============================================================================
+# EVALUATION FUNCTIONS
+# ==============================================================================
 
 def _compute_manifold_distance_matrix(
     manifold: str,
@@ -170,6 +309,44 @@ def _compute_manifold_distance_matrix(
         )
 
     raise ValueError("manifold must be one of: ['grassmann', 'riemann']")
+
+
+def _evaluate_kmeans(
+    items: Sequence[np.ndarray],
+    dist_matrix: np.ndarray,
+    k_range: Sequence[int],
+    manifold: str,
+    metric: str = "log-euclidean",
+) -> Optional[Dict[str, float]]:
+    best_result = None
+
+    for k in k_range:
+        try:
+            if manifold == "riemann" and metric == "log-euclidean":
+                labels, _ = log_euclidean_kmeans(np.array(items), int(k))
+            else:
+                labels, _ = riemannian_kmeans(items, int(k), manifold=manifold)
+        except Exception as e:
+            logger.debug(f"True K-Means failed for k={k} on {manifold}: {e}")
+            continue
+
+        silhouette = _safe_silhouette(dist_matrix, labels)
+        davies_bouldin = _safe_davies_bouldin(dist_matrix, labels)
+        if silhouette is None or davies_bouldin is None:
+            continue
+
+        result = {
+            "Optimal k": int(k),
+            "Num Clusters": int(len(np.unique(labels))),
+            "Silhouette": silhouette,
+            "Davies-Bouldin": davies_bouldin,
+            "labels": labels,
+        }
+
+        if best_result is None or result["Silhouette"] > best_result["Silhouette"]:
+            best_result = result
+
+    return best_result
 
 
 def _evaluate_spectral(
@@ -348,6 +525,9 @@ def _evaluate_affinity_propagation(
 
     return best_result
 
+# ==============================================================================
+# PLOTTING AND SAVING
+# ==============================================================================
 
 def _plot_top_results(
     results_df: pd.DataFrame,
@@ -436,6 +616,9 @@ def _save_ranked_results(
     )
     logger.success(f"Saved {method_name} top-result plot to {plot_path}")
 
+# ==============================================================================
+# MAIN PIPELINE
+# ==============================================================================
 
 def evaluate_non_euclidean_combinations(
     df: pl.DataFrame,
@@ -501,6 +684,7 @@ def evaluate_non_euclidean_combinations(
     dbscan_results: List[Dict[str, float]] = []
     affinity_results: List[Dict[str, float]] = []
     kmedoids_results: List[Dict[str, float]] = []
+    kmeans_results: List[Dict[str, float]] = []
 
     combo_iter = tqdm(combinations_to_test, desc=f"{manifold.title()} combinations", unit="combo")
     for feature_keys in combo_iter:
@@ -516,6 +700,24 @@ def evaluate_non_euclidean_combinations(
         if normalize_features:
             feature_matrices = _normalize_feature_matrices(feature_matrices)
 
+        # 1. Retrieve the actual manifold representations for True K-Means
+        if manifold.lower() == "grassmann":
+            items = Grassmann._get_uk_bases(
+                frames=None,
+                k=grassmann_k,
+                method=grassmann_method,
+                precomputed_feature_matrices=feature_matrices
+            )
+        elif manifold.lower() == "riemann":
+            items = Riemann._get_spd_matrices(
+                frames=None,
+                regularization=riemann_regularization,
+                precomputed_feature_matrices=feature_matrices
+            )
+        else:
+            items = []
+
+        # 2. Compute the shared distance matrix for K-Medoids, DBSCAN, Spectral, etc.
         dist_matrix = _compute_manifold_distance_matrix(
             manifold=manifold,
             feature_matrices=feature_matrices,
@@ -526,6 +728,21 @@ def evaluate_non_euclidean_combinations(
         )
         affinity_matrix, sigma = _gaussian_affinity_from_distance(dist_matrix)
 
+        # --- TRUE K-MEANS ---
+        kmeans_result = _evaluate_kmeans(items, dist_matrix, k_range, manifold.lower(), riemann_metric)
+        if kmeans_result is not None:
+            labels = kmeans_result.pop("labels")
+            _, avg_coherence = get_overall_chemical_coherence(df, labels)
+            kmeans_results.append(
+                {
+                    "Combination": combo_name,
+                    "Feature Count": len(feature_keys),
+                    "Overall Chemical Coherence": avg_coherence,
+                    **kmeans_result,
+                }
+            )
+
+        # --- SPECTRAL ---
         spectral_result = _evaluate_spectral(dist_matrix, affinity_matrix, k_range)
         if spectral_result is not None:
             labels = spectral_result.pop("labels")
@@ -540,6 +757,7 @@ def evaluate_non_euclidean_combinations(
                 }
             )
 
+        # --- DBSCAN ---
         dbscan_result = _evaluate_dbscan(dist_matrix, eps_values, min_samples_values)
         if dbscan_result is not None:
             labels = dbscan_result.pop("labels")
@@ -553,6 +771,7 @@ def evaluate_non_euclidean_combinations(
                 }
             )
 
+        # --- AFFINITY PROPAGATION ---
         affinity_result = _evaluate_affinity_propagation(
             dist_matrix,
             affinity_matrix,
@@ -572,6 +791,7 @@ def evaluate_non_euclidean_combinations(
                 }
             )
 
+        # --- K-MEDOIDS ---
         kmedoids_result = _evaluate_kmedoids(dist_matrix, k_range)
         if kmedoids_result is not None:
             labels = kmedoids_result.pop("labels")
@@ -587,6 +807,13 @@ def evaluate_non_euclidean_combinations(
 
     manifold_output_dir = Path(output_base_dir) / manifold.lower() / "invariant_features"
 
+    _save_ranked_results(
+        kmeans_results,
+        output_dir=manifold_output_dir / "kmeans",
+        method_name="kmeans",
+        title=f"Top Feature Combinations by Silhouette Score\n(True K-Means, {manifold.title()})",
+        annotation_columns=["Optimal k", "Davies-Bouldin"],
+    )
     _save_ranked_results(
         spectral_results,
         output_dir=manifold_output_dir / "spectral",
@@ -617,6 +844,7 @@ def evaluate_non_euclidean_combinations(
     )
 
 
+
 if __name__ == "__main__":
     qm9 = QM9Dataset(
         limit=400,
@@ -634,6 +862,7 @@ if __name__ == "__main__":
         k_max=20,
         output_base_dir=output_base_dir,
     )
+
     evaluate_non_euclidean_combinations(
         df,
         manifold="riemann",
