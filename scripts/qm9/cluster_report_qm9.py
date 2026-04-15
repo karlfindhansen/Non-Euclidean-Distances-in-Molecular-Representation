@@ -536,7 +536,7 @@ def evaluate_non_euclidean_kmedoids(
 
     qm9 = QM9Dataset()
     qm9.load()
-    frames = qm9.get_positions(subset_size=limit)
+    frames = qm9.get_molecules(subset_size=limit)
     dataset_dir = f"QM9/distance_matrices_n{len(frames)}"
     if use_precomputed_only:
         try:

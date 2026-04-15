@@ -12,6 +12,7 @@ from ase import Atoms
 from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
@@ -57,7 +58,7 @@ class QM9Dataset:
         "ether": Fragments.fr_ether,
         "nitro": Fragments.fr_nitro,
     }
-    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups", "avg_bond_length"}
+    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups", "avg_bond_length", "scaffold_smiles"}
 
     def __init__(
         self,
@@ -348,6 +349,12 @@ class QM9Dataset:
         if mol is None:
             return None
 
+        scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
+        scaffold_smiles = Chem.MolToSmiles(scaffold_mol, canonical=True)
+
+        if not scaffold_smiles:
+            scaffold_smiles = "Acyclic"
+
         formula = CalcMolFormula(mol)
 
         structure_type = self._classify_structure_type(mol)
@@ -424,6 +431,7 @@ class QM9Dataset:
             "formula": formula,
             "smiles": smiles,
             "canonical_smiles": canonical,
+            "scaffold_smiles": scaffold_smiles,
             "selfies": selfies_str,
             "functional_groups": functional_groups_str,
             "num_atoms": int(data.num_nodes),
@@ -1030,7 +1038,7 @@ class QM9Dataset:
             max_bond_rattle=max_bond_rattle
         )
 
-    def get_positions(
+    def get_molecules(
         self,
         invariant: bool = True,
         output_filename: str = "qm9_subset.xyz",
@@ -1105,6 +1113,8 @@ class QM9Dataset:
                     "mol_id": mol_id,
                     "smiles": smiles,
                     "canonical_smiles": canonical_smiles,
+                    
+                    "scaffold": row["scaffold_smiles"],
                     "formula": formula,
                     "structure_type": self._classify_structure_type(mol),
                     "functional_groups": ",".join(self._detect_functional_groups(mol)),
@@ -1471,6 +1481,10 @@ class MaterialsProject:
         return float(np.mean(nearest_distances)), float(np.max(nearest_distances))
 
     def _process_doc(self, d) -> Dict[str, Any]:
+        """
+        Processes a single MP document into a dictionary, adding chemical
+        baseline features like anonymized formula and EN difference.
+        """
         # Helper to safely extract data whether 'd' is a dict or an MP-API object
         def get_val(key):
             try:
@@ -1488,7 +1502,7 @@ class MaterialsProject:
         def safe_bool(val):
             return bool(val) if val is not None else None
 
-        # 1. Structure Handling
+        # 1. Structure and Lattice Handling
         raw_struct = get_val("structure")
         if isinstance(raw_struct, Structure):
             struct = raw_struct
@@ -1510,7 +1524,7 @@ class MaterialsProject:
             c_sys, sg = None, None
 
         # ---------------------------------------------------------
-        # 3. NEW: Prototype and Bonding Calculations
+        # 3. CHEMICAL BASELINE FEATURES (New)
         # ---------------------------------------------------------
         formula = safe_str(get_val("formula_pretty"))
         anon_formula = None
@@ -1520,27 +1534,27 @@ class MaterialsProject:
             try:
                 comp = Composition(formula)
                 
-                # Prototype: Extract generic formula (e.g., ABO3)
+                # Prototype: Maps specific formula to generic (e.g., SrTiO3 -> ABC3)
                 anon_formula = comp.anonymized_formula
                 
-                # Bonding: Calculate max electronegativity difference
+                # Bonding: Calculate max Pauling electronegativity difference (Δχ)
                 elements = comp.elements
-                if len(elements) > 1:
-                    # Get Pauling electronegativity (X), ignoring elements without it (like some noble gases)
-                    ens = [el.X for el in elements if getattr(el, 'X', None) and el.X > 0]
-                    if ens:
-                        max_en_diff = max(ens) - min(ens)
-                elif len(elements) == 1:
-                    max_en_diff = 0.0 # Pure elemental solids have no EN difference
+                # Filter elements that have defined Pauling electronegativity
+                ens = [el.X for el in elements if getattr(el, 'X', None) and el.X > 0]
+                
+                if len(ens) > 1:
+                    max_en_diff = max(ens) - min(ens)
+                elif len(ens) == 1:
+                    max_en_diff = 0.0 # Pure elemental solids
             except Exception as e:
                 logger.debug(f"Could not compute chemistry features for {formula}: {e}")
 
-        # 4. Return flattened dictionary with safe casts
+        # 4. Return flattened dictionary
         return {
             "material_id": safe_str(get_val("material_id")),
             "formula_pretty": formula,
-            "anonymized_formula": safe_str(anon_formula), # NEW
-            "max_en_diff": safe_float(max_en_diff),       # NEW
+            "anonymized_formula": safe_str(anon_formula), # For Prototype clustering
+            "max_en_diff": safe_float(max_en_diff), 
             "energy_per_atom": safe_float(get_val("energy_per_atom")),
             "formation_energy_per_atom": safe_float(get_val("formation_energy_per_atom")),
             "band_gap": safe_float(get_val("band_gap")),
@@ -1561,7 +1575,6 @@ class MaterialsProject:
             "avg_bond_length": safe_float(avg_bond_length),
             "max_bond_length": safe_float(max_bond_length),
         }
-
     def _get_structures(self) -> List[Structure]:
         logger.info("Reconstructing Pymatgen structures from JSON...")
         struct_strings = self.df["raw_structure"].to_list()

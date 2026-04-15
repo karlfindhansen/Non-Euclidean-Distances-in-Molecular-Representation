@@ -114,7 +114,7 @@ if __name__ == "__main__":
     qm9.load()
 
     frames = qm9.run_stress_test()
-    all_frames = qm9.get_positions(invariant=True)
+    all_frames = qm9.get_molecules(invariant=True)
     
     grassmann_dist_matrix = Grassmann.distance_matrix(all_frames)
 

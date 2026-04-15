@@ -164,7 +164,7 @@ class MolecularFeaturizer:
         weighting = {el: element(el).atomic_number for el in unique_elements}
         soap_engine = SOAP(
             species=species, periodic=False, 
-            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, average='inner', compression={"mode": "mu2", "species_weighting": weighting}
+            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, average='inner', compression={"mode": "mu1nu1", "species_weighting": weighting}
         )
 
         def _compute_single_soap(s):
@@ -283,7 +283,7 @@ class MolecularFeaturizer:
         else:
             logger.warning("No model_path provided. Using RANDOM (untrained) MPNN weights.")
             
-            d_h = 300
+            d_h = 25
             message_passing = nn.BondMessagePassing(d_h=d_h, depth=3)
             aggregator = nn.MeanAggregation()
             predictor = nn.RegressionFFN()

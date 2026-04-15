@@ -13,6 +13,7 @@ from scipy.linalg import logm, eigvalsh
 from pymatgen.core import Element
 from ripser import ripser
 from scipy.linalg import subspace_angles
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 
@@ -131,24 +132,29 @@ def _pairwise_distance_matrix(
 
 class Wasserstein:
     """
-    Computes the Earth Mover's Distance (Wasserstein-1) between materials.
-    Can use raw 3D atomic positions (via frames) or unaggregated D x N feature matrices.
+    Computes the Earth Mover's Distance (Wasserstein-1) between molecules.
+    Treats each molecule as a distribution of atomic feature vectors.
     """
 
     @staticmethod
     def compute_feature_distance(feat_i: np.ndarray, feat_j: np.ndarray, metric: str = 'sqeuclidean') -> float:
-        # feat_i is (D, N_atoms). Transpose to (N_atoms, D) for POT library
+        """
+        Computes EMD between two matrices of shape (D, N_atoms).
+        """
+        # Transpose to (N_atoms, D) for the POT (ot) library
         pos_i = feat_i.T
         pos_j = feat_j.T
 
-        # Give each atom equal weight in the distribution
+        # 1. Assign weights (Uniform: each atom is 1/N of the molecule's 'mass')
         weights_i = np.ones(pos_i.shape[0]) / pos_i.shape[0]
         weights_j = np.ones(pos_j.shape[0]) / pos_j.shape[0]
 
-        # Cost matrix between all atoms in Material A and Material B
+        # 2. Compute the Cost Matrix (Distances between all atoms in A and B)
+        # M[a, b] is the cost to move atom 'a' to 'b' in feature space
         M = ot.dist(pos_i, pos_j, metric=metric)
 
-        # Compute Earth Mover's Distance
+        # 3. Solve the Optimal Transport problem
+        # We use emd2 to get the scalar distance value
         distance = ot.emd2(weights_i, weights_j, M)
         
         return float(distance)
@@ -157,29 +163,36 @@ class Wasserstein:
     def distance_matrix(
         cls, 
         frames: Optional[Sequence] = None, 
-        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        feature_type: str = 'invariant',
         metric: str = 'sqeuclidean'
     ) -> np.ndarray:
         
-        if precomputed_feature_matrices is not None:
-            n = len(precomputed_feature_matrices)
-            # Create a simple pair function for the precomputed matrices
-            print(f"Computing Wasserstein distance matrix for {n} feature matrices...")
+        # Step 1: Extract the correct feature matrices
+        if feature_matrices is not None:
+            raw_matrices = feature_matrices
         else:
-            precomputed_feature_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
-            n = len(precomputed_feature_matrices)
-            print(f"Computing Wasserstein distance matrix for {n} feature matrices...")
-            #raise NotImplementedError("Please pass precomputed_feature_matrices.")
+            if feature_type == 'invariant':
+                # Returns list of (3, N_atoms)
+                raw_matrices = _compute_feature_matrices(frames, normalized=True)
+            elif feature_type == 'soap':
+                # If global, returns (1, 252). If atomic, returns (N, 252)
+                soap_list = _compute_soap_feature_matrices(frames)
+                raw_matrices = [np.atleast_2d(s).T if s.ndim == 1 else s.T for s in soap_list]
+            else:
+                raise ValueError(f"Unknown feature_type: {feature_type}")
 
+        n = len(raw_matrices)
+        logger.info(f"Computing Wasserstein distance matrix | Features: {feature_type}")
+
+        # Step 2: Pairwise distance calculation
         def pair_fn(i, j):
-            return cls.compute_feature_distance(precomputed_feature_matrices[i], precomputed_feature_matrices[j], metric=metric)
+            return cls.compute_feature_distance(raw_matrices[i], raw_matrices[j], metric=metric)
 
-        # Assuming you have a _pairwise_distance_matrix helper function defined elsewhere
-        # If not, you can just use a nested for-loop here to build the NxN matrix.
         dist_matrix = _pairwise_distance_matrix(
             n=n,
             pair_fn=pair_fn,
-            desc="Wasserstein distances",
+            desc=f"Wasserstein ({feature_type})",
         )
         
         return dist_matrix
@@ -409,6 +422,7 @@ class Grassmann:
         
         # Initialize an empty symmetric matrix
         dist_matrix = np.zeros((num_items, num_items))
+        logger.info(f"Computing Grassmann distance matrix for {num_items} items (k={k}, method='{method}', features='{features}', normalized={normalized}).")
         
         # Compute pairwise distances (upper triangle)
         for i in tqdm(range(num_items), desc="Grassmann distances", unit="pair"):
@@ -419,206 +433,116 @@ class Grassmann:
                 
         return dist_matrix
 
+
 class Riemann:
     """
-    Handles molecular representation on the Riemannian Manifold of SPD matrices.
-
-    Each molecule is represented as a covariance matrix of invariant atomic
-    feature vectors. Distances are computed using either:
-
-    - Log-Euclidean metric
-    - Affine-Invariant Riemannian metric
+    Handles molecular representation on the Riemannian Manifold.
+    Supports both atomic invariant feature matrices and global descriptors (SOAP).
     """
 
     @classmethod
     def _get_spd_matrices(
         cls,
-        frames: Optional[Sequence['Atoms']],
-        regularization: float = 1e-6,
-        normalized: bool = False,
-        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        frames=None,
+        feature_matrices=None,
+        feature_type: str = 'invariant',
+        regularization: float = 1e-3,
+        n_pca: int = 30
     ) -> np.ndarray:
         """
-        Converts frames into SPD covariance matrices.
+        Step 1: Extract features and convert to SPD (covariance) matrices.
         """
-        # Extract invariant atomic features (optionally normalized)
-        if precomputed_feature_matrices is not None:
-            raw_matrices = precomputed_feature_matrices
-            if normalized:
-                logger.info("Using precomputed feature matrices; skipping normalization.")
+        # 1. Obtain raw feature matrices (List of D x N matrices)
+        if feature_matrices is not None:
+            raw_matrices = feature_matrices
+        elif frames is not None:
+            if feature_type == 'invariant':
+                # Returns list of (3, N_atoms)
+                raw_matrices = _compute_feature_matrices(frames, normalized=True)
+            elif feature_type == 'soap':
+                # User has global vectors (1000, 252), convert to list of (252, 1)
+                soap_list = _compute_soap_feature_matrices(frames)
+                raw_matrices = [np.atleast_2d(s).T if s.ndim == 1 else s for s in soap_list]
+            else:
+                raise ValueError(f"Unknown feature_type: {feature_type}")
         else:
-            if frames is None:
-                raise ValueError("Must provide either 'frames' or 'precomputed_feature_matrices'.")
-            raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
+            raise ValueError("Must provide 'frames' or 'feature_matrices'.")
 
+        # 2. Optional PCA reduction
+        if feature_type == 'soap' and n_pca is not None:
+            # Flatten to (N_samples, D) for PCA
+            flat_features = np.array([m.flatten() for m in raw_matrices])
+            pca = PCA(n_components=n_pca)
+            reduced = pca.fit_transform(flat_features)
+            # Reshape back to list of (n_pca, 1)
+            raw_matrices = [r.reshape(-1, 1) for r in reduced]
+
+        # 3. Build SPD Matrices (Covariance)
         spd_matrices = []
-
-        for raw_feat in raw_matrices:
-            X = raw_feat
-
+        for X in raw_matrices:
+            # X shape is (D, N)
+            # C = (X @ X.T) / N -> shape (D, D)
             C = (X @ X.T) / X.shape[1]
+            
+            # Regularization to ensure it is strictly Positive Definite
             C += np.eye(C.shape[0]) * regularization
-
             spd_matrices.append(C)
 
         return np.array(spd_matrices)
 
-    # ---------------------------------------------------------
-
     @staticmethod
     def _log_spd(C: np.ndarray) -> np.ndarray:
-        """
-        Computes matrix logarithm of SPD matrix using eigen-decomposition.
-        """
         eigvals, eigvecs = np.linalg.eigh(C)
-
-        eigvals = np.clip(eigvals, 1e-12, None)
-
-        log_eigvals = np.log(eigvals)
-
-        return eigvecs @ np.diag(log_eigvals) @ eigvecs.T
-
-    # ---------------------------------------------------------
-
-    @classmethod
-    def _log_spd_batch(cls, spd_matrices: np.ndarray) -> np.ndarray:
-        """
-        Precompute log-SPD matrices for all frames.
-        """
-        log_mats = []
-
-        for C in tqdm(spd_matrices, desc="Computing log-SPD matrices"):
-            log_mats.append(cls._log_spd(C))
-
-        return np.array(log_mats)
-
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _distance_log_euclidean(logC1: np.ndarray, logC2: np.ndarray) -> float:
-        """
-        Log-Euclidean Riemannian distance.
-
-        d(A,B) = || log(A) - log(B) ||_F
-        """
-        if np.allclose(logC1, logC2, rtol=1e-05, atol=1e-08):
-            return 0.0
-        
-        return float(np.linalg.norm(logC1 - logC2, ord="fro"))
-
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _distance_affine_invariant(C1: np.ndarray, C2: np.ndarray) -> float:
-        """
-        Affine-Invariant Riemannian distance.
-
-        d(A,B) = sqrt( sum( log(lambda_i)^2 ) )
-        where lambda_i are generalized eigenvalues.
-        """
-
-        if np.allclose(C1, C2, rtol=1e-05, atol=1e-08):
-            return 0.0
-
-        eigvals = eigvalsh(C1, C2)
-        eigvals = np.clip(eigvals, 1e-12, None)
-
-        return float(np.sqrt(np.sum(np.log(eigvals) ** 2)))
-
-    # ---------------------------------------------------------
+        eigvals = np.clip(eigvals, 1e-9, None)
+        return eigvecs @ np.diag(np.log(eigvals)) @ eigvecs.T
 
     @classmethod
     def distance_matrix(
         cls,
-        frames: Optional[Sequence['Atoms']] = None,
+        frames=None,
+        feature_matrices=None,
+        feature_type: str = 'invariant',
         metric: str = "log-euclidean",
-        regularization: float = 1e-6,
-        normalized: bool = False,
-        feature_matrices: Optional[Sequence[np.ndarray]] = None,
-        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        regularization: float = 1e-3,
+        n_pca: int = None
     ) -> np.ndarray:
-        """
-        Computes pairwise Riemannian distance matrix for frames.
-        """
-        if feature_matrices is not None:
-            if precomputed_feature_matrices is not None:
-                raise ValueError(
-                    "Provide only one of 'feature_matrices' or 'precomputed_feature_matrices'."
-                )
-            precomputed_feature_matrices = feature_matrices
+        
+        logger.info(f"Computing Riemann distance matrix | Features: {feature_type} | Metric: {metric}")
 
-        if precomputed_feature_matrices is None and frames is None:
-            raise ValueError("Must provide either 'frames' or 'precomputed_feature_matrices'.")
-
-        num_items = (
-            len(precomputed_feature_matrices)
-            if precomputed_feature_matrices is not None
-            else len(frames)
-        )
-        logger.info(
-            f"Computing Riemannian distance matrix for {num_items} frames "
-            f"(metric='{metric}', normalized={normalized})"
-        )
-
-        metric_key = metric.lower()
-
-        if metric_key not in {"log-euclidean", "affine-invariant"}:
-            raise ValueError(
-                "metric must be one of: ['log-euclidean', 'affine-invariant']"
-            )
-
-        # Step 1: Build SPD matrices
+        # Build SPD matrices
         spd_matrices = cls._get_spd_matrices(
-            frames,
+            frames=frames, 
+            feature_matrices=feature_matrices,
+            feature_type=feature_type,
             regularization=regularization,
-            normalized=normalized,
-            precomputed_feature_matrices=precomputed_feature_matrices,
+            n_pca=n_pca
         )
+        
         n = len(spd_matrices)
-
         dist_matrix = np.zeros((n, n))
 
-        # -------------------------------------------------
-        # LOG-EUCLIDEAN METRIC
-        # -------------------------------------------------
-
-        if metric_key == "log-euclidean":
-
-            log_mats = cls._log_spd_batch(spd_matrices)
-
-            with tqdm(total=n, desc="Riemann distances", unit="material") as pbar:
-
-                for i in range(n):
-                    for j in range(i + 1, n):
-
-                        d = cls._distance_log_euclidean(log_mats[i], log_mats[j])
-
-                        dist_matrix[i, j] = dist_matrix[j, i] = d
-
-                    pbar.update(1)
-
-        # -------------------------------------------------
-        # AFFINE-INVARIANT METRIC
-        # -------------------------------------------------
+        if metric.lower() == "log-euclidean":
+            # Log-Euclidean: Compute logs once (O(n * d^3))
+            log_mats = np.array([cls._log_spd(C) for C in tqdm(spd_matrices, desc="Matrix Logs")])
+            
+            for i in tqdm(range(n), desc="Computing Distances"):
+                for j in range(i + 1, n):
+                    d = np.linalg.norm(log_mats[i] - log_mats[j], ord="fro")
+                    dist_matrix[i, j] = dist_matrix[j, i] = d
 
         else:
-
-            with tqdm(total=n, desc="Riemann distances", unit="material") as pbar:
-
-                for i in range(n):
-                    for j in range(i + 1, n):
-
-                        d = cls._distance_affine_invariant(
-                            spd_matrices[i], spd_matrices[j]
-                        )
-
-                        if np.isinf(d):
-                            d = 0.0
-
-                        dist_matrix[i, j] = dist_matrix[j, i] = d
-
-                    pbar.update(1)
-
-        logger.success("Finished Riemannian distance matrix computation.")
+            # Affine-Invariant: Solve generalized eigenvalue for every pair (O(n^2 * d^3))
+            for i in tqdm(range(n), desc="Computing Distances"):
+                for j in range(i + 1, n):
+                    try:
+                        evs = eigvalsh(spd_matrices[i], spd_matrices[j])
+                        d = np.sqrt(np.sum(np.log(np.clip(evs, 1e-9, None))**2))
+                    except:
+                        d = np.nan
+                    dist_matrix[i, j] = dist_matrix[j, i] = d
+            
+            # Fill failed calculations with max distance
+            if np.isnan(dist_matrix).any():
+                dist_matrix = np.nan_to_num(dist_matrix, nan=np.nanmax(dist_matrix))
 
         return dist_matrix

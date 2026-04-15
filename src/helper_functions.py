@@ -2,13 +2,18 @@ import os
 import chemiscope
 import json
 import webbrowser
+from io import StringIO
 import kmedoids
+import matplotlib.pyplot as plt
 import polars as pl
 import numpy as np
 
 from pathlib import Path
+from ase.io import write
 from pymatgen.io.ase import AseAtomsAdaptor
+from tqdm import tqdm
 from pymatgen.core import Structure
+from sklearn.cluster import AgglomerativeClustering, DBSCAN, SpectralClustering
 from sklearn.manifold import TSNE, Isomap, MDS
 from geomstats.learning.pca import TangentPCA
 from sklearn.decomposition import PCA, KernelPCA
@@ -20,7 +25,7 @@ from umap import UMAP
 from ase import Atoms
 
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
-from sklearn.metrics import silhouette_score, calinski_harabasz_score
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 
 
 def get_structures(df, mol_id_list = None):
@@ -92,6 +97,299 @@ def align_frames_to_dist_matrix(
         dist_matrix = dist_matrix[:min_n, :min_n]
 
     return aligned_frames if not return_matrix else (aligned_frames, dist_matrix)
+
+
+def plot_molecules_with_py3dmol(
+    molecules: Sequence[Atoms],
+    n: Optional[int] = None,
+    width: int = 320,
+    height: int = 320,
+    show_atom_labels: bool = False,
+):
+    """
+    Show the first ``n`` QM9 molecules from ``QM9Dataset.get_molecules()`` next to each
+    other using ``py3Dmol``.
+
+    Parameters
+    ----------
+    molecules
+        Sequence of ASE ``Atoms`` objects returned by ``QM9Dataset.get_molecules()``.
+    n
+        Optional number of molecules from ``molecules`` to plot. If ``None``, plot all.
+    width
+        Width in pixels for each molecule panel.
+    height
+        Height in pixels for each molecule panel.
+    show_atom_labels
+        If ``True``, show element labels on atoms.
+    """
+    if n is not None and n <= 0:
+        raise ValueError("n must be a positive integer when provided.")
+
+    selected_molecules = list(molecules if n is None else molecules[:n])
+    if not selected_molecules:
+        raise ValueError("No molecules were selected for plotting.")
+
+    try:
+        import py3Dmol
+    except ImportError as exc:
+        raise ImportError(
+            "py3Dmol support requires the `py3Dmol` package to be available."
+        ) from exc
+
+    viewer = py3Dmol.view(
+        viewergrid=(1, len(selected_molecules)),
+        width=width * len(selected_molecules),
+        height=height,
+    )
+
+    for idx, molecule in enumerate(selected_molecules):
+        if not isinstance(molecule, Atoms):
+            raise TypeError(
+                f"Expected ASE Atoms objects from get_molecules(), got {type(molecule).__name__} at index {idx}."
+            )
+
+        pdb_buffer = StringIO()
+        write(pdb_buffer, molecule, format="proteindatabank")
+        viewer.addModel(pdb_buffer.getvalue(), "pdb", viewer=(0, idx))
+        viewer.setStyle(
+            {"stick": {"radius": 0.16}, "sphere": {"scale": 0.28}},
+            viewer=(0, idx),
+        )
+        if show_atom_labels:
+            viewer.addPropertyLabels(
+                "elem",
+                "",
+                {"fontSize": 10, "showBackground": False, "alignment": "center"},
+                viewer=(0, idx),
+            )
+        viewer.zoomTo(viewer=(0, idx))
+
+    return viewer
+
+
+def plot_molecules_with_pymol(
+    frames: Sequence[Atoms],
+    n: int,
+    width: int = 320,
+    height: int = 320,
+    show_atom_labels: bool = False,
+):
+    """Backward-compatible alias that now uses ``py3Dmol``."""
+    return plot_molecules_with_py3dmol(
+        molecules=frames,
+        n=n,
+        width=width,
+        height=height,
+        show_atom_labels=show_atom_labels,
+    )
+
+
+def plot_atoms_with_pymol(
+    frames: Sequence[Atoms],
+    n: int,
+    width: int = 320,
+    height: int = 320,
+    show_atom_labels: bool = False,
+):
+    """Backward-compatible alias that now uses ``py3Dmol``."""
+    return plot_molecules_with_py3dmol(
+        molecules=frames,
+        n=n,
+        width=width,
+        height=height,
+        show_atom_labels=show_atom_labels,
+    )
+
+
+def _project_distance_matrix(
+    dist_matrix: np.ndarray,
+    projection_method: str = "PCA",
+    random_state: int = 42,
+) -> np.ndarray:
+    dist_matrix = np.asarray(dist_matrix)
+    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+        raise ValueError("dist_matrix must be a square matrix.")
+
+    method = projection_method.strip().lower()
+
+    if method == "pca":
+        reducer = PCA(n_components=2, random_state=random_state)
+        return reducer.fit_transform(dist_matrix)
+
+    if method == "kpca":
+        d2 = np.square(dist_matrix.astype(np.float64))
+        non_zero = d2[d2 > 0]
+        gamma = 1.0 / np.median(non_zero) if non_zero.size else 1.0
+        kernel = np.exp(-gamma * d2)
+        reducer = KernelPCA(n_components=2, kernel="precomputed", random_state=random_state)
+        return reducer.fit_transform(kernel)
+
+    if method in {"tsne", "t-sne"}:
+        reducer = TSNE(
+            n_components=2,
+            metric="precomputed",
+            init="random",
+            random_state=random_state,
+        )
+        return reducer.fit_transform(dist_matrix)
+
+    if method == "umap":
+        reducer = UMAP(n_components=2, metric="precomputed", random_state=random_state)
+        return reducer.fit_transform(dist_matrix)
+
+    if method == "isomap":
+        reducer = Isomap(n_components=2, metric="precomputed")
+        return reducer.fit_transform(dist_matrix)
+
+    if method == "mds":
+        reducer = MDS(n_components=2, metric=True, dissimilarity="precomputed", random_state=random_state)
+        return reducer.fit_transform(dist_matrix)
+
+    raise ValueError(
+        "Unsupported projection_method. Use one of: "
+        "'PCA', 'KPCA', 't-SNE', 'UMAP', 'ISOMAP', 'MDS'."
+    )
+
+
+def plot_distance_matrix_projection(
+    dist_matrix: np.ndarray,
+    fingerprint: str,
+    distance_metric: str,
+    projection_method: str = "PCA",
+    dataset_name: str = "qm9",
+    labels: Optional[Sequence] = None,
+    clustering_method: Optional[str] = None,
+    title: Optional[str] = None,
+    output_base_dir: str = "figures",
+    point_size: int = 55,
+    alpha: float = 0.9,
+    random_state: int = 42,
+):
+    """
+    Project a distance matrix to 2D, create a publication-friendly scatter plot,
+    and save it under ``figures/<dataset>/clustering/<distance_metric>/<fingerprint>/``.
+
+    Parameters
+    ----------
+    dist_matrix
+        Square pairwise distance matrix.
+    fingerprint
+        Fingerprint/descriptor name used to generate the distance matrix.
+    distance_metric
+        Distance metric used to generate the distance matrix.
+    projection_method
+        2D projection method. Defaults to ``PCA``.
+    dataset_name
+        Dataset name used in the output folder path.
+    labels
+        Optional labels for coloring points.
+    clustering_method
+        Optional name of the clustering method used to generate ``labels``.
+    title
+        Optional custom plot title.
+    output_base_dir
+        Root output directory. Defaults to ``figures``.
+    point_size
+        Scatter marker size.
+    alpha
+        Marker opacity.
+    random_state
+        Random seed for stochastic projection methods.
+    """
+    dist_matrix = np.asarray(dist_matrix)
+    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+        raise ValueError("dist_matrix must be a square matrix.")
+
+    n_samples = dist_matrix.shape[0]
+    if labels is not None and len(labels) != n_samples:
+        raise ValueError("labels must have the same length as dist_matrix.")
+
+    coords = _project_distance_matrix(
+        dist_matrix=dist_matrix,
+        projection_method=projection_method,
+        random_state=random_state,
+    )
+
+    projection_label = projection_method.upper() if projection_method.lower() != "t-sne" else "t-SNE"
+    fingerprint_slug = str(fingerprint).strip().lower().replace(" ", "_")
+    metric_slug = str(distance_metric).strip().lower().replace(" ", "_")
+    dataset_slug = str(dataset_name).strip().lower().replace(" ", "_")
+    clustering_slug = (
+        str(clustering_method).strip().lower().replace(" ", "_")
+        if clustering_method is not None
+        else None
+    )
+
+    output_dir = Path(output_base_dir) / dataset_slug / "clustering" / metric_slug / fingerprint_slug
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename_prefix = (
+        f"{projection_label.lower().replace('-', '_')}_{clustering_slug}_projection"
+        if clustering_slug
+        else f"{projection_label.lower().replace('-', '_')}_projection"
+    )
+    output_path = output_dir / f"{filename_prefix}.png"
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    if labels is None:
+        scatter = ax.scatter(
+            coords[:, 0],
+            coords[:, 1],
+            s=point_size,
+            alpha=alpha,
+            c="#1f77b4",
+            edgecolors="white",
+            linewidths=0.6,
+        )
+    else:
+        labels_arr = np.asarray(labels)
+        unique_labels = np.unique(labels_arr)
+        cmap = plt.get_cmap("tab20", max(len(unique_labels), 1))
+
+        for idx, label in enumerate(unique_labels):
+            mask = labels_arr == label
+            ax.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                s=point_size,
+                alpha=alpha,
+                color=cmap(idx),
+                edgecolors="white",
+                linewidths=0.6,
+                label=str(label),
+            )
+        if len(unique_labels) <= 20:
+            ax.legend(title="Label", frameon=True, loc="best")
+
+    ax.set_title(
+        title
+        or f"{dataset_slug.upper()} {projection_label} Projection\n"
+           f"Fingerprint: {fingerprint} | Distance: {distance_metric}"
+           + (
+               f" | Clustering: {clustering_method}"
+               if clustering_method is not None
+               else ""
+           ),
+        fontsize=14,
+    )
+    ax.set_xlabel(f"{projection_label} Component 1", fontsize=12)
+    ax.set_ylabel(f"{projection_label} Component 2", fontsize=12)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Saved {projection_label} projection plot to {output_path}")
+
+    return {
+        "coords": coords,
+        "figure_path": output_path,
+        "output_dir": output_dir,
+        "clustering_method": clustering_method,
+    }
 
 def get_distances(frames, frames_ph=None, dataset = 'QM9', include_ph=True):
     expected_n = len(frames)
@@ -219,6 +517,339 @@ def find_best_kmedoids_k(
     }
 
     return {"results": results, "best_k": best_k}
+
+
+def _gaussian_affinity_from_distance(dist_matrix: np.ndarray) -> np.ndarray:
+    d2 = np.square(np.asarray(dist_matrix, dtype=np.float64))
+    non_zero = d2[d2 > 0]
+    gamma = 1.0 / np.median(non_zero) if non_zero.size else 1.0
+    return np.exp(-gamma * d2)
+
+
+def _safe_silhouette_from_precomputed_distance(
+    dist_matrix: np.ndarray,
+    labels: Sequence,
+) -> Optional[float]:
+    labels = np.asarray(labels)
+    unique_labels = set(labels.tolist())
+    if -1 in unique_labels:
+        unique_labels.remove(-1)
+    if len(unique_labels) < 2:
+        return None
+    if len(unique_labels) >= len(labels):
+        return None
+    try:
+        return float(silhouette_score(dist_matrix, labels, metric="precomputed"))
+    except Exception:
+        return None
+
+
+def _safe_cluster_quality_scores(
+    dist_matrix: np.ndarray,
+    labels: Sequence,
+) -> dict[str, Optional[float]]:
+    labels = np.asarray(labels)
+    unique_labels = set(labels.tolist())
+    if -1 in unique_labels:
+        unique_labels.remove(-1)
+    if len(unique_labels) < 2 or len(unique_labels) >= len(labels):
+        return {"silhouette": None, "db_index": None, "ch_index": None}
+
+    feature_matrix = np.asarray(dist_matrix, dtype=np.float64)
+
+    try:
+        silhouette = float(silhouette_score(dist_matrix, labels, metric="precomputed"))
+    except Exception:
+        silhouette = None
+
+    try:
+        db_index = float(davies_bouldin_score(feature_matrix, labels))
+    except Exception:
+        db_index = None
+
+    try:
+        ch_index = float(calinski_harabasz_score(feature_matrix, labels))
+    except Exception:
+        ch_index = None
+
+    return {
+        "silhouette": silhouette,
+        "db_index": db_index,
+        "ch_index": ch_index,
+    }
+
+
+def evaluate_distance_matrix_clustering_sweep(
+    dist_matrix: np.ndarray,
+    fingerprint: str,
+    distance_metric: str,
+    dataset_name: str = "qm9",
+    k_range: Iterable[int] = range(2, 21),
+    eps_values: Sequence[float] = (0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 5.0),
+    min_samples_values: Sequence[int] = (2, 3, 5, 8, 10),
+    hierarchical_linkage: str = "average",
+    spectral_assign_labels: str = "kmeans",
+    output_base_dir: str = "figures",
+    title: Optional[str] = None,
+    random_state: int = 42,
+):
+    """
+    Sweep K-Medoids, hierarchical, spectral clustering, and DBSCAN over a distance
+    matrix and plot silhouette, Davies-Bouldin, and Calinski-Harabasz against the
+    number of clusters (2..20 by default).
+
+    DBSCAN is swept over ``eps_values`` and ``min_samples_values``. Its curve shows the
+    best silhouette score achieved for each produced cluster count.
+    """
+    dist_matrix = np.asarray(dist_matrix)
+    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+        raise ValueError("dist_matrix must be a square matrix.")
+
+    n = dist_matrix.shape[0]
+    k_list = [int(k) for k in k_range if 2 <= int(k) <= min(20, n - 1)]
+    if not k_list:
+        raise ValueError("k_range must contain at least one value in [2, min(20, n-1)].")
+
+    fingerprint_slug = str(fingerprint).strip().lower().replace(" ", "_")
+    metric_slug = str(distance_metric).strip().lower().replace(" ", "_")
+    dataset_slug = str(dataset_name).strip().lower().replace(" ", "_")
+    output_dir = Path(output_base_dir) / dataset_slug / "clustering" / metric_slug / fingerprint_slug
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    affinity = _gaussian_affinity_from_distance(dist_matrix)
+
+    results = {
+        "kmedoids": [],
+        "hierarchical": [],
+        "spectral": [],
+        "dbscan": [],
+    }
+    dbscan_grid_results = []
+
+    for k in tqdm(k_list, desc="Evaluation k"):
+        try:
+            model = kmedoids.KMedoids(n_clusters=k, metric="precomputed", random_state=random_state)
+            labels = model.fit_predict(dist_matrix)
+            scores = _safe_cluster_quality_scores(dist_matrix, labels)
+            results["kmedoids"].append({"k": k, **scores})
+        except Exception as exc:
+            logger.warning(f"K-Medoids failed for k={k}: {exc}")
+            results["kmedoids"].append({"k": k, "silhouette": None, "db_index": None, "ch_index": None})
+
+        try:
+            model = AgglomerativeClustering(
+                n_clusters=k,
+                metric="precomputed",
+                linkage=hierarchical_linkage,
+            )
+            labels = model.fit_predict(dist_matrix)
+            scores = _safe_cluster_quality_scores(dist_matrix, labels)
+            results["hierarchical"].append({"k": k, **scores})
+        except Exception as exc:
+            logger.warning(f"Hierarchical clustering failed for k={k}: {exc}")
+            results["hierarchical"].append({"k": k, "silhouette": None, "db_index": None, "ch_index": None})
+
+        try:
+            model = SpectralClustering(
+                n_clusters=k,
+                affinity="precomputed",
+                assign_labels=spectral_assign_labels,
+                random_state=random_state,
+            )
+            labels = model.fit_predict(affinity)
+            scores = _safe_cluster_quality_scores(dist_matrix, labels)
+            results["spectral"].append({"k": k, **scores})
+        except Exception as exc:
+            logger.warning(f"Spectral clustering failed for k={k}: {exc}")
+            results["spectral"].append({"k": k, "silhouette": None, "db_index": None, "ch_index": None})
+
+    best_dbscan_by_k = {}
+    for eps in tqdm(eps_values, desc="Evaluating epsilon and min samples"):
+        for min_samples in min_samples_values:
+            try:
+                model = DBSCAN(
+                    eps=float(eps),
+                    min_samples=int(min_samples),
+                    metric="precomputed",
+                )
+                labels = model.fit_predict(dist_matrix)
+                unique_clusters = sorted({int(x) for x in labels if int(x) != -1})
+                n_clusters = len(unique_clusters)
+                if n_clusters < 2 or n_clusters > 20:
+                    continue
+
+                scores = _safe_cluster_quality_scores(dist_matrix, labels)
+                if scores["silhouette"] is None:
+                    continue
+
+                current = best_dbscan_by_k.get(n_clusters)
+                candidate = {
+                    "k": n_clusters,
+                    **scores,
+                    "eps": float(eps),
+                    "min_samples": int(min_samples),
+                    "noise_ratio": float(np.mean(np.asarray(labels) == -1)),
+                }
+                dbscan_grid_results.append(candidate.copy())
+                if current is None or scores["silhouette"] > current["silhouette"]:
+                    best_dbscan_by_k[n_clusters] = candidate
+            except Exception as exc:
+                logger.warning(
+                    f"DBSCAN failed for eps={eps}, min_samples={min_samples}: {exc}"
+                )
+
+    for k in k_list:
+        entry = best_dbscan_by_k.get(
+            k,
+            {
+                "k": k,
+                "silhouette": None,
+                "db_index": None,
+                "ch_index": None,
+                "eps": None,
+                "min_samples": None,
+                "noise_ratio": None,
+            },
+        )
+        results["dbscan"].append(entry)
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharex=True)
+
+    plot_specs = {
+        "kmedoids": {"label": "K-Medoids", "color": "#1f77b4", "marker": "o"},
+        "hierarchical": {"label": f"Hierarchical ({hierarchical_linkage})", "color": "#ff7f0e", "marker": "s"},
+        "spectral": {"label": "Spectral", "color": "#2ca02c", "marker": "^"},
+        "dbscan": {"label": "DBSCAN (best per cluster count)", "color": "#d62728", "marker": "D"},
+    }
+
+    metric_specs = [
+        ("silhouette", "Silhouette score"),
+        ("db_index", "Davies-Bouldin index"),
+        ("ch_index", "Calinski-Harabasz index"),
+    ]
+
+    for ax, (metric_key, metric_label) in zip(axes, metric_specs):
+        for method_name, entries in results.items():
+            xs = [entry["k"] for entry in entries if entry.get(metric_key) is not None]
+            ys = [entry[metric_key] for entry in entries if entry.get(metric_key) is not None]
+            if xs:
+                spec = plot_specs[method_name]
+                ax.plot(
+                    xs,
+                    ys,
+                    label=spec["label"],
+                    color=spec["color"],
+                    marker=spec["marker"],
+                    linewidth=2,
+                    markersize=6,
+                )
+
+        ax.set_xlim(min(k_list), max(k_list))
+        ax.set_xticks(k_list)
+        ax.set_ylabel(metric_label, fontsize=12)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=True, loc="best")
+
+    axes[0].set_title(
+        title
+        or (
+            f"{dataset_slug.upper()} Clustering Sweep\n"
+            f"Fingerprint: {fingerprint} | Distance: {distance_metric}"
+        ),
+        fontsize=14,
+    )
+    for ax in axes:
+        ax.set_xlabel("Number of clusters", fontsize=12)
+
+    fig.tight_layout()
+    plot_path = output_dir / "clustering_sweep_2_to_20_clusters.png"
+    fig.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    dbscan_plot_path = output_dir / "dbscan_parameter_sweep.png"
+    if dbscan_grid_results:
+        fig_dbscan, axes_dbscan = plt.subplots(1, 4, figsize=(24, 6), sharex=False)
+        min_samples_sorted = sorted({entry["min_samples"] for entry in dbscan_grid_results})
+        cmap = plt.get_cmap("tab10", max(len(min_samples_sorted), 1))
+
+        dbscan_metric_specs = [
+            ("silhouette", "Silhouette score"),
+            ("db_index", "Davies-Bouldin index"),
+            ("ch_index", "Calinski-Harabasz index"),
+            ("k", "Number of clusters"),
+        ]
+
+        for ax, (metric_key, metric_label) in zip(axes_dbscan, dbscan_metric_specs):
+            for idx, min_samples in enumerate(min_samples_sorted):
+                entries = sorted(
+                    [entry for entry in dbscan_grid_results if entry["min_samples"] == min_samples],
+                    key=lambda entry: entry["eps"],
+                )
+                xs = [entry["eps"] for entry in entries if entry.get(metric_key) is not None]
+                ys = [entry[metric_key] for entry in entries if entry.get(metric_key) is not None]
+                if xs:
+                    ax.plot(
+                        xs,
+                        ys,
+                        label=f"min_samples={min_samples}",
+                        color=cmap(idx),
+                        marker="o",
+                        linewidth=2,
+                        markersize=5,
+                    )
+
+            ax.set_xlabel("eps", fontsize=12)
+            ax.set_ylabel(metric_label, fontsize=12)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.legend(frameon=True, loc="best")
+
+        axes_dbscan[0].set_title(
+            f"{dataset_slug.upper()} DBSCAN Parameter Sweep\n"
+            f"Fingerprint: {fingerprint} | Distance: {distance_metric}",
+            fontsize=14,
+        )
+        fig_dbscan.tight_layout()
+        fig_dbscan.savefig(dbscan_plot_path, dpi=300, bbox_inches="tight")
+        plt.show()
+    else:
+        logger.warning("No valid DBSCAN parameter combinations produced clusterings to plot.")
+        dbscan_plot_path = None
+
+    results_path = output_dir / "clustering_sweep_2_to_20_clusters.json"
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dataset_name": dataset_name,
+                "fingerprint": fingerprint,
+                "distance_metric": distance_metric,
+                "hierarchical_linkage": hierarchical_linkage,
+                "spectral_assign_labels": spectral_assign_labels,
+                "k_values": k_list,
+                "eps_values": list(eps_values),
+                "min_samples_values": list(min_samples_values),
+                "results": results,
+                "dbscan_grid_results": dbscan_grid_results,
+            },
+            f,
+            indent=2,
+        )
+
+    logger.success(f"Saved clustering sweep plot to {plot_path}")
+    if dbscan_plot_path is not None:
+        logger.success(f"Saved DBSCAN evaluation plot to {dbscan_plot_path}")
+    logger.success(f"Saved clustering sweep results to {results_path}")
+
+    return {
+        "results": results,
+        "dbscan_grid_results": dbscan_grid_results,
+        "plot_path": plot_path,
+        "dbscan_plot_path": dbscan_plot_path,
+        "results_path": results_path,
+        "output_dir": output_dir,
+    }
 
 def _open_in_browser(path_or_url):
     try:
@@ -365,6 +996,15 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
 
     print("Assembling properties for Chemiscope...")
 
+    df = df.with_columns(
+        pl.format(
+            "{} / {} / {}", 
+            pl.col("fraction_csp1").round(2), 
+            pl.col("fraction_csp2").round(2), 
+            pl.col("fraction_csp3").round(2)
+        ).alias("sp_ratio_set")
+    )
+
     properties = {
         f"{reduction_method}_1": coords[:, 0],
         f"{reduction_method}_2": coords[:, 1],
@@ -397,20 +1037,30 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             "mol_id": "mol_id",
             "Formula": "formula",
             "smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
+            "sefiles": "selfies",
             "num_atoms": "num_atoms",
-            "coordination": "coordination",
+            #"coordination": "coordination",
             "structure_class": "structure_class",
             "functional_groups": "functional_groups",
-            "gap": "gap",
-            "homo": "homo",
-            "lumo": "lumo",
-            "mu": "mu",
-            "alpha": "alpha",
-            "avg_bond_length": "avg_bond_length",
+            #"gap": "gap",
+            #"homo": "homo",
+            #"lumo": "lumo",
+            #"mu": "mu",
+            #"alpha": "alpha",
+            "hybridization_ratio": "sp_ratio_set",
+            "scaffold": "scaffold",
         }
         for prop_name, col_name in qm9_cols.items():
             if col_name in df.columns:
-                properties[prop_name] = df[col_name].to_list()
+                values = df[col_name].to_list()
+
+                # Replace SMILES/SELFIES with their lengths
+                if prop_name in ["smiles", "sefiles"]:
+                    properties[prop_name + "_length"] = [
+                        len(v) if isinstance(v, str) else 0 for v in values
+                    ]
+                else:
+                    properties[prop_name] = values
 
     settings = {
         "map": {
@@ -430,7 +1080,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     output_prefix = "materials" if dataset_kind == "materials" else "qm9"
 
     if hasattr(chemiscope, "write_html"):
-        output_html = f"{output_prefix}_{reduction_method}_clustering.html"
+        output_html = f"data/chemiscope/{output_prefix}_{reduction_method}_clustering.html"
         chemiscope.write_html(
             output_html,
             frames=frames,
@@ -469,10 +1119,36 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     return viewer
 
 
+def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> pl.DataFrame:
+    """
+    Groups a Polars DataFrame by 'cluster_label' and returns 
+    the mean of all numeric columns along with the count of elements.
+    Includes the 'token_to_atom_ratio' to measure syntactic complexity.
+    """
+    agg_exprs = [
+        pl.len().alias("count"),
+        # Calculate the mean of the individual ratios
+        (pl.col("raw_token_count") / pl.col("num_atoms")).mean().alias("token_to_atom_ratio"),
+        pl.col(pl.NUMERIC_DTYPES).mean(),
+    ]
+
+    if "structure_class" in df.columns:
+        agg_exprs.extend([
+            (pl.col("structure_class").eq("Aliphatic Ring").mean() * 100).alias("pct_aliphatic_ring"),
+            (pl.col("structure_class").eq("Aromatic").mean() * 100).alias("pct_aromatic"),
+            (pl.col("structure_class").eq("Acyclic").mean() * 100).alias("pct_acyclic"),
+        ])
+
+    summary = df.group_by(labels_col).agg(agg_exprs).sort(labels_col)
+
+    return summary
+
+
+
 if __name__ == '__main__':
     from src.datasets import QM9Dataset
     dataset = QM9Dataset()
     df = dataset.load()
-    frames = dataset.get_positions()
+    frames = dataset.get_molecules()
     matrices = get_distances(frames)
     

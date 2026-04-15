@@ -45,11 +45,33 @@ class DistanceCalculator:
         try:
             if metric == "soap_kernel":
                 # SOAP kernel distance: 1 - normalized dot product
+                zeta = 1.0  # Optional: change to 2.0 or 4.0 to sharpen the similarity
+                
+                # 1. Normalize the power spectrum vectors
                 norms = np.linalg.norm(data_array, axis=1, keepdims=True)
                 norms[norms == 0] = 1.0
                 normalized = data_array / norms
-                kernel = normalized @ normalized.T
-                matrix = 1.0 - kernel
+                
+                # 2. Compute the base rotationally-averaged overlap (dot product)
+                base_kernel = normalized @ normalized.T
+                
+                # 3. Apply the zeta exponent (with clipping to prevent NaNs on tiny negatives)
+                if zeta != 1.0:
+                    base_kernel = np.clip(base_kernel, a_min=0.0, a_max=None)
+                    kernel = base_kernel ** zeta
+                else:
+                    kernel = base_kernel
+                    
+                # 4. Compute the formal Kernel Distance: D = sqrt(2 - 2K)
+                dist_sq = 2.0 - 2.0 * kernel
+                
+                # 5. Mandatory numerical safeguards for floating-point errors
+                dist_sq = np.clip(dist_sq, a_min=0.0, a_max=None)
+                matrix = np.sqrt(dist_sq)
+                
+                # Force exact 0s on the diagonal and ensure strict symmetry
+                np.fill_diagonal(matrix, 0.0)
+                matrix = (matrix + matrix.T) / 2.0
             else:
                 condensed = pdist(data_array, metric=metric)
                 matrix = squareform(condensed)

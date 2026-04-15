@@ -4,37 +4,27 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import ks_2samp
 
-# Assuming these are your local imports
 from torch_geometric.datasets import QM9
 from src.datasets import QM9Dataset
 
 def load_qm9_samples(limit=1000):
     print("Loading sequential head sample...")
-    df_head = QM9Dataset(sampling_strategy="head", limit=limit).load(force_process=True)
+    df_head = QM9Dataset(sampling_strategy="head", limit=limit).load(force_process=False)
 
     print("Loading random sample...")
-    df_random = QM9Dataset(sampling_strategy="random", limit=limit).load(force_process=True)
+    df_random = QM9Dataset(sampling_strategy="random", limit=limit).load(force_process=False)
 
     print("Loading stratified sample...")
     df_strat = QM9Dataset(
         sampling_strategy="stratified", 
         stratify_by=['num_atoms', 'gap'], 
         limit=limit
-    ).load(force_process=True)
+    ).load(force_process=False)
 
-    return df_head, df_random, df_strat
+    df_full = QM9Dataset(limit=None).load()
 
-def extract_population_target(target_name="gap", data_root="data/QM9"):
-    """Bypasses processing to quickly extract the full population target array."""
-    print(f"\nExtracting full QM9 population targets for '{target_name}' validation...")
-    raw_dataset = QM9(root=data_root)
-    
-    # Handle num_atoms dynamically since it isn't in the data.y matrix
-    if target_name == "num_atoms":
-        return np.array([data.z.size(0) for data in raw_dataset])
-    
-    target_idx = QM9Dataset.QM9_TARGETS.index(target_name)
-    return np.array([data.y[0, target_idx].item() for data in raw_dataset])
+    return df_head, df_random, df_strat, df_full
+
 
 def evaluate_ks_tests(pop_data, strat_data, head_data, rand_data, target_name="gap"):
     """Calculates and prints the Kolmogorov-Smirnov statistics."""
@@ -74,12 +64,12 @@ def plot_distributions(pop_data, strat_data, head_data, rand_data, target_name="
     plt.close()
 
 if __name__ == "__main__":
-    df_head, df_random, df_strat = load_qm9_samples(limit=1000)
+    df_head, df_random, df_strat, pop_array = load_qm9_samples(limit=400)
     
     targets_to_evaluate = ["gap", "num_atoms"]
     
     for target in targets_to_evaluate:
-        pop_array = extract_population_target(target_name=target)
+        pop_array = pop_array[target]
 
         # Clean nulls and convert to flat numpy arrays for Scipy/Seaborn
         head_array = df_head[target].drop_nulls().to_numpy()
