@@ -17,21 +17,21 @@ class DistanceCalculator:
         self, 
         data_series: pl.Series, 
         metric: Literal['jaccard', 'euclidean', 'cosine', 'soap_kernel', 'hamming'], 
-        filename: str
+        filename: str,
+        force_calculate = False,
     ) -> np.ndarray:
         """
         Retrieves or computes the distance matrix.
         """
         file_path = os.path.join(self.cache_dir, filename)
 
-        if os.path.exists(file_path):
+        if os.path.exists(file_path) and not force_calculate:
             logger.info(f"Loading cached distance matrix from {file_path}")
             return np.load(file_path)
 
         return self._compute_and_save(data_series, metric, file_path)
 
     def _compute_and_save(self, series: pl.Series, metric: str, path: str) -> np.ndarray:
-        logger.info(f"Computing {metric} distance matrix...")
         
         data_list = series.to_list()
         

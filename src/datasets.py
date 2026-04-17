@@ -3,6 +3,7 @@ from mendeleev import element
 import os
 import polars as pl
 import numpy as np
+import torch
 import selfies as sf
 
 from ase.io import write
@@ -816,7 +817,7 @@ class QM9Dataset:
             )
         )
 
-    def add_selfies_onehot(self, flatten: bool = False) -> None:
+    def add_selfies_onehot(self, flatten: bool = True) -> None:
         if "selfies_onehot" in self.df.columns: 
             return
         self.df = self.df.with_columns(
@@ -925,7 +926,7 @@ class QM9Dataset:
         logger.success("Finished adding all requested descriptors.")
     
 
-    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard") -> 'np.ndarray':
+    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", force_calculate=False) -> 'np.ndarray':
         """
         Computes a distance matrix for a chosen descriptor.
 
@@ -998,10 +999,12 @@ class QM9Dataset:
             )
 
         series = _series_for(descriptor)
+        logger.info(f"Calculating distance matrix for {descriptor} using {dist_type} distance.")
         return self.distance_engine.get_matrix(
             series,
             metric=dist_type,
-            filename=f"dist_{descriptor}_{dist_type}.npy"
+            filename=f"dist_{descriptor}_{dist_type}.npy", 
+            force_calculate=force_calculate,
         )
 
     def run_stress_test(
@@ -1206,6 +1209,7 @@ class MaterialsProject:
         base_path: str = "data/Materials Project/",
         file_name: str = "materials.parquet",
         config_path: str = "config/api_key.json",
+        limit: Optional[int] = 2000,
         sampling_strategy: str = "head",
         stratify_on: Optional[Union[str, Sequence[str]]] = None,
         stratify_bins: int = 10,
@@ -1213,11 +1217,14 @@ class MaterialsProject:
         min_per_bin: int = 1,
         add_soap: bool = False,
         add_acsf: bool = False,
+        add_mace: bool = False,
+        add_coulomb: bool = False,
     ) -> None:
         self.base_path = base_path
         self.file_name = file_name
         self.file_path = os.path.join(self.base_path, self.file_name)
         self.api_key = self._load_api_key(config_path)
+        self.subset_size = limit
         self.sampling_strategy = sampling_strategy
         if stratify_on is None:
             self.stratify_on = ["band_gap", "energy_above_hull"]
@@ -1230,6 +1237,8 @@ class MaterialsProject:
         self.min_per_bin = min_per_bin
         self.add_soap = add_soap
         self.add_acsf = add_acsf
+        self.add_mace = add_mace
+        self.add_coulomb = add_coulomb
         self.df = pl.DataFrame()
         os.makedirs(self.base_path, exist_ok=True)
 
@@ -1245,20 +1254,22 @@ class MaterialsProject:
     def load(self, force_fetch: bool = False, limit: Optional[int] = None) -> pl.DataFrame:
         """
         Loads the full dataset from cache or fetches it.
-        If 'limit' is provided, applies sampling. If 'limit=None', returns the whole dataset.
+        Uses the init-time limit by default. If the effective limit is None,
+        returns the whole dataset.
         """
+        effective_limit = self.subset_size if limit is None else limit
         computed_full_descriptors = False
         if os.path.exists(self.file_path) and not force_fetch:
             logger.info(f"Loading full cached Parquet data from {self.file_path}...")
             self.df = pl.read_parquet(self.file_path)
         else:
             # Fetch full dataset, process, and save (skip descriptors if we're sampling)
-            compute_full_descriptors = (self.add_soap or self.add_acsf) and (limit is None)
+            compute_full_descriptors = (self.add_soap or self.add_acsf) and (effective_limit is None)
             self._fetch_from_api(compute_descriptors=compute_full_descriptors)
             computed_full_descriptors = compute_full_descriptors
 
-        # If limit is None, or if the requested limit is larger than the dataset, return everything
-        if limit is None or limit >= len(self.df):
+        # If no limit is requested, or if the requested limit is larger than the dataset, return everything
+        if effective_limit is None or effective_limit >= len(self.df):
             missing = []
             if self.add_soap and "soap_embedding" not in self.df.columns:
                 missing.append("soap_embedding")
@@ -1274,25 +1285,25 @@ class MaterialsProject:
                 logger.success("Descriptors added and full Parquet updated.")
 
             logger.info(
-                f"Limit is {limit}. Returning the full dataset ({len(self.df)} rows) without sampling."
+                f"Limit is {effective_limit}. Returning the full dataset ({len(self.df)} rows) without sampling."
             )
             return self.df
 
         # Apply sampling on the loaded Polars DataFrame
-        logger.info(f"Sampling {limit} rows using {self.sampling_strategy} strategy...")
+        logger.info(f"Sampling {effective_limit} rows using {self.sampling_strategy} strategy...")
         if self.sampling_strategy == "stratified":
-            sampled_df = self._stratified_sample_df(self.df, target_size=limit)
+            sampled_df = self._stratified_sample_df(self.df, target_size=effective_limit)
         elif self.sampling_strategy == "head":
-            sampled_df = self.df.head(limit)
+            sampled_df = self.df.head(effective_limit)
         elif self.sampling_strategy == "random":
-            sampled_df = self.df.sample(n=limit, seed=self.sampling_seed)
+            sampled_df = self.df.sample(n=effective_limit, seed=self.sampling_seed)
         else:
             raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
 
         self.df = sampled_df
 
-        if self.add_soap or self.add_acsf:
-            tag_parts = [f"sample_n{limit}", f"seed{self.sampling_seed}"]
+        if self.add_soap or self.add_acsf or self.add_mace or self.add_coulomb:
+            tag_parts = [f"sample_n{effective_limit}", f"seed{self.sampling_seed}"]
             if self.sampling_strategy:
                 tag_parts.append(self.sampling_strategy)
             output_tag = "_".join(tag_parts)
@@ -1587,34 +1598,35 @@ class MaterialsProject:
         n_max=8,
         l_max=6,
         sigma=0.5,
-        chunk_size=5000, # NEW: How many rows to process before saving to disk
+        chunk_size=5000, 
         output_tag: Optional[str] = None,
         attach_to_df: bool = True,
     ) -> None:
 
-        if not (self.add_soap or self.add_acsf):
-            logger.info("Skipping descriptor computation (add_soap=False and add_acsf=False).")
+        # 1. Check if any descriptors need to be computed
+        if not (self.add_soap or self.add_acsf or getattr(self, "add_mace", False) or getattr(self, "add_coulomb", False)):
+            logger.info("Skipping descriptor computation (all descriptor flags are False).")
             return
         
-        # 1. We only attach to the dataframe (no chunk files on disk)
         if output_tag:
-            logger.info(f"Ignoring output_tag={output_tag} since descriptors are not saved to disk.")
+            logger.info(f"Ignoring output_tag={output_tag} since descriptors are attached directly to dataframe.")
 
-        # 2. Extract unique elements efficiently
-        logger.info("Extracting unique elements from formulas...")
-        formulas = self.df["formula_pretty"].to_list()
-        unique_elements_set = set()
-        for f in formulas:
-            comp = Composition(f)
-            unique_elements_set.update([el.symbol for el in comp.elements])
-        
-        unique_elements = sorted(list(unique_elements_set))
-        weighting = {el: element(el).atomic_number for el in unique_elements}
-        
-        logger.info(f"Found {len(unique_elements)} unique elements. Warning: Feature vectors will be massive.")
+        # 2. Extract unique elements (Needed for SOAP/ACSF)
+        if self.add_soap or self.add_acsf:
+            logger.info("Extracting unique elements from formulas...")
+            formulas = self.df["formula_pretty"].to_list()
+            unique_elements_set = set()
+            for f in formulas:
+                comp = Composition(f)
+                unique_elements_set.update([el.symbol for el in comp.elements])
+            
+            unique_elements = sorted(list(unique_elements_set))
+            weighting = {el: element(el).atomic_number for el in unique_elements}
+            logger.info(f"Found {len(unique_elements)} unique elements.")
 
-        # 3. Engines (created only if requested)
-        soap_engine = None
+        # 3. Initialize Engines
+        soap_engine, acsf_engine, coulomb_engine, mace_engine = None, None, None, None
+        
         if self.add_soap:
             soap_engine = SOAP(
                 species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, 
@@ -1622,7 +1634,6 @@ class MaterialsProject:
                 compression={"mode": "mu2", "species_weighting": weighting}
             )
         
-        acsf_engine = None
         if self.add_acsf:
             acsf_engine = ACSF(
                 species=unique_elements, periodic=True, r_cut=r_cut,
@@ -1630,14 +1641,28 @@ class MaterialsProject:
                 g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
             )
 
+        if getattr(self, "add_coulomb", False):
+            from dscribe.descriptors import CoulombMatrix
+            logger.info("Calculating max atoms for Coulomb Matrix padding...")
+            max_atoms = max([json.loads(s)["num_sites"] for s in self.df["raw_structure"] if "num_sites" in json.loads(s)] or [100])
+            coulomb_engine = CoulombMatrix(n_atoms_max=max_atoms)
+
+        if getattr(self, "add_mace", False):
+            from mace.calculators import mace_mp
+            logger.info("Loading MACE-MP model...")
+            from utils.file_ops import get_device
+            mace_engine = mace_mp(model="medium", device=get_device(), default_dtype="float32")
+
         # 4. Process in Chunks
         total_rows = len(self.df)
         soap_all: List[Optional[List[float]]] = []
         acsf_all: List[Optional[List[float]]] = []
+        coulomb_all: List[Optional[List[float]]] = []
+        mace_all: List[Optional[List[float]]] = []
+        
         for chunk_idx, start_row in enumerate(range(0, total_rows, chunk_size)):
             end_row = min(start_row + chunk_size, total_rows)
             chunk_df = self.df[start_row:end_row]
-
             struct_strings = chunk_df["raw_structure"].to_list()
 
             # --- PROCESS SOAP ---
@@ -1645,7 +1670,6 @@ class MaterialsProject:
                 logger.info(f"Computing SOAP chunk {chunk_idx} ({start_row} to {end_row})...")
                 soap_features = self._compute_feature(struct_strings, soap_engine, "SOAP")
                 soap_all.extend(soap_features)
-                del soap_features
 
             # --- PROCESS ACSF ---
             if self.add_acsf:
@@ -1662,30 +1686,71 @@ class MaterialsProject:
                             normalized_acsf.append(np.mean(arr, axis=0).tolist())
                         else:
                             normalized_acsf.append(arr.ravel().tolist())
-
                 acsf_all.extend(normalized_acsf)
 
-                del raw_acsf_features
-                del normalized_acsf
+            # --- PROCESS COULOMB ---
+            if getattr(self, "add_coulomb", False):
+                logger.info(f"Computing Coulomb Matrix chunk {chunk_idx} ({start_row} to {end_row})...")
+                coulomb_features = self._compute_feature(struct_strings, coulomb_engine, "Coulomb")
+                coulomb_all.extend(coulomb_features)
 
+            # --- PROCESS MACE ---
+            if getattr(self, "add_mace", False):
+                logger.info(f"Computing MACE chunk {chunk_idx} ({start_row} to {end_row})...")
+                mace_features = self._compute_mace_features(struct_strings, mace_engine)
+                mace_all.extend(mace_features)
+
+        # 5. Attach features to DataFrame
         if attach_to_df:
-            if self.add_soap:
-                if "soap_embedding" not in self.df.columns:
-                    self.df = self.df.with_columns(
-                        pl.Series("soap_embedding", soap_all)
-                    )
-                else:
-                    logger.info("SOAP embeddings already present in dataframe; skipping attach.")
+            if self.add_soap and "soap_embedding" not in self.df.columns:
+                self.df = self.df.with_columns(pl.Series("soap_embedding", soap_all))
+                
+            if self.add_acsf and "acsf_embedding" not in self.df.columns:
+                self.df = self.df.with_columns(pl.Series("acsf_embedding", acsf_all))
+                
+            if getattr(self, "add_coulomb", False) and "coulomb_matrix" not in self.df.columns:
+                self.df = self.df.with_columns(pl.Series("coulomb_matrix", coulomb_all))
+                
+            if getattr(self, "add_mace", False) and "mace_embedding" not in self.df.columns:
+                self.df = self.df.with_columns(pl.Series("mace_embedding", mace_all))
 
-            if self.add_acsf:
-                if "acsf_embedding" not in self.df.columns:
-                    self.df = self.df.with_columns(
-                        pl.Series("acsf_embedding", acsf_all)
-                    )
-                else:
-                    logger.info("ACSF embeddings already present in dataframe; skipping attach.")
+        logger.success("All requested descriptors successfully added to dataframe.")
 
-        logger.success("All descriptors successfully added to dataframe.")
+    def _compute_mace_features(
+            self, 
+            struct_strings: List[str], 
+            mace_calc, 
+            batch_size: int = 32
+        ) -> List[Optional[List[float]]]:
+            """
+            Helper method specifically for extracting node embeddings from MACE 
+            and pooling them into global graph-level features.
+            """
+            
+            features = []
+            for i in range(0, len(struct_strings), batch_size):
+                batch_jsons = struct_strings[i : i + batch_size]
+                batch_structs = [Structure.from_dict(json.loads(s)) for s in batch_jsons]
+                
+                for struct in batch_structs:
+                    try:
+                        atoms = AseAtomsAdaptor.get_atoms(struct)
+                        
+                        desc = mace_calc.get_descriptors(atoms)
+                        
+                        if isinstance(desc, (list, tuple)):
+                            node_embeddings = np.array(desc[0])
+                        else:
+                            node_embeddings = np.array(desc)
+                            
+                        # Average the atom-level embeddings to get a single vector for the whole crystal
+                        global_embedding = np.mean(node_embeddings, axis=0).tolist()
+                        features.append(global_embedding)
+                        
+                    except Exception as e:
+                        features.append(None)
+                        
+            return features
 
 
     def _compute_feature(

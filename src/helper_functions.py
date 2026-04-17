@@ -1141,8 +1141,14 @@ def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> 
 
     summary = df.group_by(labels_col).agg(agg_exprs).sort(labels_col)
 
-    return summary
-
+    with pl.Config(
+        tbl_cols=-1,           # Show all columns
+        tbl_rows=-1,           # Show all rows
+        tbl_width_chars=1000,  # Increase total table width (default is often 80-100)
+        fmt_str_lengths=100,   # Allow strings (and column names) to be 100 chars wide
+        float_precision=4      # Control decimal space to save/standardize width
+    ):
+        print(summary)
 
 
 if __name__ == '__main__':

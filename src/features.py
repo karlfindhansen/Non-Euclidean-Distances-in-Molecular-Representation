@@ -9,6 +9,7 @@ import selfies as sf
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from transformers import AutoTokenizer, AutoModel
+from sklearn.decomposition import PCA
 from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
@@ -126,6 +127,13 @@ class MolecularFeaturizer:
                 mean_pooled = sum_embeddings / sum_mask
                 
                 embeddings.extend(mean_pooled.cpu().tolist())
+
+
+        logger.info(f"Reducing dimensions from {len(embeddings[0])} to 32 using PCA...")
+        embeddings_matrix = np.array(embeddings)
+        pca = PCA(n_components=32)
+        reduced_matrix = pca.fit_transform(embeddings_matrix)
+        embeddings = reduced_matrix.tolist()
 
         return pl.Series("selfies_transformer", embeddings)
 
