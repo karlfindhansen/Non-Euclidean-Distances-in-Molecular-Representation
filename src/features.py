@@ -129,11 +129,11 @@ class MolecularFeaturizer:
                 embeddings.extend(mean_pooled.cpu().tolist())
 
 
-        logger.info(f"Reducing dimensions from {len(embeddings[0])} to 32 using PCA...")
-        embeddings_matrix = np.array(embeddings)
-        pca = PCA(n_components=32)
-        reduced_matrix = pca.fit_transform(embeddings_matrix)
-        embeddings = reduced_matrix.tolist()
+        #logger.info(f"Reducing dimensions from {len(embeddings[0])} to 32 using PCA...")
+        #embeddings_matrix = np.array(embeddings)
+        #pca = PCA(n_components=32)
+        #reduced_matrix = pca.fit_transform(embeddings_matrix)
+        #embeddings = reduced_matrix.tolist()
 
         return pl.Series("selfies_transformer", embeddings)
 
@@ -291,7 +291,7 @@ class MolecularFeaturizer:
         else:
             logger.warning("No model_path provided. Using RANDOM (untrained) MPNN weights.")
             
-            d_h = 25
+            d_h = 4
             message_passing = nn.BondMessagePassing(d_h=d_h, depth=3)
             aggregator = nn.MeanAggregation()
             predictor = nn.RegressionFFN()

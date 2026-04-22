@@ -996,14 +996,15 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
 
     print("Assembling properties for Chemiscope...")
 
-    df = df.with_columns(
-        pl.format(
-            "{} / {} / {}", 
-            pl.col("fraction_csp1").round(2), 
-            pl.col("fraction_csp2").round(2), 
-            pl.col("fraction_csp3").round(2)
-        ).alias("sp_ratio_set")
-    )
+    if "fraction_csp1" in df.columns:
+        df = df.with_columns(
+            pl.format(
+                "{} / {} / {}", 
+                pl.col("fraction_csp1").round(2), 
+                pl.col("fraction_csp2").round(2), 
+                pl.col("fraction_csp3").round(2)
+            ).alias("sp_ratio_set")
+        )
 
     properties = {
         f"{reduction_method}_1": coords[:, 0],
@@ -1123,33 +1124,60 @@ def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> 
     """
     Groups a Polars DataFrame by 'cluster_label' and returns 
     the mean of all numeric columns along with the count of elements.
-    Includes the 'token_to_atom_ratio' to measure syntactic complexity.
+    Includes the 'token_to_atom_ratio' to measure syntactic complexity,
+    and calculates scaffold enrichment to benchmark against chemical taxonomies.
     """
-    agg_exprs = [
-        pl.len().alias("count"),
-        # Calculate the mean of the individual ratios
-        (pl.col("raw_token_count") / pl.col("num_atoms")).mean().alias("token_to_atom_ratio"),
-        pl.col(pl.NUMERIC_DTYPES).mean(),
-    ]
+    if "raw_token_count" in df.columns and "structure_class" in df.columns:
+        agg_exprs = [
+            pl.len().alias("count"),
+            # Calculate the mean of the individual ratios
+            (pl.col("raw_token_count") / pl.col("num_atoms")).mean().alias("token_to_atom_ratio"),
+            pl.col(pl.NUMERIC_DTYPES).mean(),
+        ]
 
-    if "structure_class" in df.columns:
         agg_exprs.extend([
             (pl.col("structure_class").eq("Aliphatic Ring").mean() * 100).alias("pct_aliphatic_ring"),
             (pl.col("structure_class").eq("Aromatic").mean() * 100).alias("pct_aromatic"),
             (pl.col("structure_class").eq("Acyclic").mean() * 100).alias("pct_acyclic"),
         ])
+    else:
+        agg_exprs = [pl.len().alias("count"), pl.col(pl.NUMERIC_DTYPES).mean()]
 
+    # Add metal percentage if the column exists in the dataset
+    if "is_metal" in df.columns:
+        agg_exprs.append(
+            (pl.col("is_metal").cast(pl.Float64).mean() * 100).alias("pct_metal")
+        )
+
+    # NEW: Scaffold Enrichment Metrics (Chemical Taxonomy Baseline)
+    if "scaffold_smiles" in df.columns:
+        # Get the most frequent scaffold in the cluster (first item handles ties)
+        top_scaffold_expr = pl.col("scaffold_smiles").drop_nulls().mode().first()
+        
+        agg_exprs.extend([
+            # 1. Total unique scaffolds in this cluster (Lower = More chemically pure)
+            pl.col("scaffold_smiles").n_unique().alias("unique_scaffolds"),
+            
+            # 2. The SMILES string of the dominant scaffold
+            top_scaffold_expr.alias("top_scaffold"),
+            
+            # 3. Purity/Enrichment: What % of the cluster matches this exact top scaffold?
+            ((pl.col("scaffold_smiles") == top_scaffold_expr).sum() / pl.len() * 100).alias("top_scaffold_pct")
+        ])
+
+    # Group by the cluster label and apply all aggregations
     summary = df.group_by(labels_col).agg(agg_exprs).sort(labels_col)
 
     with pl.Config(
         tbl_cols=-1,           # Show all columns
         tbl_rows=-1,           # Show all rows
-        tbl_width_chars=1000,  # Increase total table width (default is often 80-100)
-        fmt_str_lengths=100,   # Allow strings (and column names) to be 100 chars wide
-        float_precision=4      # Control decimal space to save/standardize width
+        tbl_width_chars=1000,  # Increase total table width
+        fmt_str_lengths=100,   # Allow strings (like the top_scaffold SMILES) to be visible
+        float_precision=4      # Control decimal space
     ):
         print(summary)
-
+        
+    return summary
 
 if __name__ == '__main__':
     from src.datasets import QM9Dataset

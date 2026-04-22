@@ -3,6 +3,7 @@ from mendeleev import element
 import os
 import polars as pl
 import numpy as np
+import pyarrow as pa
 import torch
 import selfies as sf
 
@@ -18,6 +19,7 @@ from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
 from tqdm import tqdm 
+from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from pymatgen.core import Structure
 from dscribe.descriptors import SOAP, ACSF
@@ -354,7 +356,10 @@ class QM9Dataset:
         scaffold_smiles = Chem.MolToSmiles(scaffold_mol, canonical=True)
 
         if not scaffold_smiles:
-            scaffold_smiles = "Acyclic"
+            scaffold_smiles, generic_scaffold = "Acyclic", "Acyclic"
+        else:
+            generic_mol = MurckoScaffold.MakeScaffoldGeneric(scaffold_mol)
+            generic_scaffold = Chem.MolToSmiles(generic_mol, canonical=True)    
 
         formula = CalcMolFormula(mol)
 
@@ -433,6 +438,7 @@ class QM9Dataset:
             "smiles": smiles,
             "canonical_smiles": canonical,
             "scaffold_smiles": scaffold_smiles,
+            "generic_scaffold": generic_scaffold,
             "selfies": selfies_str,
             "functional_groups": functional_groups_str,
             "num_atoms": int(data.num_nodes),
@@ -926,25 +932,13 @@ class QM9Dataset:
         logger.success("Finished adding all requested descriptors.")
     
 
-    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", force_calculate=False) -> 'np.ndarray':
+    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", pca_variance=None, force_calculate=False) -> np.ndarray:
         """
         Computes a distance matrix for a chosen descriptor.
-
-        Descriptors:
-            - morgan
-            - selfies_transformer (alias: transformer)
-            - selfies_onehot (alias: onehot)
-            - soap
-            - acsf
-            - coulomb_matrix
-            - chemprop
-
-        Distance types:
-            - jaccard (Tanimoto)
-            - euclidean
-            - cosine
-            - soap_kernel (1 - normalized SOAP dot product)
-            - hamming
+        
+        Args:
+            pca_variance: If float (0-1) or int (1-100), applies PCA to reduce 
+                         dimensionality before calculating distances.
         """
 
         descriptor = descriptor.lower()
@@ -952,6 +946,9 @@ class QM9Dataset:
             "transformer": "selfies_transformer",
             "onehot": "selfies_onehot",
         }
+        if dist_type == 'tanimoto':
+            dist_type = 'jaccard'
+            
         descriptor = aliases.get(descriptor, descriptor)
 
         def _series_for(desc: str) -> pl.Series:
@@ -982,28 +979,45 @@ class QM9Dataset:
                 "soap, acsf, coulomb_matrix, chemprop."
             )
 
-        if dist_type == "jaccard" and descriptor not in {"morgan", "selfies_onehot"}:
-            logger.warning(
-                "Jaccard distance is usually used for binary fingerprints. "
-                f"Descriptor='{descriptor}' may not be binary."
-            )
+        # Distance type warnings
+        if dist_type in {"jaccard", "hamming"} and descriptor not in {"morgan", "selfies_onehot"}:
+            logger.warning(f"{dist_type.capitalize()} distance is usually for binary fingerprints. '{descriptor}' may not be binary.")
         if dist_type == "soap_kernel" and descriptor != "soap":
-            logger.warning(
-                "SOAP kernel is designed for SOAP descriptors. "
-                f"Descriptor='{descriptor}' may not be compatible."
-            )
-        if dist_type == "hamming" and descriptor not in {"morgan", "selfies_onehot"}:
-            logger.warning(
-                "Hamming distance is usually used for binary fingerprints. "
-                f"Descriptor='{descriptor}' may not be binary."
-            )
+            logger.warning(f"SOAP kernel is designed for SOAP. '{descriptor}' may not be compatible.")
 
         series = _series_for(descriptor)
+
+        if pca_variance is not None:
+            n_components = pca_variance
+            if isinstance(n_components, (int, float)) and n_components > 1.0:
+                n_components = n_components / 100.0
+                
+            logger.info(f"Applying PCA to retain {n_components * 100:.2f}% of variance.")
+            
+            # Convert series to 2D NumPy array
+            X = np.array(series.to_list())
+            
+            # Only apply if we actually have enough dimensions to reduce
+            if X.shape[1] > 2:
+                pca = PCA(n_components=n_components)
+                X_reduced = pca.fit_transform(X)
+                
+                logger.info(f"PCA reduced '{descriptor}' dimensions from {X.shape[1]} to {X_reduced.shape[1]}")
+                
+                # Convert back to Polars Series of lists
+                series = pl.Series(series.name, X_reduced.tolist())
+                filename = f"dist_{descriptor}_{dist_type}_pca{n_components}.npy"
+            else:
+                logger.warning(f"Descriptor '{descriptor}' has too few dimensions for PCA. Skipping reduction.")
+                filename = f"dist_{descriptor}_{dist_type}.npy"
+        else:
+            filename = f"dist_{descriptor}_{dist_type}.npy"
+
         logger.info(f"Calculating distance matrix for {descriptor} using {dist_type} distance.")
         return self.distance_engine.get_matrix(
             series,
             metric=dist_type,
-            filename=f"dist_{descriptor}_{dist_type}.npy", 
+            filename=filename, 
             force_calculate=force_calculate,
         )
 
@@ -1251,69 +1265,118 @@ class MaterialsProject:
             logger.warning(f"Could not load API key from {path}: {e}")
             return None
 
-    def load(self, force_fetch: bool = False, limit: Optional[int] = None) -> pl.DataFrame:
-        """
-        Loads the full dataset from cache or fetches it.
-        Uses the init-time limit by default. If the effective limit is None,
-        returns the whole dataset.
-        """
-        effective_limit = self.subset_size if limit is None else limit
-        computed_full_descriptors = False
-        if os.path.exists(self.file_path) and not force_fetch:
-            logger.info(f"Loading full cached Parquet data from {self.file_path}...")
-            self.df = pl.read_parquet(self.file_path)
-        else:
-            # Fetch full dataset, process, and save (skip descriptors if we're sampling)
-            compute_full_descriptors = (self.add_soap or self.add_acsf) and (effective_limit is None)
-            self._fetch_from_api(compute_descriptors=compute_full_descriptors)
-            computed_full_descriptors = compute_full_descriptors
+    def _required_descriptor_columns(self) -> List[str]:
+        """Returns a list of descriptor columns that should be present and valid."""
+        cols = []
+        if getattr(self, "add_soap", False): cols.append("soap_embedding")
+        if getattr(self, "add_acsf", False): cols.append("acsf_embedding")
+        if getattr(self, "add_coulomb", False): cols.append("coulomb_matrix")
+        if getattr(self, "add_mace", False): cols.append("mace_embedding")
+        return cols
 
-        # If no limit is requested, or if the requested limit is larger than the dataset, return everything
-        if effective_limit is None or effective_limit >= len(self.df):
-            missing = []
-            if self.add_soap and "soap_embedding" not in self.df.columns:
-                missing.append("soap_embedding")
-            if self.add_acsf and "acsf_embedding" not in self.df.columns:
-                missing.append("acsf_embedding")
-            if missing and (self.add_soap or self.add_acsf) and not computed_full_descriptors:
-                logger.info(
-                    f"Descriptors missing from cache ({missing}); computing for ALL data."
-                )
-                if self.add_acsf or self.add_soap:
-                    self._add_descriptors()
-                self.df.write_parquet(self.file_path)
-                logger.success("Descriptors added and full Parquet updated.")
+    def _drop_rows_with_null_required_descriptors(self) -> None:
+        """Filters out rows where any of the requested 3D descriptors failed (are null or empty)."""
+        required_cols = [c for c in self._required_descriptor_columns() if c in self.df.columns]
+        if not required_cols:
+            return
 
+        before = self.df.height
+        mask = pl.lit(True)
+        for col_name in required_cols:
+            col_expr = pl.col(col_name)
+            mask = mask & col_expr.is_not_null()
+            
+            # If the column is a Polars List type, ensure it's not an empty list
+            if self.df[col_name].dtype == pl.List:
+                mask = mask & (col_expr.list.len() > 0)
+            
+        self.df = self.df.filter(mask)
+        dropped = before - self.df.height
+        if dropped > 0:
             logger.info(
-                f"Limit is {effective_limit}. Returning the full dataset ({len(self.df)} rows) without sampling."
+                f"Dropped {dropped} materials due to failed descriptor calculations. "
+                f"Remaining valid candidates: {self.df.height}"
             )
-            return self.df
 
-        # Apply sampling on the loaded Polars DataFrame
-        logger.info(f"Sampling {effective_limit} rows using {self.sampling_strategy} strategy...")
+    def _sample_materials_df(self, full_df: pl.DataFrame, target_size: int) -> pl.DataFrame:
+        """Helper to route the dataframe sampling."""
+        if target_size <= 0:
+            return full_df.clear()
+        if target_size >= full_df.height:
+            return full_df
+
         if self.sampling_strategy == "stratified":
-            sampled_df = self._stratified_sample_df(self.df, target_size=effective_limit)
+            return self._stratified_sample_df(full_df, target_size=target_size)
         elif self.sampling_strategy == "head":
-            sampled_df = self.df.head(effective_limit)
+            return full_df.head(target_size)
         elif self.sampling_strategy == "random":
-            sampled_df = self.df.sample(n=effective_limit, seed=self.sampling_seed)
+            return full_df.sample(n=target_size, seed=self.sampling_seed)
         else:
             raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
 
-        self.df = sampled_df
-
-        if self.add_soap or self.add_acsf or self.add_mace or self.add_coulomb:
-            tag_parts = [f"sample_n{effective_limit}", f"seed{self.sampling_seed}"]
-            if self.sampling_strategy:
+    def load(self, force_fetch: bool = False, limit: Optional[int] = None) -> pl.DataFrame:
+        """
+        Loads the dataset, applies sampling, computes descriptors, and ensures 
+        exactly 'limit' rows are returned by filtering out failed structures.
+        """
+        effective_limit = self.subset_size if limit is None else limit
+        
+        # 1. Load or fetch the raw full dataset
+        if os.path.exists(self.file_path) and not force_fetch:
+            logger.info(f"Loading full cached Parquet data from {self.file_path}...")
+            full_df = pl.read_parquet(self.file_path)
+        else:
+            self._fetch_from_api(compute_descriptors=False)
+            full_df = self.df
+            
+        needs_descriptors = len(self._required_descriptor_columns()) > 0
+        
+        # 2. Simple Path: No limit requested, or no descriptors to compute
+        if effective_limit is None or not needs_descriptors:
+            target = effective_limit if effective_limit is not None else full_df.height
+            self.df = self._sample_materials_df(full_df, target)
+            if needs_descriptors:
+                self._add_descriptors(attach_to_df=True)
+                self._drop_rows_with_null_required_descriptors()
+            return self.df
+            
+        # 3. Robust Path: We need exactly `effective_limit` valid rows
+        sampling_buffer = getattr(self, "sampling_buffer", 1.2)
+        candidate_target = int(min(full_df.height, max(effective_limit, np.ceil(effective_limit * sampling_buffer))))
+        
+        attempt = 0
+        while True:
+            attempt += 1
+            self.df = self._sample_materials_df(full_df, candidate_target)
+            
+            # Compute descriptors on the candidate pool
+            tag_parts = [f"sample_n{candidate_target}", f"seed{self.sampling_seed}"]
+            if self.sampling_strategy: 
                 tag_parts.append(self.sampling_strategy)
             output_tag = "_".join(tag_parts)
-            logger.info(
-                f"Computing descriptors on sampled subset ({len(self.df)} rows) "
-                f"and saving to tagged cache: {output_tag}"
-            )
-            self._add_descriptors(output_tag=output_tag)
-
-        return self.df
+            
+            self._add_descriptors(output_tag=output_tag, attach_to_df=True)
+            
+            # Dynamically drop rows that failed (e.g. Coulomb matrix returned None)
+            self._drop_rows_with_null_required_descriptors()
+            
+            # Did we end up with enough valid rows?
+            if self.df.height >= effective_limit:
+                self.df = self.df.head(effective_limit)
+                logger.success(f"Successfully reached requested limit of {effective_limit} valid rows (Attempt {attempt}).")
+                return self.df
+                
+            # If we've processed everything and still don't have enough, return what we have
+            if candidate_target >= full_df.height:
+                logger.warning(
+                    f"Exhausted the full dataset. Could only find {self.df.height} valid rows "
+                    f"(requested {effective_limit})."
+                )
+                return self.df
+                
+            # Scale up the pool and try again
+            candidate_target = int(min(full_df.height, max(candidate_target + 1, np.ceil(candidate_target * 1.5))))
+            logger.info(f"Attempt {attempt} fell short due to failed structures. Resampling with larger pool: target={candidate_target}.")
 
     def _fetch_from_api(self, compute_descriptors: bool = True) -> None:
         """
@@ -1564,7 +1627,8 @@ class MaterialsProject:
         return {
             "material_id": safe_str(get_val("material_id")),
             "formula_pretty": formula,
-            "anonymized_formula": safe_str(anon_formula), # For Prototype clustering
+            "anonymized_formula": safe_str(anon_formula),
+            "structural_prototype": f"{safe_str(anon_formula)}_{safe_str(sg)}",
             "max_en_diff": safe_float(max_en_diff), 
             "energy_per_atom": safe_float(get_val("energy_per_atom")),
             "formation_energy_per_atom": safe_float(get_val("formation_energy_per_atom")),
@@ -1598,7 +1662,7 @@ class MaterialsProject:
         n_max=8,
         l_max=6,
         sigma=0.5,
-        chunk_size=5000, 
+        chunk_size=1000, 
         output_tag: Optional[str] = None,
         attach_to_df: bool = True,
     ) -> None:
@@ -1651,7 +1715,7 @@ class MaterialsProject:
             from mace.calculators import mace_mp
             logger.info("Loading MACE-MP model...")
             from utils.file_ops import get_device
-            mace_engine = mace_mp(model="medium", device=get_device(), default_dtype="float32")
+            mace_engine = mace_mp(model="medium", device='cpu', default_dtype="float32")
 
         # 4. Process in Chunks
         total_rows = len(self.df)
@@ -1701,18 +1765,19 @@ class MaterialsProject:
                 mace_all.extend(mace_features)
 
         # 5. Attach features to DataFrame
+        # 5. Attach features to DataFrame
         if attach_to_df:
             if self.add_soap and "soap_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("soap_embedding", soap_all))
+                self.df = self.df.with_columns(pl.Series("soap_embedding", pa.array(soap_all)))
                 
             if self.add_acsf and "acsf_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("acsf_embedding", acsf_all))
+                self.df = self.df.with_columns(pl.Series("acsf_embedding", pa.array(acsf_all)))
                 
             if getattr(self, "add_coulomb", False) and "coulomb_matrix" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("coulomb_matrix", coulomb_all))
+                self.df = self.df.with_columns(pl.Series("coulomb_matrix", pa.array(coulomb_all)))
                 
             if getattr(self, "add_mace", False) and "mace_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("mace_embedding", mace_all))
+                self.df = self.df.with_columns(pl.Series("mace_embedding", pa.array(mace_all)))
 
         logger.success("All requested descriptors successfully added to dataframe.")
 
@@ -1792,3 +1857,115 @@ class MaterialsProject:
                         features.append(None)
 
         return features
+    
+    def get_distance_matrix(self, descriptor: str = "soap", dist_type: str = "euclidean", pca_variance=None, force_calculate=False) -> np.ndarray:
+        """
+        Computes a distance matrix for a chosen descriptor in the Materials dataset.
+
+        Descriptors:
+            - soap
+            - acsf
+            - coulomb_matrix (alias: coulomb)
+            - mace
+
+        Distance types:
+            - euclidean
+            - cosine
+            - soap_kernel (1 - normalized SOAP dot product)
+            - jaccard (Not recommended for continuous embeddings)
+        """
+
+        descriptor = descriptor.lower()
+        aliases = {
+            "coulomb": "coulomb_matrix",
+            "mace_embedding": "mace",
+            "soap_embedding": "soap",
+            "acsf_embedding": "acsf",
+        }
+        
+        if dist_type == 'tanimoto':
+            dist_type = 'jaccard'
+            
+        descriptor = aliases.get(descriptor, descriptor)
+
+        def _series_for(desc: str) -> pl.Series:
+            if desc == "soap":
+                if "soap_embedding" not in self.df.columns:
+                    self.add_soap = True
+                    self._add_descriptors(attach_to_df=True)
+                return self.df["soap_embedding"]
+            if desc == "acsf":
+                if "acsf_embedding" not in self.df.columns:
+                    self.add_acsf = True
+                    self._add_descriptors(attach_to_df=True)
+                return self.df["acsf_embedding"]
+            if desc == "coulomb_matrix":
+                if "coulomb_matrix" not in self.df.columns:
+                    self.add_coulomb = True
+                    self._add_descriptors(attach_to_df=True)
+                return self.df["coulomb_matrix"]
+            if desc == "mace":
+                if "mace_embedding" not in self.df.columns:
+                    self.add_mace = True
+                    self._add_descriptors(attach_to_df=True)
+                return self.df["mace_embedding"]
+            
+            raise ValueError(
+                f"Unknown descriptor: {desc}. "
+                "Expected one of: soap, acsf, coulomb_matrix, mace."
+            )
+
+        # Warn users if they use binary distances on continuous solid-state vectors
+        if dist_type in {"jaccard", "hamming"}:
+            logger.warning(
+                f"{dist_type.capitalize()} distance is usually used for binary fingerprints. "
+                f"Descriptor '{descriptor}' contains continuous float values and may yield unexpected results."
+            )
+        if dist_type == "soap_kernel" and descriptor != "soap":
+            logger.warning(
+                "SOAP kernel is designed for SOAP descriptors. "
+                f"Descriptor '{descriptor}' may not be compatible."
+            )
+
+        series = _series_for(descriptor)
+
+        if pca_variance is not None:
+
+            n_components = pca_variance
+            if isinstance(n_components, (int, float)) and n_components > 1.0:
+                n_components = n_components / 100.0
+                
+            logger.info(f"Applying PCA to retain {n_components * 100:.2f}% of variance.")
+            
+            # Convert Polars Series of lists/arrays to a 2D NumPy array
+            X = np.array(series.to_list())
+            
+            # Fit and transform
+            pca = PCA(n_components=n_components)
+            X_reduced = pca.fit_transform(X)
+            
+            logger.info(f"PCA reduced '{descriptor}' dimensions from {X.shape[1]} to {X_reduced.shape[1]}")
+            
+            # Convert back to a Polars Series of lists so distance_engine can process it
+            series = pl.Series(series.name, X_reduced.tolist())
+            
+            # Append PCA info to the cache filename so it doesn't overwrite the full-dimension cache
+            filename = f"dist_{descriptor}_{dist_type}_pca{n_components}.npy"
+        else:
+            filename = f"dist_{descriptor}_{dist_type}.npy"
+        # ---------------------------------------------------------
+
+        logger.info(f"Calculating distance matrix for {descriptor} using {dist_type} distance.")
+
+        # Instantiate DistanceCalculator dynamically if it wasn't added to __init__
+        distance_engine = getattr(self, "distance_engine", None)
+        if distance_engine is None:
+            distance_engine = DistanceCalculator(cache_dir=self.base_path)
+            self.distance_engine = distance_engine
+
+        return distance_engine.get_matrix(
+            series,
+            metric=dist_type,
+            filename=filename, 
+            force_calculate=force_calculate,
+        )
