@@ -1428,10 +1428,9 @@ def get_distance_matrices_soap(
 
 if __name__ == "__main__":
     mp = MaterialsProject(
-        add_soap=True,
-        add_acsf=False,
         stratify_on=["band_gap", "energy_above_hull"],
         sampling_strategy="stratified",
+        descriptors=["soap"],
     )
     df = mp.load(limit=1000)
 

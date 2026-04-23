@@ -269,6 +269,50 @@ class MolecularFeaturizer:
 
         return pl.Series("coulomb_matrix", features)
 
+    @staticmethod
+    def compute_mace_embeddings(
+        smiles_series: pl.Series,
+        model: str = "medium",
+        batch_size: int = 32,
+    ) -> pl.Series:
+        """
+        Computes pooled MACE embeddings from 3D molecular geometries.
+        Each molecule is embedded with RDKit, converted to ASE Atoms, then
+        mean-pooled over atom-level MACE descriptors to form a single vector.
+        """
+        logger.info(f"Computing MACE embeddings (model={model}, batch_size={batch_size})...")
+
+        from mace.calculators import mace_mp
+
+        mace_calc = mace_mp(model=model, device="cpu", default_dtype="float32")
+        smiles_list = smiles_series.to_list()
+        embeddings: list[list[float] | None] = []
+
+        for start in range(0, len(smiles_list), batch_size):
+            batch = smiles_list[start:start + batch_size]
+            for smiles in batch:
+                mol = MolecularFeaturizer._generate_3d_mol(smiles)
+                if mol is None:
+                    embeddings.append(None)
+                    continue
+
+                try:
+                    atoms = MolecularFeaturizer._rdkit_to_ase(mol)
+                    desc = mace_calc.get_descriptors(atoms)
+                    if isinstance(desc, (list, tuple)):
+                        node_embeddings = np.asarray(desc[0])
+                    else:
+                        node_embeddings = np.asarray(desc)
+
+                    if node_embeddings.ndim == 1:
+                        embeddings.append(node_embeddings.ravel().tolist())
+                    else:
+                        embeddings.append(np.mean(node_embeddings, axis=0).ravel().tolist())
+                except Exception:
+                    embeddings.append(None)
+
+        return pl.Series("mace_embedding", embeddings)
+
 
     @staticmethod
     def compute_chemprop_embeddings(

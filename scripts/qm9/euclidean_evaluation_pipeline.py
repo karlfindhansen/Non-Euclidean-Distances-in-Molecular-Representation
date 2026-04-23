@@ -8,7 +8,12 @@ from scripts.materials_project.euclidean_evaluation_pipeline import (
 
 
 if __name__ == "__main__":
-    qm9 = QM9Dataset(limit=400, stratify_by=["num_atoms", "gap"], sampling_strategy="stratified", add_soap=True)
+    qm9 = QM9Dataset(
+        limit=400,
+        stratify_by=["num_atoms", "gap"],
+        sampling_strategy="stratified",
+        descriptors=["soap"],
+    )
     df = qm9.load()
 
     output_base_dir = "figures/qm9/clustering"

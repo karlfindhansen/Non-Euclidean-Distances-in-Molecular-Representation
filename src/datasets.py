@@ -15,6 +15,8 @@ from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem import BRICS
+from rdkit.Chem.Scaffolds import rdScaffoldNetwork
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
 from mp_api.client import MPRester
 from loguru import logger
@@ -25,6 +27,7 @@ from pymatgen.core import Structure
 from dscribe.descriptors import SOAP, ACSF
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.core import Composition
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from transformers import logging as tf_log
 
 from utils.file_ops import ensure_directory, validate_columns
@@ -37,6 +40,9 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["REPORT_TO"] = "none"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+lg = RDLogger.logger()
+lg.setLevel(RDLogger.CRITICAL)
 
 class QM9Dataset:
     """
@@ -62,6 +68,27 @@ class QM9Dataset:
         "nitro": Fragments.fr_nitro,
     }
     REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups", "avg_bond_length", "scaffold_smiles"}
+    DESCRIPTOR_ALIASES = {
+        "morgan": "morgan",
+        "morgan_fingerprint": "morgan",
+        "fingerprint": "morgan",
+        "transformer": "transformer",
+        "selfies_transformer": "transformer",
+        "selformer": "transformer",
+        "onehot": "onehot",
+        "one_hot": "onehot",
+        "selfies_onehot": "onehot",
+        "soap": "soap",
+        "soap_embedding": "soap",
+        "acsf": "acsf",
+        "acsf_embedding": "acsf",
+        "mace": "mace",
+        "mace_embedding": "mace",
+        "coulomb": "coulomb",
+        "coulomb_matrix": "coulomb",
+        "chemprop": "chemprop",
+        "chemprop_embedding": "chemprop",
+    }
 
     def __init__(
         self,
@@ -76,16 +103,7 @@ class QM9Dataset:
         sampling_seed: int = 40,
         min_per_stratum: int = 1,
         sampling_buffer: float = 1.1,
-        add_morgan_fingerprint: bool = False,
-        add_selfies_transformer: bool = False,
-        add_selfies_onehot: bool = False,
-        add_soap: bool = False,
-        add_acsf: bool = False,
-        add_coulomb_matrix: bool = False,
-        add_chemprop: bool = False,
-        add_soap_embedding: Optional[bool] = None,
-        add_acsf_embedding: Optional[bool] = None,
-        add_chemprop_embedding: Optional[bool] = None,
+        descriptors: Optional[Sequence[str]] = None,
     ):
         self.root = root
         self.filename = filename
@@ -99,13 +117,16 @@ class QM9Dataset:
         self.sampling_seed = sampling_seed
         self.min_per_stratum = min_per_stratum
         self.sampling_buffer = sampling_buffer
-        self.add_morgan_fingerprint_flag = add_morgan_fingerprint
-        self.add_selfies_transformer_flag = add_selfies_transformer
-        self.add_selfies_onehot_flag = add_selfies_onehot
-        self.add_soap_embedding_flag = add_soap if add_soap_embedding is None else add_soap_embedding
-        self.add_acsf_embedding_flag = add_acsf if add_acsf_embedding is None else add_acsf_embedding
-        self.add_coulomb_matrix_flag = add_coulomb_matrix
-        self.add_chemprop_embedding_flag = add_chemprop if add_chemprop_embedding is None else add_chemprop_embedding
+        requested_descriptors = self._normalize_descriptors(descriptors)
+        self.add_morgan_fingerprint_flag = False
+        self.add_selfies_transformer_flag = False
+        self.add_selfies_onehot_flag = False
+        self.add_soap_embedding_flag = False
+        self.add_acsf_embedding_flag = False
+        self.add_mace_embedding_flag = False
+        self.add_coulomb_matrix_flag = False
+        self.add_chemprop_embedding_flag = False
+        self._set_descriptor_flags(requested_descriptors)
         self.df = pl.DataFrame()
         self.scaler = StandardScaler()
         self.is_scaled = False
@@ -119,6 +140,42 @@ class QM9Dataset:
         self.distance_engine = DistanceCalculator(cache_dir=root)
 
         RDLogger.DisableLog("rdApp.error")
+
+    @classmethod
+    def _normalize_descriptors(cls, descriptors: Optional[Sequence[str]]) -> List[str]:
+        if descriptors is None:
+            return []
+
+        normalized: List[str] = []
+        unknown: List[str] = []
+        for descriptor in descriptors:
+            key = str(descriptor).strip().lower()
+            canonical = cls.DESCRIPTOR_ALIASES.get(key)
+            if canonical is None:
+                unknown.append(str(descriptor))
+                continue
+            if canonical not in normalized:
+                normalized.append(canonical)
+
+        if unknown:
+            valid = ", ".join(sorted(set(cls.DESCRIPTOR_ALIASES.values())))
+            raise ValueError(
+                f"Unknown QM9 descriptor(s): {unknown}. "
+                f"Supported descriptors: {valid}."
+            )
+
+        return normalized
+
+    def _set_descriptor_flags(self, descriptors: Sequence[str]) -> None:
+        requested = set(descriptors)
+        self.add_morgan_fingerprint_flag = "morgan" in requested
+        self.add_selfies_transformer_flag = "transformer" in requested
+        self.add_selfies_onehot_flag = "onehot" in requested
+        self.add_soap_embedding_flag = "soap" in requested
+        self.add_acsf_embedding_flag = "acsf" in requested
+        self.add_mace_embedding_flag = "mace" in requested
+        self.add_coulomb_matrix_flag = "coulomb" in requested
+        self.add_chemprop_embedding_flag = "chemprop" in requested
 
     def _add_requested_descriptors(self) -> bool:
         """Adds descriptor columns requested at init-time; returns True if dataframe schema changed."""
@@ -141,6 +198,8 @@ class QM9Dataset:
             self.add_soap()
         if self.add_acsf_embedding_flag:
             self.add_acsf()
+        if self.add_mace_embedding_flag:
+            self.add_mace()
         if self.add_coulomb_matrix_flag:
             self.add_coulomb_matrix()
         if self.add_chemprop_embedding_flag:
@@ -361,6 +420,20 @@ class QM9Dataset:
             generic_mol = MurckoScaffold.MakeScaffoldGeneric(scaffold_mol)
             generic_scaffold = Chem.MolToSmiles(generic_mol, canonical=True)    
 
+        brics_fragments = list(BRICS.BRICSDecompose(mol))
+        scaffold_tree_nodes = []
+        root_scaffold = "Acyclic"
+
+        if scaffold_smiles != "Acyclic":
+            params = rdScaffoldNetwork.ScaffoldNetworkParams()
+            network = rdScaffoldNetwork.CreateScaffoldNetwork([mol], params)
+            scaffold_tree_nodes = list(network.nodes)
+            if scaffold_tree_nodes:
+                root_scaffold = scaffold_tree_nodes[-1]
+
+        brics_str = ",".join(brics_fragments)
+        scaffold_tree_str = ",".join(scaffold_tree_nodes)
+
         formula = CalcMolFormula(mol)
 
         structure_type = self._classify_structure_type(mol)
@@ -439,9 +512,11 @@ class QM9Dataset:
             "canonical_smiles": canonical,
             "scaffold_smiles": scaffold_smiles,
             "generic_scaffold": generic_scaffold,
+            "root_scaffold": root_scaffold,
+            "brics_fragments": brics_str,
+            "scaffold_tree_nodes": scaffold_tree_str,
             "selfies": selfies_str,
             "functional_groups": functional_groups_str,
-            "num_atoms": int(data.num_nodes),
             "structure_class": struct_class,
 
             # Physical Properties
@@ -455,6 +530,9 @@ class QM9Dataset:
             "num_heavy_atoms": int(mol.GetNumHeavyAtoms()),
             "num_rings": int(rdMolDescriptors.CalcNumRings(mol)),
             "num_aromatic_rings": int(rdMolDescriptors.CalcNumAromaticRings(mol)),
+            "num_fluorine": int(sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() in {9})),
+            "num_heteroatoms": int(rdMolDescriptors.CalcNumHeteroatoms(mol)),
+            "num_atoms": mol.GetNumAtoms(),
             "coordination": coordination,
 
             # Flexibility/Complexity & newly added string/graph complexity metrics
@@ -485,7 +563,6 @@ class QM9Dataset:
             "fr_ketone": int(Fragments.fr_ketone(mol)),
             "fr_ether": int(Fragments.fr_ether(mol)),
             "fr_nitro": int(Fragments.fr_nitro(mol)),
-            "fr_halogen": int(rdMolDescriptors.CalcNumHeteroatoms(mol)),
         }
 
         mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
@@ -564,6 +641,8 @@ class QM9Dataset:
             cols.append("soap_embedding")
         if self.add_acsf_embedding_flag:
             cols.append("acsf_embedding")
+        if self.add_mace_embedding_flag:
+            cols.append("mace_embedding")
         return cols
 
     def _requires_non_null_descriptor_rows(self) -> bool:
@@ -856,6 +935,23 @@ class QM9Dataset:
         self.df = self.df.with_columns(acsf_series.alias("acsf_embedding"))
         logger.success("Added ACSF embeddings.")
 
+    def add_mace(
+        self,
+        model: str = "medium",
+        batch_size: int = 32,
+    ) -> None:
+        """Adds MACE embeddings to the dataframe."""
+        if "mace_embedding" in self.df.columns:
+            return
+
+        mace_series = MolecularFeaturizer.compute_mace_embeddings(
+            self.df["canonical_smiles"],
+            model=model,
+            batch_size=batch_size,
+        )
+        self.df = self.df.with_columns(mace_series.alias("mace_embedding"))
+        logger.success("Added MACE embeddings.")
+
     def add_coulomb_matrix(
         self,
         n_atoms_max: int | None = None,
@@ -918,6 +1014,7 @@ class QM9Dataset:
         self.add_selfies_onehot()
         self.add_soap(r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma)
         self.add_acsf(r_cut=r_cut)
+        self.add_mace()
         self.add_coulomb_matrix(
             n_atoms_max=coulomb_n_atoms_max,
             permutation=coulomb_permutation
@@ -932,13 +1029,14 @@ class QM9Dataset:
         logger.success("Finished adding all requested descriptors.")
     
 
-    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", pca_variance=None, force_calculate=False) -> np.ndarray:
+    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", pca_components=None, force_calculate=False) -> np.ndarray:
         """
         Computes a distance matrix for a chosen descriptor.
         
         Args:
-            pca_variance: If float (0-1) or int (1-100), applies PCA to reduce 
-                         dimensionality before calculating distances.
+            pca_components: If provided, applies PCA to reduce the descriptor
+                to the requested number of dimensions before calculating
+                distances.
         """
 
         descriptor = descriptor.lower()
@@ -967,6 +1065,9 @@ class QM9Dataset:
             if desc == "acsf":
                 self.add_acsf()
                 return self.df["acsf_embedding"]
+            if desc == "mace":
+                self.add_mace()
+                return self.df["mace_embedding"]
             if desc == "coulomb_matrix":
                 self.add_coulomb_matrix()
                 return self.df["coulomb_matrix"]
@@ -976,7 +1077,7 @@ class QM9Dataset:
             raise ValueError(
                 f"Unknown descriptor: {desc}. "
                 "Expected one of: morgan, selfies_transformer, selfies_onehot, "
-                "soap, acsf, coulomb_matrix, chemprop."
+                "soap, acsf, mace, coulomb_matrix, chemprop."
             )
 
         # Distance type warnings
@@ -987,28 +1088,32 @@ class QM9Dataset:
 
         series = _series_for(descriptor)
 
-        if pca_variance is not None:
-            n_components = pca_variance
-            if isinstance(n_components, (int, float)) and n_components > 1.0:
-                n_components = n_components / 100.0
-                
-            logger.info(f"Applying PCA to retain {n_components * 100:.2f}% of variance.")
-            
+        if pca_components is not None:
+            if not isinstance(pca_components, int) or pca_components <= 0:
+                raise ValueError("pca_components must be a positive integer.")
+
             # Convert series to 2D NumPy array
             X = np.array(series.to_list())
             
             # Only apply if we actually have enough dimensions to reduce
-            if X.shape[1] > 2:
-                pca = PCA(n_components=n_components)
+            if X.shape[1] > pca_components:
+                logger.info(f"Applying PCA to reduce '{descriptor}' to {pca_components} dimensions.")
+                pca = PCA(n_components=pca_components)
                 X_reduced = pca.fit_transform(X)
+                explained_variance = float(np.sum(pca.explained_variance_ratio_))
+                logger.info(f"PCA kept {explained_variance * 100:.2f}% of the variance for '{descriptor}'.")
                 
                 logger.info(f"PCA reduced '{descriptor}' dimensions from {X.shape[1]} to {X_reduced.shape[1]}")
                 
                 # Convert back to Polars Series of lists
                 series = pl.Series(series.name, X_reduced.tolist())
-                filename = f"dist_{descriptor}_{dist_type}_pca{n_components}.npy"
+                filename = f"dist_{descriptor}_{dist_type}_pca{pca_components}.npy"
             else:
-                logger.warning(f"Descriptor '{descriptor}' has too few dimensions for PCA. Skipping reduction.")
+                logger.warning(
+                    f"Descriptor '{descriptor}' has {X.shape[1]} dimensions, "
+                    f"which is not greater than pca_components={pca_components}. "
+                    "Skipping reduction."
+                )
                 filename = f"dist_{descriptor}_{dist_type}.npy"
         else:
             filename = f"dist_{descriptor}_{dist_type}.npy"
@@ -1218,6 +1323,17 @@ class QM9Dataset:
         self.df = self.df.with_columns([scaled_df[col] for col in columns])
     
 class MaterialsProject:
+    DESCRIPTOR_ALIASES = {
+        "soap": "soap",
+        "soap_embedding": "soap",
+        "acsf": "acsf",
+        "acsf_embedding": "acsf",
+        "mace": "mace",
+        "mace_embedding": "mace",
+        "coulomb": "coulomb",
+        "coulomb_matrix": "coulomb",
+    }
+
     def __init__(
         self,
         base_path: str = "data/Materials Project/",
@@ -1229,10 +1345,7 @@ class MaterialsProject:
         stratify_bins: int = 10,
         sampling_seed: int = 40,
         min_per_bin: int = 1,
-        add_soap: bool = False,
-        add_acsf: bool = False,
-        add_mace: bool = False,
-        add_coulomb: bool = False,
+        descriptors: Optional[Sequence[str]] = None,
     ) -> None:
         self.base_path = base_path
         self.file_name = file_name
@@ -1249,12 +1362,46 @@ class MaterialsProject:
         self.stratify_bins = stratify_bins
         self.sampling_seed = sampling_seed
         self.min_per_bin = min_per_bin
-        self.add_soap = add_soap
-        self.add_acsf = add_acsf
-        self.add_mace = add_mace
-        self.add_coulomb = add_coulomb
+        requested_descriptors = self._normalize_descriptors(descriptors)
+        self.add_soap = False
+        self.add_acsf = False
+        self.add_mace = False
+        self.add_coulomb = False
+        self._set_descriptor_flags(requested_descriptors)
         self.df = pl.DataFrame()
         os.makedirs(self.base_path, exist_ok=True)
+
+    @classmethod
+    def _normalize_descriptors(cls, descriptors: Optional[Sequence[str]]) -> List[str]:
+        if descriptors is None:
+            return []
+
+        normalized: List[str] = []
+        unknown: List[str] = []
+        for descriptor in descriptors:
+            key = str(descriptor).strip().lower()
+            canonical = cls.DESCRIPTOR_ALIASES.get(key)
+            if canonical is None:
+                unknown.append(str(descriptor))
+                continue
+            if canonical not in normalized:
+                normalized.append(canonical)
+
+        if unknown:
+            valid = ", ".join(sorted(set(cls.DESCRIPTOR_ALIASES.values())))
+            raise ValueError(
+                f"Unknown Materials Project descriptor(s): {unknown}. "
+                f"Supported descriptors: {valid}."
+            )
+
+        return normalized
+
+    def _set_descriptor_flags(self, descriptors: Sequence[str]) -> None:
+        requested = set(descriptors)
+        self.add_soap = "soap" in requested
+        self.add_acsf = "acsf" in requested
+        self.add_mace = "mace" in requested
+        self.add_coulomb = "coulomb" in requested
 
     def _load_api_key(self, path: str) -> Optional[str]:
         try:
@@ -1604,6 +1751,19 @@ class MaterialsProject:
         anon_formula = None
         max_en_diff = None
 
+        # Get rigorous symmetry data
+        sga = SpacegroupAnalyzer(struct)
+        sym_dataset = sga.get_symmetry_dataset()
+
+        # Extract true baseline labels
+        pearson = sga.get_pearson_symbol()
+        wyckoff_seq = sym_dataset["wyckoffs"] if sym_dataset else []
+        # Sort and join unique wyckoff letters to match standard notation (e.g., 'a_b')
+        wyckoff_str = "_".join(sorted(list(set(wyckoff_seq))))
+
+        # The true AFLOW-style prototype
+        true_prototype = f"{safe_str(anon_formula)}_{pearson}_{safe_str(sg)}_{wyckoff_str}"
+
         if formula:
             try:
                 comp = Composition(formula)
@@ -1628,7 +1788,7 @@ class MaterialsProject:
             "material_id": safe_str(get_val("material_id")),
             "formula_pretty": formula,
             "anonymized_formula": safe_str(anon_formula),
-            "structural_prototype": f"{safe_str(anon_formula)}_{safe_str(sg)}",
+            "structural_prototype": true_prototype,
             "max_en_diff": safe_float(max_en_diff), 
             "energy_per_atom": safe_float(get_val("energy_per_atom")),
             "formation_energy_per_atom": safe_float(get_val("formation_energy_per_atom")),
@@ -1637,6 +1797,7 @@ class MaterialsProject:
             "raw_structure": json.dumps(struct.as_dict()),
             "crystal_system": safe_str(c_sys),
             "space_group": safe_str(sg),
+            "pearson_symbol": safe_str(pearson),
             "density": safe_float(get_val("density")),
             "a": safe_float(lat.a),
             "b": safe_float(lat.b),
@@ -1858,7 +2019,7 @@ class MaterialsProject:
 
         return features
     
-    def get_distance_matrix(self, descriptor: str = "soap", dist_type: str = "euclidean", pca_variance=None, force_calculate=False) -> np.ndarray:
+    def get_distance_matrix(self, descriptor: str = "soap", dist_type: str = "euclidean", pca_components=None, force_calculate=False) -> np.ndarray:
         """
         Computes a distance matrix for a chosen descriptor in the Materials dataset.
 
@@ -1873,6 +2034,11 @@ class MaterialsProject:
             - cosine
             - soap_kernel (1 - normalized SOAP dot product)
             - jaccard (Not recommended for continuous embeddings)
+
+        Args:
+            pca_components: If provided, applies PCA to reduce the descriptor
+                to the requested number of dimensions before calculating
+                distances.
         """
 
         descriptor = descriptor.lower()
@@ -1929,28 +2095,36 @@ class MaterialsProject:
 
         series = _series_for(descriptor)
 
-        if pca_variance is not None:
+        if pca_components is not None:
+            if not isinstance(pca_components, int) or pca_components <= 0:
+                raise ValueError("pca_components must be a positive integer.")
 
-            n_components = pca_variance
-            if isinstance(n_components, (int, float)) and n_components > 1.0:
-                n_components = n_components / 100.0
-                
-            logger.info(f"Applying PCA to retain {n_components * 100:.2f}% of variance.")
-            
             # Convert Polars Series of lists/arrays to a 2D NumPy array
             X = np.array(series.to_list())
             
-            # Fit and transform
-            pca = PCA(n_components=n_components)
-            X_reduced = pca.fit_transform(X)
-            
-            logger.info(f"PCA reduced '{descriptor}' dimensions from {X.shape[1]} to {X_reduced.shape[1]}")
-            
-            # Convert back to a Polars Series of lists so distance_engine can process it
-            series = pl.Series(series.name, X_reduced.tolist())
-            
-            # Append PCA info to the cache filename so it doesn't overwrite the full-dimension cache
-            filename = f"dist_{descriptor}_{dist_type}_pca{n_components}.npy"
+            if X.shape[1] > pca_components:
+                logger.info(f"Applying PCA to reduce '{descriptor}' to {pca_components} dimensions.")
+
+                # Fit and transform
+                pca = PCA(n_components=pca_components)
+                X_reduced = pca.fit_transform(X)
+                explained_variance = float(np.sum(pca.explained_variance_ratio_))
+                logger.info(f"PCA kept {explained_variance * 100:.2f}% of the variance for '{descriptor}'.")
+
+                logger.info(f"PCA reduced '{descriptor}' dimensions from {X.shape[1]} to {X_reduced.shape[1]}")
+
+                # Convert back to a Polars Series of lists so distance_engine can process it
+                series = pl.Series(series.name, X_reduced.tolist())
+
+                # Append PCA info to the cache filename so it doesn't overwrite the full-dimension cache
+                filename = f"dist_{descriptor}_{dist_type}_pca{pca_components}.npy"
+            else:
+                logger.warning(
+                    f"Descriptor '{descriptor}' has {X.shape[1]} dimensions, "
+                    f"which is not greater than pca_components={pca_components}. "
+                    "Skipping reduction."
+                )
+                filename = f"dist_{descriptor}_{dist_type}.npy"
         else:
             filename = f"dist_{descriptor}_{dist_type}.npy"
         # ---------------------------------------------------------

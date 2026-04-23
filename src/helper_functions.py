@@ -7,6 +7,7 @@ import kmedoids
 import matplotlib.pyplot as plt
 import polars as pl
 import numpy as np
+import selfies as sf
 
 from pathlib import Path
 from ase.io import write
@@ -1125,7 +1126,7 @@ def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> 
     Groups a Polars DataFrame by 'cluster_label' and returns 
     the mean of all numeric columns along with the count of elements.
     Includes the 'token_to_atom_ratio' to measure syntactic complexity,
-    and calculates scaffold enrichment to benchmark against chemical taxonomies.
+    and calculates categorical enrichment for scaffolds and material properties.
     """
     if "raw_token_count" in df.columns and "structure_class" in df.columns:
         agg_exprs = [
@@ -1149,21 +1150,55 @@ def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> 
             (pl.col("is_metal").cast(pl.Float64).mean() * 100).alias("pct_metal")
         )
 
-    # NEW: Scaffold Enrichment Metrics (Chemical Taxonomy Baseline)
-    if "scaffold_smiles" in df.columns:
-        # Get the most frequent scaffold in the cluster (first item handles ties)
-        top_scaffold_expr = pl.col("scaffold_smiles").drop_nulls().mode().first()
-        
-        agg_exprs.extend([
-            # 1. Total unique scaffolds in this cluster (Lower = More chemically pure)
-            pl.col("scaffold_smiles").n_unique().alias("unique_scaffolds"),
+    if "selfies" in df.columns:
+        agg_exprs.append(
+            pl.col("selfies")
+            .drop_nulls()
+            .map_elements(sf.len_selfies, return_dtype=pl.UInt32)
+            .mean()
+            .alias("avg_len_selfies")
+        )
+
+    # Scaffold Enrichment Metrics (Chemical Taxonomy Baseline)
+    scaffold_columns = {
+        "scaffold_smiles": ("unique_scaffolds", "top_scaffold", "top_scaffold_pct"),
+        "generic_scaffold": (
+            "unique_generic_scaffolds",
+            "top_generic_scaffold",
+            "top_generic_scaffold_pct",
+        ),
+    }
+    for scaffold_col, (unique_alias, top_alias, pct_alias) in scaffold_columns.items():
+        if scaffold_col in df.columns:
+            # Get the most frequent scaffold in the cluster (first item handles ties)
+            top_scaffold_expr = pl.col(scaffold_col).drop_nulls().mode().first()
+
+            agg_exprs.extend([
+                # 1. Total unique scaffolds in this cluster (Lower = More chemically pure)
+                pl.col(scaffold_col).n_unique().alias(unique_alias),
+
+                # 2. The dominant scaffold representation
+                top_scaffold_expr.alias(top_alias),
+
+                # 3. Purity/Enrichment: What % of the cluster matches this exact top scaffold?
+                ((pl.col(scaffold_col) == top_scaffold_expr).sum() / pl.len() * 100).alias(pct_alias)
+            ])
+
+    # Materials Informatics Metrics (Crystallography & Formulas)
+    for cat_col in ["crystal_system", "space_group", "anonymized_formula", "pearson_symbol"]:
+        if cat_col in df.columns:
+            top_expr = pl.col(cat_col).drop_nulls().mode().first()
             
-            # 2. The SMILES string of the dominant scaffold
-            top_scaffold_expr.alias("top_scaffold"),
-            
-            # 3. Purity/Enrichment: What % of the cluster matches this exact top scaffold?
-            ((pl.col("scaffold_smiles") == top_scaffold_expr).sum() / pl.len() * 100).alias("top_scaffold_pct")
-        ])
+            agg_exprs.extend([
+                # 1. Total unique categories in this cluster
+                pl.col(cat_col).n_unique().alias(f"unique_{cat_col}s"),
+                
+                # 2. The most dominant category
+                top_expr.alias(f"top_{cat_col}"),
+                
+                # 3. Purity/Enrichment: What % of the cluster matches this exact top category?
+                ((pl.col(cat_col) == top_expr).sum() / pl.len() * 100).alias(f"top_{cat_col}_pct")
+            ])
 
     # Group by the cluster label and apply all aggregations
     summary = df.group_by(labels_col).agg(agg_exprs).sort(labels_col)
@@ -1172,12 +1207,46 @@ def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> 
         tbl_cols=-1,           # Show all columns
         tbl_rows=-1,           # Show all rows
         tbl_width_chars=1000,  # Increase total table width
-        fmt_str_lengths=100,   # Allow strings (like the top_scaffold SMILES) to be visible
+        fmt_str_lengths=100,   # Allow strings to be visible
         float_precision=4      # Control decimal space
     ):
         print(summary)
         
     return summary
+
+def benchmark_functional_groups(df, cluster_col="labels_hier", fr_prefix="fr_"):
+    """
+    Evaluates which functional groups dominate each cluster.
+    Assumes df is a Polars or Pandas DataFrame containing fragment counts.
+    """
+    # Convert to pandas for easier dynamic column manipulation if using Polars
+    if hasattr(df, "to_pandas"):
+        df = df.to_pandas()
+        
+    # Isolate functional group columns
+    fg_cols = [col for col in df.columns if col.startswith(fr_prefix)]
+    
+    results = []
+    
+    # Group by the cluster labels
+    for cluster_id, group in df.groupby(cluster_col):
+        cluster_size = len(group)
+        
+        # Calculate what percentage of molecules in this cluster have >0 of each FG
+        fg_presence_pct = (group[fg_cols] > 0).mean() * 100
+        
+        # Get the top 3 most prevalent functional groups in this cluster
+        top_fgs = fg_presence_pct.nlargest(3)
+        
+        results.append({
+            "Cluster": cluster_id,
+            "Size": cluster_size,
+            "Top_FG_1": f"{top_fgs.index[0]} ({top_fgs.iloc[0]:.1f}%)",
+            "Top_FG_2": f"{top_fgs.index[1]} ({top_fgs.iloc[1]:.1f}%)",
+            "Top_FG_3": f"{top_fgs.index[2]} ({top_fgs.iloc[2]:.1f}%)"
+        })
+        
+    return results
 
 if __name__ == '__main__':
     from src.datasets import QM9Dataset
