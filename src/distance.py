@@ -56,28 +56,23 @@ class DistanceCalculator:
                 base_kernel = normalized @ normalized.T
                 
                 # 3. Apply the zeta exponent (with clipping to prevent NaNs on tiny negatives)
-                if zeta != 1.0:
-                    base_kernel = np.clip(base_kernel, a_min=0.0, a_max=None)
-                    kernel = base_kernel ** zeta
-                else:
-                    kernel = base_kernel
+                kernel_matrix = base_kernel ** zeta if zeta != 1.0 else base_kernel
                     
                 # 4. Compute the formal Kernel Distance: D = sqrt(2 - 2K)
-                dist_sq = 2.0 - 2.0 * kernel
-                
-                # 5. Mandatory numerical safeguards for floating-point errors
+                dist_sq = 2.0 - 2.0 * kernel_matrix
                 dist_sq = np.clip(dist_sq, a_min=0.0, a_max=None)
-                matrix = np.sqrt(dist_sq)
+                dist_matrix = np.sqrt(dist_sq)
                 
                 # Force exact 0s on the diagonal and ensure strict symmetry
-                np.fill_diagonal(matrix, 0.0)
-                matrix = (matrix + matrix.T) / 2.0
+                np.fill_diagonal(dist_matrix, 0.0)
+                dist_matrix = (dist_matrix + dist_matrix.T) / 2.0
+
             else:
                 condensed = pdist(data_array, metric=metric)
-                matrix = squareform(condensed)
-            np.save(path, matrix)
+                dist_matrix = squareform(condensed)
+            np.save(path, dist_matrix)
             logger.success(f"Saved distance matrix to {path}")
-            return matrix
+            return dist_matrix
         except Exception as e:
             logger.error(f"Matrix computation failed: {e}")
             raise

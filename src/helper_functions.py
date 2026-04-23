@@ -1033,7 +1033,12 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         }
         for prop_name, col_name in materials_cols.items():
             if col_name in df.columns:
-                properties[prop_name] = df[col_name].to_list()
+                # FIX: Handle null values safely for Chemiscope
+                if df[col_name].dtype in pl.NUMERIC_DTYPES:
+                    properties[prop_name] = df[col_name].fill_null(float('nan')).to_list()
+                else:
+                    properties[prop_name] = df[col_name].fill_null("N/A").to_list()
+
     else:
         qm9_cols = {
             "mol_id": "mol_id",
@@ -1041,35 +1046,34 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             "smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
             "sefiles": "selfies",
             "num_atoms": "num_atoms",
-            #"coordination": "coordination",
             "structure_class": "structure_class",
             "functional_groups": "functional_groups",
-            #"gap": "gap",
-            #"homo": "homo",
-            #"lumo": "lumo",
-            #"mu": "mu",
-            #"alpha": "alpha",
             "hybridization_ratio": "sp_ratio_set",
             "scaffold": "scaffold",
+            "outlier_type": "outlier_category",
         }
         for prop_name, col_name in qm9_cols.items():
             if col_name in df.columns:
-                values = df[col_name].to_list()
-
-                # Replace SMILES/SELFIES with their lengths
+                # FIX: Replace SMILES/SELFIES with their lengths directly
                 if prop_name in ["smiles", "sefiles"]:
+                    values = df[col_name].to_list()
                     properties[prop_name + "_length"] = [
                         len(v) if isinstance(v, str) else 0 for v in values
                     ]
+                # FIX: Properly label non-outliers instead of crashing on 'None'
+                elif col_name == "outlier_category":
+                    properties[prop_name] = df[col_name].fill_null("Native QM9").to_list()
+                # FIX: Safety net for any other numerical or categorical nulls
+                elif df[col_name].dtype in pl.NUMERIC_DTYPES:
+                    properties[prop_name] = df[col_name].fill_null(float('nan')).to_list()
                 else:
-                    properties[prop_name] = values
+                    properties[prop_name] = df[col_name].fill_null("N/A").to_list()
 
     settings = {
         "map": {
             "x": {"property": f"{reduction_method}_1"},
             "y": {"property": f"{reduction_method}_2"},
             "color": {"property": "Cluster"},
-            #"symbol": "circle",
             "size": {"factor": 35}
         },
         "structure": [{"keepOrientation": True}],
@@ -1120,13 +1124,13 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         )
     return viewer
 
-
 def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> pl.DataFrame:
     """
     Groups a Polars DataFrame by 'cluster_label' and returns 
     the mean of all numeric columns along with the count of elements.
     Includes the 'token_to_atom_ratio' to measure syntactic complexity,
-    and calculates categorical enrichment for scaffolds and material properties.
+    and calculates categorical enrichment for scaffolds, material properties,
+    and outlier categories.
     """
     if "raw_token_count" in df.columns and "structure_class" in df.columns:
         agg_exprs = [
@@ -1199,6 +1203,21 @@ def average_numeric_by_cluster(df: pl.DataFrame, labels_col="cluster_label") -> 
                 # 3. Purity/Enrichment: What % of the cluster matches this exact top category?
                 ((pl.col(cat_col) == top_expr).sum() / pl.len() * 100).alias(f"top_{cat_col}_pct")
             ])
+
+    # Outlier Category Enrichment
+    if "outlier_category" in df.columns:
+        top_outlier_expr = pl.col("outlier_category").drop_nulls().mode().first()
+        
+        agg_exprs.extend([
+            # 1. Total unique outlier categories in this cluster
+            pl.col("outlier_category").n_unique().alias("unique_outlier_categories"),
+            
+            # 2. The dominant outlier category
+            top_outlier_expr.alias("top_outlier_category"),
+            
+            # 3. Purity/Enrichment: What % of the cluster matches this exact outlier category?
+            ((pl.col("outlier_category") == top_outlier_expr).sum() / pl.len() * 100).alias("top_outlier_category_pct")
+        ])
 
     # Group by the cluster label and apply all aggregations
     summary = df.group_by(labels_col).agg(agg_exprs).sort(labels_col)

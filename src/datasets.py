@@ -103,6 +103,7 @@ class QM9Dataset:
         sampling_seed: int = 40,
         min_per_stratum: int = 1,
         sampling_buffer: float = 1.1,
+        injected_molecules: Optional[Union[pl.DataFrame, Sequence[str]]] = None,
         descriptors: Optional[Sequence[str]] = None,
     ):
         self.root = root
@@ -117,6 +118,7 @@ class QM9Dataset:
         self.sampling_seed = sampling_seed
         self.min_per_stratum = min_per_stratum
         self.sampling_buffer = sampling_buffer
+        self.injected_molecules = injected_molecules
         requested_descriptors = self._normalize_descriptors(descriptors)
         self.add_morgan_fingerprint_flag = False
         self.add_selfies_transformer_flag = False
@@ -212,6 +214,46 @@ class QM9Dataset:
         else:
             logger.info("No new descriptor columns added (already present or none requested).")
         return after_cols != before_cols
+
+    def _upsert_descriptor_column(
+        self,
+        column_name: str,
+        compute_series: callable,
+    ) -> bool:
+        """
+        Adds a descriptor column if missing, or fills null/empty values for rows that
+        were appended later (for example injected molecules).
+        Returns True when the dataframe was updated.
+        """
+        if self.df.is_empty():
+            return False
+
+        if column_name not in self.df.columns:
+            self.df = self.df.with_columns(compute_series(self.df).alias(column_name))
+            return True
+
+        indexed_df = self.df.with_row_count("_row_idx")
+        missing_mask = pl.col(column_name).is_null() | (pl.col(column_name).list.len() == 0)
+        missing_rows = indexed_df.filter(missing_mask)
+        if missing_rows.is_empty():
+            return False
+
+        updates = missing_rows.select("_row_idx").with_columns(
+            compute_series(missing_rows).alias(column_name)
+        )
+
+        self.df = (
+            indexed_df
+            .join(updates, on="_row_idx", how="left", suffix="_new")
+            .with_columns(
+                pl.coalesce(
+                    pl.col(f"{column_name}_new"),
+                    pl.col(column_name),
+                ).alias(column_name)
+            )
+            .drop("_row_idx", f"{column_name}_new")
+        )
+        return True
 
     def _select_qm9_indices(self, dataset: QM9) -> List[int]:
         """Selects QM9 indices using the configured sampling strategy."""
@@ -398,8 +440,15 @@ class QM9Dataset:
             count += 1
         return float(total / count) if count > 0 else 0.0
 
-    def _build_qm9_row(self, i: int, data) -> Optional[Dict[str, Any]]:
-        smiles = getattr(data, "smiles", None)
+    def _build_smiles_row(
+        self,
+        smiles: str,
+        mol_id: str,
+        *,
+        is_injected: int,
+        outlier_category: Optional[str] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not smiles:
             return None
 
@@ -418,7 +467,7 @@ class QM9Dataset:
             scaffold_smiles, generic_scaffold = "Acyclic", "Acyclic"
         else:
             generic_mol = MurckoScaffold.MakeScaffoldGeneric(scaffold_mol)
-            generic_scaffold = Chem.MolToSmiles(generic_mol, canonical=True)    
+            generic_scaffold = Chem.MolToSmiles(generic_mol, canonical=True)
 
         brics_fragments = list(BRICS.BRICSDecompose(mol))
         scaffold_tree_nodes = []
@@ -505,8 +554,8 @@ class QM9Dataset:
         election_affinity = float(np.mean(electron_affinities)) if electron_affinities else 0.0
         ionization_energies_value = float(np.mean(ionization_energies)) if ionization_energies else 0.0
 
-        mol_dict = {
-            "mol_id": f"qm9_{i}",
+        row = {
+            "mol_id": mol_id,
             "formula": formula,
             "smiles": smiles,
             "canonical_smiles": canonical,
@@ -518,6 +567,8 @@ class QM9Dataset:
             "selfies": selfies_str,
             "functional_groups": functional_groups_str,
             "structure_class": struct_class,
+            "is_injected": int(is_injected),
+            "outlier_category": outlier_category,
 
             # Physical Properties
             "mol_weight": int(Descriptors.MolWt(mol)),
@@ -565,8 +616,176 @@ class QM9Dataset:
             "fr_nitro": int(Fragments.fr_nitro(mol)),
         }
 
+        return row
+
+    def _build_qm9_row(self, i: int, data) -> Optional[Dict[str, Any]]:
+        smiles = getattr(data, "smiles", None)
+        mol_dict = self._build_smiles_row(
+            smiles=smiles,
+            mol_id=f"qm9_{i}",
+            is_injected=0,
+            outlier_category=None,
+        )
+        if mol_dict is None:
+            return None
+
         mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
         return mol_dict
+
+    @staticmethod
+    def _ensure_injection_columns(df: pl.DataFrame) -> pl.DataFrame:
+        if "is_injected" in df.columns:
+            df = df.with_columns(
+                pl.col("is_injected").fill_null(0).cast(pl.Int64, strict=False)
+            )
+        else:
+            df = df.with_columns(pl.lit(0).cast(pl.Int64).alias("is_injected"))
+
+        if "outlier_category" not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("outlier_category"))
+        else:
+            df = df.with_columns(pl.col("outlier_category").cast(pl.Utf8, strict=False))
+
+        return df
+
+    def _next_injected_mol_id(self) -> int:
+        if self.df.is_empty() or "mol_id" not in self.df.columns:
+            return 0
+
+        injected_ids = (
+            self.df
+            .filter(pl.col("mol_id").cast(pl.Utf8).str.starts_with("injected_"))
+            .select(
+                pl.col("mol_id")
+                .cast(pl.Utf8)
+                .str.replace("injected_", "")
+                .cast(pl.Int64, strict=False)
+                .alias("idx")
+            )
+            .drop_nulls()
+        )
+        if injected_ids.is_empty():
+            return 0
+        return int(injected_ids["idx"].max()) + 1
+
+    @staticmethod
+    def _align_to_schema(df: pl.DataFrame, columns: List[str]) -> pl.DataFrame:
+        aligned = df
+        missing = [col for col in columns if col not in aligned.columns]
+        if missing:
+            aligned = aligned.with_columns(
+                [pl.lit(None).alias(col) for col in missing]
+            )
+        return aligned.select(columns)
+
+    def _apply_configured_injections(self) -> None:
+        """Inject molecules provided at init-time into the current sampled dataframe."""
+        if self.injected_molecules is None:
+            return
+        self.inject_outliers(self.injected_molecules)
+
+    def _base_row_count(self) -> int:
+        if self.df.is_empty() or "is_injected" not in self.df.columns:
+            return self.df.height
+        return self.df.filter(pl.col("is_injected") != 1).height
+
+    def _finalize_loaded_dataframe(self) -> pl.DataFrame:
+        """
+        Keeps the requested number of base QM9 molecules and preserves all injected rows.
+        """
+        if self.df.is_empty() or "is_injected" not in self.df.columns:
+            self.df = self.df.head(self.subset_size)
+            return self.df
+
+        base_df = self.df.filter(pl.col("is_injected") != 1).head(self.subset_size)
+        injected_df = self.df.filter(pl.col("is_injected") == 1)
+        self.df = pl.concat([base_df, injected_df], how="vertical_relaxed")
+        return self.df
+
+    def inject_outliers(
+        self,
+        outliers: Union[pl.DataFrame, Sequence[str]],
+    ) -> pl.DataFrame:
+        """
+        Appends user-supplied outliers and tags them with `is_injected=1`.
+        Accepts either:
+        - a Polars dataframe with at least a `smiles` column and optionally `outlier_category`
+        - a sequence of SMILES strings
+        Call `load()` before injecting so there is a base dataframe to extend.
+        """
+        if self.df.is_empty():
+            raise ValueError("Dataset is empty. Call `load()` before injecting outliers.")
+
+        if isinstance(outliers, pl.DataFrame):
+            if outliers.is_empty():
+                self.df = self._ensure_injection_columns(self.df)
+                return self.df
+            if "smiles" not in outliers.columns:
+                raise ValueError("Outlier dataframe must contain a `smiles` column.")
+            normalized_outliers = outliers.with_columns(
+                pl.col("smiles").cast(pl.Utf8, strict=False),
+                (
+                    pl.col("outlier_category").cast(pl.Utf8, strict=False)
+                    if "outlier_category" in outliers.columns
+                    else pl.lit(None).cast(pl.Utf8).alias("outlier_category")
+                ),
+            )
+            outlier_records = normalized_outliers.to_dicts()
+        else:
+            if not outliers:
+                self.df = self._ensure_injection_columns(self.df)
+                return self.df
+            outlier_records = [
+                {"smiles": str(smiles), "outlier_category": None}
+                for smiles in outliers
+            ]
+
+        self.df = self._ensure_injection_columns(self.df)
+        if not outlier_records:
+            return self.df
+
+        next_idx = self._next_injected_mol_id()
+        injected_rows: List[Dict[str, Any]] = []
+        failed_smiles: List[str] = []
+
+        for record in outlier_records:
+            smiles = record["smiles"]
+            mol_dict = self._build_smiles_row(
+                smiles=str(smiles),
+                mol_id=f"injected_{next_idx}",
+                is_injected=1,
+                outlier_category=record.get("outlier_category"),
+                extra_fields=record,
+            )
+            if mol_dict is None:
+                failed_smiles.append(str(smiles))
+                continue
+            injected_rows.append(mol_dict)
+            next_idx += 1
+
+        if not injected_rows:
+            raise ValueError(
+                "None of the provided SMILES could be parsed and embedded for injection."
+            )
+
+        injected_df = pl.DataFrame(injected_rows)
+        injected_df = self._align_to_schema(injected_df, self.df.columns)
+        self.df = pl.concat([self.df, injected_df], how="vertical_relaxed")
+
+        # Ensure any descriptors that were already requested are populated for new rows.
+        self._add_requested_descriptors()
+
+        if failed_smiles:
+            logger.warning(
+                "Some injected SMILES were skipped because parsing or 3D embedding failed: "
+                f"{failed_smiles}"
+            )
+
+        logger.info(
+            "Injected custom outliers into QM9 dataframe: "
+            f"requested={len(outlier_records)}, injected={len(injected_rows)}, total_rows={self.df.height}."
+        )
+        return self.df
 
     def load(self, force_process: bool = False) -> pl.DataFrame:
         """
@@ -587,6 +806,8 @@ class QM9Dataset:
         needs_non_null_descriptor_filter = self._requires_non_null_descriptor_rows()
         if not needs_non_null_descriptor_filter:
             self.df = self._sample_qm9_df(full_df, self.subset_size)
+            self.df = self._ensure_injection_columns(self.df)
+            self._apply_configured_injections()
             self._add_requested_descriptors()
             return self.df
 
@@ -603,21 +824,27 @@ class QM9Dataset:
         while True:
             attempt += 1
             self.df = self._sample_qm9_df(full_df, candidate_target)
+            self.df = self._ensure_injection_columns(self.df)
+            self._apply_configured_injections()
             self._add_requested_descriptors()
             self._drop_rows_with_null_required_descriptors()
 
-            if self.df.height >= self.subset_size:
-                self.df = self.df.head(self.subset_size)
+            base_count = self._base_row_count()
+            if base_count >= self.subset_size:
+                self._finalize_loaded_dataframe()
                 logger.info(
                     "QM9 descriptor null-filtering complete: "
-                    f"attempts={attempt}, requested_limit={self.subset_size}, returned_rows={self.df.height}."
+                    f"attempts={attempt}, requested_limit={self.subset_size}, "
+                    f"returned_rows={self.df.height}, base_rows={base_count}."
                 )
                 return self.df
 
             if candidate_target >= full_df.height:
+                self._finalize_loaded_dataframe()
                 logger.warning(
                     "Unable to reach requested QM9 limit after filtering null descriptor rows. "
                     f"requested_limit={self.subset_size}, returned_rows={self.df.height}, "
+                    f"base_rows={base_count}, "
                     f"descriptor_cols={self._required_descriptor_columns()}."
                 )
                 return self.df
@@ -885,55 +1112,53 @@ class QM9Dataset:
             return None
 
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
-        if "morgan_fingerprint" in self.df.columns: 
-            return
-        self.df = self.df.with_columns(
-            MolecularFeaturizer.compute_morgan_fingerprints(
-                self.df["canonical_smiles"], radius, fp_size
-            ).alias("morgan_fingerprint")
+        self._upsert_descriptor_column(
+            "morgan_fingerprint",
+            lambda frame: MolecularFeaturizer.compute_morgan_fingerprints(
+                frame["canonical_smiles"], radius, fp_size
+            ),
         )
 
     def add_selfies_transformer(self, model_name: str = "HUBioDataLab/SELFormer") -> None:
-        if "selfies_transformer" in self.df.columns: 
-            return
-        self.df = self.df.with_columns(
-            MolecularFeaturizer.compute_selfies_transformer(
-                self.df["selfies"], model_name
-            )
+        self._upsert_descriptor_column(
+            "selfies_transformer",
+            lambda frame: MolecularFeaturizer.compute_selfies_transformer(
+                frame["selfies"], model_name
+            ),
         )
 
     def add_selfies_onehot(self, flatten: bool = True) -> None:
-        if "selfies_onehot" in self.df.columns: 
-            return
-        self.df = self.df.with_columns(
-            MolecularFeaturizer.compute_selfies_onehot(
-                self.df["selfies"],
+        self._upsert_descriptor_column(
+            "selfies_onehot",
+            lambda frame: MolecularFeaturizer.compute_selfies_onehot(
+                frame["selfies"],
                 flatten=flatten
-            )
+            ),
         )
 
     def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
         """Adds SOAP descriptors to the dataframe."""
-        if "soap_embedding" in self.df.columns: 
-            return
         
-        soap_series = MolecularFeaturizer.compute_soap(
-            self.df["canonical_smiles"], 
-            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma
+        updated = self._upsert_descriptor_column(
+            "soap_embedding",
+            lambda frame: MolecularFeaturizer.compute_soap(
+                frame["canonical_smiles"],
+                r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma
+            ),
         )
-        self.df = self.df.with_columns(soap_series.alias("soap_embedding"))
-        logger.success("Added SOAP embeddings.")
+        if updated:
+            logger.success("Added SOAP embeddings.")
 
     def add_acsf(self, r_cut=6.0) -> None:
         """Adds ACSF descriptors to the dataframe."""
-        if "acsf_embedding" in self.df.columns: 
-            return
-        
-        acsf_series = MolecularFeaturizer.compute_acsf(
-            self.df["canonical_smiles"], r_cut=r_cut
+        updated = self._upsert_descriptor_column(
+            "acsf_embedding",
+            lambda frame: MolecularFeaturizer.compute_acsf(
+                frame["canonical_smiles"], r_cut=r_cut
+            ),
         )
-        self.df = self.df.with_columns(acsf_series.alias("acsf_embedding"))
-        logger.success("Added ACSF embeddings.")
+        if updated:
+            logger.success("Added ACSF embeddings.")
 
     def add_mace(
         self,
@@ -941,16 +1166,16 @@ class QM9Dataset:
         batch_size: int = 32,
     ) -> None:
         """Adds MACE embeddings to the dataframe."""
-        if "mace_embedding" in self.df.columns:
-            return
-
-        mace_series = MolecularFeaturizer.compute_mace_embeddings(
-            self.df["canonical_smiles"],
-            model=model,
-            batch_size=batch_size,
+        updated = self._upsert_descriptor_column(
+            "mace_embedding",
+            lambda frame: MolecularFeaturizer.compute_mace_embeddings(
+                frame["canonical_smiles"],
+                model=model,
+                batch_size=batch_size,
+            ),
         )
-        self.df = self.df.with_columns(mace_series.alias("mace_embedding"))
-        logger.success("Added MACE embeddings.")
+        if updated:
+            logger.success("Added MACE embeddings.")
 
     def add_coulomb_matrix(
         self,
@@ -958,32 +1183,29 @@ class QM9Dataset:
         permutation: str = "sorted_l2"
     ) -> None:
         """Adds Coulomb matrix descriptors to the dataframe."""
-        if "coulomb_matrix" in self.df.columns:
-            return
-
-        coulomb_series = MolecularFeaturizer.compute_coulomb_matrix(
-            self.df["canonical_smiles"],
-            n_atoms_max=n_atoms_max,
-            permutation=permutation
+        updated = self._upsert_descriptor_column(
+            "coulomb_matrix",
+            lambda frame: MolecularFeaturizer.compute_coulomb_matrix(
+                frame["canonical_smiles"],
+                n_atoms_max=n_atoms_max,
+                permutation=permutation
+            ),
         )
-        self.df = self.df.with_columns(coulomb_series.alias("coulomb_matrix"))
-        logger.success("Added Coulomb matrix descriptors.")
+        if updated:
+            logger.success("Added Coulomb matrix descriptors.")
 
     def add_chemprop(
         self,
         model_path: str | None = None,
         batch_size: int = 64
     ) -> None:
-
-        if "chemprop_embedding" in self.df.columns:
-            return
-
-        self.df = self.df.with_columns(
-            MolecularFeaturizer.compute_chemprop_embeddings(
-                self.df["canonical_smiles"],
+        self._upsert_descriptor_column(
+            "chemprop_embedding",
+            lambda frame: MolecularFeaturizer.compute_chemprop_embeddings(
+                frame["canonical_smiles"],
                 model_path=model_path,
                 batch_size=batch_size
-            ).alias("chemprop_embedding")
+            ),
         )
 
     def add_all_descriptors(
@@ -1087,7 +1309,6 @@ class QM9Dataset:
             logger.warning(f"SOAP kernel is designed for SOAP. '{descriptor}' may not be compatible.")
 
         series = _series_for(descriptor)
-
         if pca_components is not None:
             if not isinstance(pca_components, int) or pca_components <= 0:
                 raise ValueError("pca_components must be a positive integer.")

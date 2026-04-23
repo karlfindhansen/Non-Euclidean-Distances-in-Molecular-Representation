@@ -9,11 +9,9 @@ import selfies as sf
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from transformers import AutoTokenizer, AutoModel
-from sklearn.decomposition import PCA
 from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
-from mendeleev import element
 from dscribe.descriptors import SOAP, ACSF, CoulombMatrix
 
 class MolecularFeaturizer:
@@ -160,19 +158,25 @@ class MolecularFeaturizer:
         return pl.Series("selfies_onehot", [_encode(s) for s in selfies_series.to_list()])
 
     @staticmethod
-    def compute_soap(smiles_series: pl.Series, r_cut=6.0, n_max=8, l_max=6, sigma=0.5, species=None) -> pl.Series:
+    def compute_soap(smiles_series: pl.Series, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> pl.Series:
         """
         Computes SOAP descriptors (Smooth Overlap of Atomic Positions).
         Returns the mean vector of atomic SOAP features for each molecule.
         """
-        if species is None: species = ["C", "H", "O", "N", "F"]
-        
+
+        species_set = set()
+        for smi in smiles_series:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue 
+
+            for atom in mol.GetAtoms():
+                species_set.add(atom.GetSymbol())
+
         logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max})...")
-        unique_elements = set(species)
-        weighting = {el: element(el).atomic_number for el in unique_elements}
         soap_engine = SOAP(
-            species=species, periodic=False, 
-            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, average='inner', compression={"mode": "mu1nu1", "species_weighting": weighting}
+            species=sorted(species_set), periodic=False, 
+            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, average='inner', compression={"mode": "mu1nu1"}
         )
 
         def _compute_single_soap(s):
@@ -191,17 +195,24 @@ class MolecularFeaturizer:
         return smiles_series.map_elements(_compute_single_soap, return_dtype=pl.List(pl.Float64))
 
     @staticmethod
-    def compute_acsf(smiles_series: pl.Series, r_cut=6.0, species=None) -> pl.Series:
+    def compute_acsf(smiles_series: pl.Series, r_cut=6.0) -> pl.Series:
         """
         Computes ACSF (Atom-Centered Symmetry Functions).
         Returns the mean vector of atomic ACSF features.
         """
-        if species is None: species = ["C", "H", "O", "N", "F"]
+        species_set = set()
+        for smi in smiles_series:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue 
+
+            for atom in mol.GetAtoms():
+                species_set.add(atom.GetSymbol())
         
         logger.info(f"Computing ACSF (rcut={r_cut})...")
         
         acsf_engine = ACSF(
-            species=species, periodic=False, r_cut=r_cut,
+            species=sorted(species_set), periodic=False, r_cut=r_cut,
             g2_params=[[1, 1], [1, 2], [1, 3]],
             g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]]
         )
@@ -282,9 +293,9 @@ class MolecularFeaturizer:
         """
         logger.info(f"Computing MACE embeddings (model={model}, batch_size={batch_size})...")
 
-        from mace.calculators import mace_mp
+        from mace.calculators import mace_off
 
-        mace_calc = mace_mp(model=model, device="cpu", default_dtype="float32")
+        mace_calc = mace_off(model=model, device="cpu", default_dtype="float32")
         smiles_list = smiles_series.to_list()
         embeddings: list[list[float] | None] = []
 
