@@ -1,5 +1,3 @@
-from utils.file_ops import get_device
-
 import numpy as np
 from scipy.spatial.distance import pdist
 import polars as pl
@@ -13,6 +11,8 @@ from loguru import logger
 from chemprop import data, featurizers, models, nn
 from ase import Atoms
 from dscribe.descriptors import SOAP, ACSF, CoulombMatrix
+
+from utils.file_ops import get_device
 
 class MolecularFeaturizer:
     """
@@ -54,15 +54,31 @@ class MolecularFeaturizer:
         )
 
     @staticmethod
-    def _descriptor_to_list(vec, reduce: str | None = None) -> list[float]:
+    def _format_descriptor_output(
+        vec,
+        output_mode: str = "pooled",
+        reduce: str | None = "mean",
+    ) -> list[float] | list[list[float]] | None:
         """
-        Convert a descriptor output into a flat Python list.
-        If reduce == "mean" and vec is 2D, mean-pool over atoms.
+        Convert a descriptor output into either a pooled 1D list or a matrix-shaped
+        nested list.
         """
         if vec is None:
             return None
 
-        arr = np.asarray(vec)
+        mode = output_mode.strip().lower()
+        if mode not in {"pooled", "matrix"}:
+            raise ValueError(f"Unsupported output_mode '{output_mode}'. Expected 'pooled' or 'matrix'.")
+
+        arr = np.asarray(vec, dtype=np.float64)
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+
+        if mode == "matrix":
+            return np.atleast_2d(arr).tolist()
+
         if arr.ndim == 1:
             return arr.ravel().tolist()
         if reduce == "mean":
@@ -151,11 +167,19 @@ class MolecularFeaturizer:
         return pl.Series("selfies_onehot", [_encode(s) for s in selfies_series.to_list()])
 
     @staticmethod
-    def compute_soap(smiles_series: pl.Series, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> pl.Series:
+    def compute_soap(
+        smiles_series: pl.Series,
+        r_cut=6.0,
+        n_max=8,
+        l_max=6,
+        sigma=0.5,
+        output_mode: str = "pooled",
+    ) -> pl.Series:
         """
         Computes SOAP descriptors (Smooth Overlap of Atomic Positions).
-        Returns the mean vector of atomic SOAP features for each molecule.
+        Returns either pooled vectors or atom-level descriptor matrices.
         """
+        mode = output_mode.strip().lower()
 
         species_set = set()
         for smi in smiles_series:
@@ -169,7 +193,12 @@ class MolecularFeaturizer:
         logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max})...")
         soap_engine = SOAP(
             species=sorted(species_set), periodic=False, 
-            r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma, average='inner', compression={"mode": "mu1nu1"}
+            r_cut=r_cut,
+            n_max=n_max,
+            l_max=l_max,
+            sigma=sigma,
+            average="inner" if output_mode == 'pooled' else "off",
+            compression={"mode": "mu1nu1"},
         )
 
         def _compute_single_soap(s):
@@ -178,21 +207,24 @@ class MolecularFeaturizer:
             
             try:
                 atoms = MolecularFeaturizer._rdkit_to_ase(mol)
-                # atomic_soap shape: (n_atoms, n_features)
-                atomic_soap = soap_engine.create(atoms)
-                # Mean pooling -> (n_features,)
-                return MolecularFeaturizer._descriptor_to_list(atomic_soap, reduce="mean")
-            except Exception as e:
+                soap_values = soap_engine.create(atoms)
+                return MolecularFeaturizer._format_descriptor_output(
+                    soap_values,
+                    output_mode=mode,
+                    reduce="mean",
+                )
+            except Exception:
                 return None
 
-        return smiles_series.map_elements(_compute_single_soap, return_dtype=pl.List(pl.Float64))
+        return pl.Series("soap_embedding", [_compute_single_soap(s) for s in smiles_series.to_list()])
 
     @staticmethod
-    def compute_acsf(smiles_series: pl.Series, r_cut=6.0) -> pl.Series:
+    def compute_acsf(smiles_series: pl.Series, r_cut=6.0, output_mode: str = "pooled") -> pl.Series:
         """
         Computes ACSF (Atom-Centered Symmetry Functions).
-        Returns the mean vector of atomic ACSF features.
+        Returns either pooled vectors or atom-level descriptor matrices.
         """
+        mode = output_mode.strip().lower()
         species_set = set()
         for smi in smiles_series:
             mol = Chem.MolFromSmiles(smi)
@@ -217,11 +249,15 @@ class MolecularFeaturizer:
             try:
                 atoms = MolecularFeaturizer._rdkit_to_ase(mol)
                 atomic_acsf = acsf_engine.create(atoms)
-                return MolecularFeaturizer._descriptor_to_list(atomic_acsf, reduce="mean")
+                return MolecularFeaturizer._format_descriptor_output(
+                    atomic_acsf,
+                    output_mode=mode,
+                    reduce="mean",
+                )
             except Exception:
                 return None
 
-        return smiles_series.map_elements(_compute_single_acsf, return_dtype=pl.List(pl.Float64))
+        return pl.Series("acsf_embedding", [_compute_single_acsf(s) for s in smiles_series.to_list()])
     
     @staticmethod
     def compute_coulomb_matrix(
@@ -275,13 +311,16 @@ class MolecularFeaturizer:
         smiles_series: pl.Series,
         model: str = "medium",
         batch_size: int = 32,
+        output_mode: str = "pooled",
     ) -> pl.Series:
         """
-        Computes pooled MACE embeddings from 3D molecular geometries.
+        Computes pooled or atom-level MACE embeddings from 3D molecular geometries.
         Each molecule is embedded with RDKit, converted to ASE Atoms, then
-        mean-pooled over atom-level MACE descriptors to form a single vector.
+        optionally mean-pooled over atom-level MACE descriptors to form a
+        single vector.
         """
         logger.info(f"Computing MACE embeddings (model={model}, batch_size={batch_size})...")
+        mode = output_mode.strip().lower()
 
         from mace.calculators import mace_off
 
@@ -305,10 +344,13 @@ class MolecularFeaturizer:
                     else:
                         node_embeddings = np.asarray(desc)
 
-                    if node_embeddings.ndim == 1:
-                        embeddings.append(node_embeddings.ravel().tolist())
-                    else:
-                        embeddings.append(np.mean(node_embeddings, axis=0).ravel().tolist())
+                    embeddings.append(
+                        MolecularFeaturizer._format_descriptor_output(
+                            node_embeddings,
+                            output_mode=mode,
+                            reduce="mean",
+                        )
+                    )
                 except Exception:
                     embeddings.append(None)
 

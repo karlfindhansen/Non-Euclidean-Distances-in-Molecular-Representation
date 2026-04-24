@@ -17,6 +17,45 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 
+
+def _ensure_feature_matrix_d_by_n(
+    matrix: np.ndarray,
+    input_orientation: Literal["rowwise", "columnwise"] = "rowwise",
+) -> np.ndarray:
+    """
+    Normalize an input feature matrix to shape (D, N_samples_per_structure).
+    `rowwise` expects (N, D) and converts to (D, N).
+    `columnwise` expects (D, N) and preserves that convention.
+    """
+    arr = np.asarray(matrix, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+
+    if arr.size == 0:
+        return arr.reshape(0, 0)
+
+    if input_orientation == "rowwise":
+        return arr.T
+    if input_orientation == "columnwise":
+        return arr
+
+    raise ValueError(f"Unknown input_orientation '{input_orientation}'.")
+
+
+def _normalize_external_feature_matrices(
+    feature_matrices: Sequence[np.ndarray],
+    input_orientation: Literal["rowwise", "columnwise"],
+) -> List[np.ndarray]:
+    return [
+        _ensure_feature_matrix_d_by_n(matrix, input_orientation=input_orientation)
+        for matrix in feature_matrices
+    ]
+
+
 def _compute_invariant_feature_matrix(frame: Atoms, cutoff: float = 1.8) -> np.ndarray:
     """
     Maps a molecule to a D x N matrix of invariant physical features.
@@ -102,15 +141,14 @@ def _compute_feature_matrices(
 
     return scaled_matrices
 
-def _compute_soap_feature_matrices(frames: Sequence[Atoms]):
+def _compute_soap_feature_matrices(frames: Sequence[Atoms]) -> List[np.ndarray]:
     """
     Builds invariant soap feature matrices for all frames.
     """
-    features = []
-    for frame in frames:
-        features.append(frame.soap)
-    
-    return features
+    return [
+        _ensure_feature_matrix_d_by_n(frame.soap, input_orientation="rowwise")
+        for frame in frames
+    ]
 
 
 def _pairwise_distance_matrix(
@@ -170,15 +208,17 @@ class Wasserstein:
         
         # Step 1: Extract the correct feature matrices
         if feature_matrices is not None:
-            raw_matrices = feature_matrices
+            input_orientation = "columnwise" if feature_type == "invariant" else "rowwise"
+            raw_matrices = _normalize_external_feature_matrices(
+                feature_matrices,
+                input_orientation=input_orientation,
+            )
         else:
             if feature_type == 'invariant':
                 # Returns list of (3, N_atoms)
                 raw_matrices = _compute_feature_matrices(frames, normalized=True)
             elif feature_type == 'soap':
-                # If global, returns (1, 252). If atomic, returns (N, 252)
-                soap_list = _compute_soap_feature_matrices(frames)
-                raw_matrices = [np.atleast_2d(s).T if s.ndim == 1 else s.T for s in soap_list]
+                raw_matrices = _compute_soap_feature_matrices(frames)
             else:
                 raise ValueError(f"Unknown feature_type: {feature_type}")
 
@@ -337,14 +377,18 @@ class Grassmann:
         
         # Extract raw (or normalized) features for ALL frames
         if precomputed_feature_matrices is not None:
-            raw_matrices = precomputed_feature_matrices
+            input_orientation = "columnwise" if features == "invariant" else "rowwise"
+            raw_matrices = _normalize_external_feature_matrices(
+                precomputed_feature_matrices,
+                input_orientation=input_orientation,
+            )
         else:
             if frames is None:
                 raise ValueError("Must provide either 'frames' or 'precomputed_matrices'.")
             if features == 'invariant':
                 raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
             elif features == 'soap':
-                raw_matrices = _compute_soap_feature_matrices(frames, normalized=normalized)
+                raw_matrices = _compute_soap_feature_matrices(frames)
             else:
                 raise ValueError(f"Unknown feature type: {features}")
 
@@ -447,42 +491,48 @@ class Riemann:
         feature_matrices=None,
         feature_type: str = 'invariant',
         regularization: float = 1e-3,
-        n_pca: int = 30
+        n_pca: int = 30  # Strongly recommend keeping this low!
     ) -> np.ndarray:
-        """
-        Step 1: Extract features and convert to SPD (covariance) matrices.
-        """
-        # 1. Obtain raw feature matrices (List of D x N matrices)
+        
+        # 1. Obtain raw feature matrices
         if feature_matrices is not None:
             raw_matrices = feature_matrices
         elif frames is not None:
             if feature_type == 'invariant':
-                # Returns list of (3, N_atoms)
                 raw_matrices = _compute_feature_matrices(frames, normalized=True)
             elif feature_type == 'soap':
-                # User has global vectors (1000, 252), convert to list of (252, 1)
-                soap_list = _compute_soap_feature_matrices(frames)
-                raw_matrices = [np.atleast_2d(s).T if s.ndim == 1 else s for s in soap_list]
+                raw_matrices = _compute_soap_feature_matrices(frames)
             else:
                 raise ValueError(f"Unknown feature_type: {feature_type}")
         else:
             raise ValueError("Must provide 'frames' or 'feature_matrices'.")
 
-        # 2. Optional PCA reduction
-        if feature_type == 'soap' and n_pca is not None:
-            # Flatten to (N_samples, D) for PCA
-            flat_features = np.array([m.flatten() for m in raw_matrices])
+        # 2. PCA Reduction (Mandatory for large D like SOAP's 2240)
+        if n_pca is not None:
+            logger.info(f"Applying PCA to reduce feature dimension to {n_pca}...")
+            # Stack all atoms from all molecules into one giant 2D matrix
+            stacked_features = np.vstack(raw_matrices)
             pca = PCA(n_components=n_pca)
-            reduced = pca.fit_transform(flat_features)
-            # Reshape back to list of (n_pca, 1)
-            raw_matrices = [r.reshape(-1, 1) for r in reduced]
+            stacked_reduced = pca.fit_transform(stacked_features)
+            
+            # Unstack back into the original list of (N_atoms, n_pca) matrices
+            reduced_matrices = []
+            current_idx = 0
+            for X in raw_matrices:
+                n_atoms = X.shape[0]
+                reduced_matrices.append(stacked_reduced[current_idx : current_idx + n_atoms, :])
+                current_idx += n_atoms
+                
+            raw_matrices = reduced_matrices
 
         # 3. Build SPD Matrices (Covariance)
         spd_matrices = []
         for X in raw_matrices:
-            # X shape is (D, N)
-            # C = (X @ X.T) / N -> shape (D, D)
-            C = (X @ X.T) / X.shape[1]
+            X = np.asarray(X)
+            
+            # THE FIX: Transpose first! 
+            # (D_features, N_atoms) @ (N_atoms, D_features) = (D_features, D_features)
+            C = (X.T @ X) / X.shape[0]
             
             # Regularization to ensure it is strictly Positive Definite
             C += np.eye(C.shape[0]) * regularization

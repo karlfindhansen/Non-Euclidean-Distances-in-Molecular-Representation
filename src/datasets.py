@@ -4,7 +4,6 @@ import os
 import polars as pl
 import numpy as np
 import pyarrow as pa
-import torch
 import selfies as sf
 
 from ase.io import write
@@ -1206,6 +1205,54 @@ class QM9Dataset:
             ),
         )
 
+    @staticmethod
+    def _series_to_feature_matrices(series: pl.Series) -> List[np.ndarray]:
+        matrices: List[np.ndarray] = []
+        for value in series.to_list():
+            if value is None:
+                matrices.append(np.empty((0, 0), dtype=np.float64))
+                continue
+
+            arr = np.asarray(value, dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            elif arr.ndim > 2:
+                arr = arr.reshape(arr.shape[0], -1)
+            matrices.append(arr)
+        return matrices
+
+    def get_descriptor_matrices(
+        self,
+        descriptor: str,
+        **kwargs,
+    ) -> List[np.ndarray]:
+        """
+        Returns per-molecule descriptor matrices with shape (n_atoms, d) when supported.
+        This does not mutate the dataframe's pooled descriptor columns.
+        """
+        desc = self.DESCRIPTOR_ALIASES.get(descriptor.strip().lower())
+        if desc is None:
+            raise ValueError(f"Unknown descriptor '{descriptor}'.")
+
+        if self.df.is_empty():
+            raise ValueError("Dataset is empty. Call `load()` before requesting descriptor matrices.")
+
+        smiles = self.df["canonical_smiles"]
+
+        if desc == "soap":
+            series = MolecularFeaturizer.compute_soap(smiles, output_mode="matrix", **kwargs)
+        elif desc == "acsf":
+            series = MolecularFeaturizer.compute_acsf(smiles, output_mode="matrix", **kwargs)
+        elif desc == "mace":
+            series = MolecularFeaturizer.compute_mace_embeddings(smiles, output_mode="matrix", **kwargs)
+        else:
+            raise ValueError(
+                f"Descriptor '{descriptor}' does not have a matrix-form API. "
+                "Supported matrix descriptors: soap, acsf, mace."
+            )
+
+        return self._series_to_feature_matrices(series)
+
     def add_all_descriptors(
         self,
         radius: int = 3,
@@ -2314,15 +2361,41 @@ class MaterialsProject:
 
         logger.success("All requested descriptors successfully added to dataframe.")
 
+    @staticmethod
+    def _format_material_descriptor_output(
+        vec,
+        output_mode: str = "pooled",
+    ) -> Optional[List[float] | List[List[float]]]:
+        if vec is None:
+            return None
+
+        mode = output_mode.strip().lower()
+        if mode not in {"pooled", "matrix"}:
+            raise ValueError(f"Unsupported output_mode '{output_mode}'. Expected 'pooled' or 'matrix'.")
+
+        arr = np.asarray(vec, dtype=np.float64)
+        if arr.ndim == 0:
+            arr = arr.reshape(1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+
+        if mode == "matrix":
+            return np.atleast_2d(arr).tolist()
+
+        if arr.ndim == 1:
+            return arr.ravel().tolist()
+        return np.mean(arr, axis=0).ravel().tolist()
+
     def _compute_mace_features(
             self, 
             struct_strings: List[str], 
             mace_calc, 
-            batch_size: int = 32
-        ) -> List[Optional[List[float]]]:
+            batch_size: int = 32,
+            output_mode: str = "pooled",
+        ) -> List[Optional[List[float] | List[List[float]]]]:
             """
-            Helper method specifically for extracting node embeddings from MACE 
-            and pooling them into global graph-level features.
+            Helper method for extracting node embeddings from MACE and returning
+            either pooled vectors or per-site matrices.
             """
             
             features = []
@@ -2340,10 +2413,13 @@ class MaterialsProject:
                             node_embeddings = np.array(desc[0])
                         else:
                             node_embeddings = np.array(desc)
-                            
-                        # Average the atom-level embeddings to get a single vector for the whole crystal
-                        global_embedding = np.mean(node_embeddings, axis=0).tolist()
-                        features.append(global_embedding)
+
+                        features.append(
+                            self._format_material_descriptor_output(
+                                node_embeddings,
+                                output_mode=output_mode,
+                            )
+                        )
                         
                     except Exception as e:
                         features.append(None)
@@ -2357,7 +2433,8 @@ class MaterialsProject:
         engine,
         desc_name: str,
         batch_size: int = 32,
-    ) -> List[Optional[List[float]]]:
+        output_mode: str = "pooled",
+    ) -> List[Optional[List[float] | List[List[float]]]]:
         features = []
         
         # We disabled tqdm here so it doesn't spam your console during chunking,
@@ -2371,25 +2448,135 @@ class MaterialsProject:
                 batch_out = engine.create(batch_atoms, n_jobs=1)
 
                 for vec in batch_out:
-                    # Depending on sparse vs dense engine settings, ensure it's a dense list
-                    if hasattr(vec, "toarray"):
-                        features.append(vec.toarray().flatten().tolist())
-                    else:
-                        features.append(np.array(vec).flatten().tolist())
+                    dense_vec = vec.toarray() if hasattr(vec, "toarray") else np.array(vec)
+                    features.append(
+                        self._format_material_descriptor_output(
+                            dense_vec,
+                            output_mode=output_mode,
+                        )
+                    )
 
             except Exception as e:
                 for s in batch_structs:
                     try:
                         atoms = AseAtomsAdaptor.get_atoms(s)
                         vec = engine.create(atoms, n_jobs=1)
-                        if hasattr(vec, "toarray"):
-                            features.append(vec.toarray().flatten().tolist())
-                        else:
-                            features.append(np.array(vec).flatten().tolist())
+                        dense_vec = vec.toarray() if hasattr(vec, "toarray") else np.array(vec)
+                        features.append(
+                            self._format_material_descriptor_output(
+                                dense_vec,
+                                output_mode=output_mode,
+                            )
+                        )
                     except Exception as e2:
                         features.append(None)
 
         return features
+
+    @staticmethod
+    def _values_to_feature_matrices(
+        values: Sequence[Optional[List[float] | List[List[float]]]]
+    ) -> List[np.ndarray]:
+        matrices: List[np.ndarray] = []
+        for value in values:
+            if value is None:
+                matrices.append(np.empty((0, 0), dtype=np.float64))
+                continue
+
+            arr = np.asarray(value, dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            elif arr.ndim > 2:
+                arr = arr.reshape(arr.shape[0], -1)
+            matrices.append(arr)
+        return matrices
+
+    def get_descriptor_matrices(
+        self,
+        descriptor: str,
+        r_cut: float = 6.0,
+        n_max: int = 8,
+        l_max: int = 6,
+        sigma: float = 0.5,
+        batch_size: int = 32,
+    ) -> List[np.ndarray]:
+        """
+        Returns per-structure descriptor matrices with shape (n_sites, d) when supported.
+        This does not mutate pooled dataframe descriptor columns.
+        """
+        if self.df.is_empty():
+            raise ValueError("Dataset is empty. Call `load()` before requesting descriptor matrices.")
+
+        key = descriptor.strip().lower()
+        desc = self.DESCRIPTOR_ALIASES.get(key)
+        if desc is None:
+            raise ValueError(f"Unknown descriptor '{descriptor}'.")
+
+        if desc not in {"soap", "acsf", "mace"}:
+            raise ValueError(
+                f"Descriptor '{descriptor}' does not have a matrix-form API. "
+                "Supported matrix descriptors: soap, acsf, mace."
+            )
+
+        struct_strings = self.df["raw_structure"].to_list()
+
+        if desc in {"soap", "acsf"}:
+            logger.info("Extracting unique elements from formulas for matrix-form descriptors...")
+            formulas = self.df["formula_pretty"].to_list()
+            unique_elements_set = set()
+            for formula in formulas:
+                comp = Composition(formula)
+                unique_elements_set.update([el.symbol for el in comp.elements])
+
+            unique_elements = sorted(list(unique_elements_set))
+            weighting = {el: element(el).atomic_number for el in unique_elements}
+
+        if desc == "soap":
+            engine = SOAP(
+                species=unique_elements,
+                periodic=True,
+                r_cut=r_cut,
+                n_max=n_max,
+                l_max=l_max,
+                sigma=sigma,
+                sparse=False,
+                average="off",
+                compression={"mode": "mu2", "species_weighting": weighting},
+            )
+            values = self._compute_feature(
+                struct_strings,
+                engine,
+                "SOAP",
+                batch_size=batch_size,
+                output_mode="matrix",
+            )
+        elif desc == "acsf":
+            engine = ACSF(
+                species=unique_elements,
+                periodic=True,
+                r_cut=r_cut,
+                g2_params=[[1, 1], [1, 2], [1, 3]],
+                g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
+            )
+            values = self._compute_feature(
+                struct_strings,
+                engine,
+                "ACSF",
+                batch_size=batch_size,
+                output_mode="matrix",
+            )
+        else:
+            from mace.calculators import mace_mp
+            logger.info("Loading MACE-MP model for matrix-form descriptors...")
+            mace_engine = mace_mp(model="medium", device="cpu", default_dtype="float32")
+            values = self._compute_mace_features(
+                struct_strings,
+                mace_engine,
+                batch_size=batch_size,
+                output_mode="matrix",
+            )
+
+        return self._values_to_feature_matrices(values)
     
     def get_distance_matrix(self, descriptor: str = "soap", dist_type: str = "euclidean", pca_components=None, force_calculate=False) -> np.ndarray:
         """
