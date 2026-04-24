@@ -1029,7 +1029,11 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             "max_en_diff": "max_en_diff",
             "avg_bond_length": "avg_bond_length",
             "max_bond_length": "max_bond_length",
-            "material_id": "material_id",
+            #"material_id": "material_id",
+            "outlier_category": "outlier_category",
+            "hdbscan_label": "hdbscan_label",
+            "lof_label": "lof_label",
+            "knn_label": "knn_label",
         }
         for prop_name, col_name in materials_cols.items():
             if col_name in df.columns:

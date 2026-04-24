@@ -126,13 +126,6 @@ class MolecularFeaturizer:
                 
                 embeddings.extend(mean_pooled.cpu().tolist())
 
-
-        #logger.info(f"Reducing dimensions from {len(embeddings[0])} to 32 using PCA...")
-        #embeddings_matrix = np.array(embeddings)
-        #pca = PCA(n_components=32)
-        #reduced_matrix = pca.fit_transform(embeddings_matrix)
-        #embeddings = reduced_matrix.tolist()
-
         return pl.Series("selfies_transformer", embeddings)
 
     @staticmethod
@@ -229,9 +222,6 @@ class MolecularFeaturizer:
                 return None
 
         return smiles_series.map_elements(_compute_single_acsf, return_dtype=pl.List(pl.Float64))
-
-
-    @staticmethod
     
     @staticmethod
     def compute_coulomb_matrix(

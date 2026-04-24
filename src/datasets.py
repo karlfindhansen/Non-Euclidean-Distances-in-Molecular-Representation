@@ -860,8 +860,6 @@ class QM9Dataset:
                 f"(attempt={attempt}, next_candidate_target={candidate_target})."
             )
 
-        return self.df
-
     def _required_descriptor_columns(self) -> List[str]:
         cols: List[str] = []
         if self.add_soap_embedding_flag:
@@ -1566,6 +1564,7 @@ class MaterialsProject:
         stratify_bins: int = 10,
         sampling_seed: int = 40,
         min_per_bin: int = 1,
+        injected_materials: Optional[Union[pl.DataFrame, Sequence[Dict[str, Any]]]] = None,
         descriptors: Optional[Sequence[str]] = None,
     ) -> None:
         self.base_path = base_path
@@ -1583,6 +1582,8 @@ class MaterialsProject:
         self.stratify_bins = stratify_bins
         self.sampling_seed = sampling_seed
         self.min_per_bin = min_per_bin
+        self.sampling_buffer = 1.2
+        self.injected_materials = injected_materials
         requested_descriptors = self._normalize_descriptors(descriptors)
         self.add_soap = False
         self.add_acsf = False
@@ -1682,6 +1683,125 @@ class MaterialsProject:
         else:
             raise ValueError(f"Unknown sampling strategy: {self.sampling_strategy}")
 
+    @staticmethod
+    def _ensure_injection_columns(df: pl.DataFrame) -> pl.DataFrame:
+        if "is_injected" in df.columns:
+            df = df.with_columns(
+                pl.col("is_injected").fill_null(0).cast(pl.Int64, strict=False)
+            )
+        else:
+            df = df.with_columns(pl.lit(0).cast(pl.Int64).alias("is_injected"))
+
+        if "outlier_category" not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("outlier_category"))
+        else:
+            df = df.with_columns(pl.col("outlier_category").cast(pl.Utf8, strict=False))
+
+        return df
+
+    @staticmethod
+    def _align_to_schema(df: pl.DataFrame, columns: List[str]) -> pl.DataFrame:
+        aligned = df
+        missing = [col for col in columns if col not in aligned.columns]
+        if missing:
+            aligned = aligned.with_columns([pl.lit(None).alias(col) for col in missing])
+        return aligned.select(columns)
+
+    def _next_injected_material_id(self) -> int:
+        if self.df.is_empty() or "material_id" not in self.df.columns:
+            return 0
+
+        injected_ids = (
+            self.df
+            .filter(pl.col("material_id").cast(pl.Utf8).str.starts_with("injected_"))
+            .select(
+                pl.col("material_id")
+                .cast(pl.Utf8)
+                .str.replace("injected_", "")
+                .cast(pl.Int64, strict=False)
+                .alias("idx")
+            )
+            .drop_nulls()
+        )
+        if injected_ids.is_empty():
+            return 0
+        return int(injected_ids["idx"].max()) + 1
+
+    def _apply_configured_injections(self) -> None:
+        if self.injected_materials is None:
+            return
+        self.inject_outliers(self.injected_materials)
+
+    def _base_row_count(self) -> int:
+        if self.df.is_empty() or "is_injected" not in self.df.columns:
+            return self.df.height
+        return self.df.filter(pl.col("is_injected") != 1).height
+
+    def _finalize_loaded_dataframe(self, limit: Optional[int]) -> pl.DataFrame:
+        if limit is None:
+            return self.df
+
+        if self.df.is_empty() or "is_injected" not in self.df.columns:
+            self.df = self.df.head(limit)
+            return self.df
+
+        base_df = self.df.filter(pl.col("is_injected") != 1).head(limit)
+        injected_df = self.df.filter(pl.col("is_injected") == 1)
+        self.df = pl.concat([base_df, injected_df], how="vertical_relaxed")
+        return self.df
+
+    def inject_outliers(
+        self,
+        outliers: Union[pl.DataFrame, Sequence[Dict[str, Any]]],
+    ) -> pl.DataFrame:
+        """
+        Appends user-supplied synthetic materials and tags them with `is_injected=1`.
+        Accepts either a Polars dataframe matching the Materials Project schema
+        or a sequence of dictionaries (for example from `process_synthetic_structure`).
+        Call `load()` before injecting so there is a base dataframe to extend.
+        """
+        if self.df.is_empty():
+            raise ValueError("Dataset is empty. Call `load()` before injecting outliers.")
+
+        if isinstance(outliers, pl.DataFrame):
+            if outliers.is_empty():
+                self.df = self._ensure_injection_columns(self.df)
+                return self.df
+            normalized_outliers = outliers
+        else:
+            outlier_records = list(outliers)
+            if not outlier_records:
+                self.df = self._ensure_injection_columns(self.df)
+                return self.df
+            normalized_outliers = pl.DataFrame(outlier_records)
+
+        self.df = self._ensure_injection_columns(self.df)
+        normalized_outliers = self._ensure_injection_columns(normalized_outliers)
+
+        if "material_id" not in normalized_outliers.columns:
+            next_idx = self._next_injected_material_id()
+            normalized_outliers = normalized_outliers.with_row_count("_inject_row").with_columns(
+                (pl.col("_inject_row") + next_idx).cast(pl.Utf8).radd("injected_").alias("material_id")
+            ).drop("_inject_row")
+
+        normalized_outliers = normalized_outliers.with_columns(
+            pl.col("material_id").cast(pl.Utf8, strict=False),
+            pl.lit(1).cast(pl.Int64).alias("is_injected"),
+            pl.col("outlier_category").cast(pl.Utf8, strict=False),
+        )
+
+        injected_df = self._align_to_schema(normalized_outliers, self.df.columns)
+        self.df = pl.concat([self.df, injected_df], how="vertical_relaxed")
+
+        if any(col in self.df.columns for col in self._required_descriptor_columns()):
+            self._add_descriptors(attach_to_df=True)
+
+        logger.info(
+            "Injected custom outliers into Materials Project dataframe: "
+            f"requested={injected_df.height}, total_rows={self.df.height}."
+        )
+        return self.df
+
     def load(self, force_fetch: bool = False, limit: Optional[int] = None) -> pl.DataFrame:
         """
         Loads the dataset, applies sampling, computes descriptors, and ensures 
@@ -1696,6 +1816,7 @@ class MaterialsProject:
         else:
             self._fetch_from_api(compute_descriptors=False)
             full_df = self.df
+        full_df = self._ensure_injection_columns(full_df)
             
         needs_descriptors = len(self._required_descriptor_columns()) > 0
         
@@ -1703,9 +1824,12 @@ class MaterialsProject:
         if effective_limit is None or not needs_descriptors:
             target = effective_limit if effective_limit is not None else full_df.height
             self.df = self._sample_materials_df(full_df, target)
+            self.df = self._ensure_injection_columns(self.df)
+            self._apply_configured_injections()
             if needs_descriptors:
                 self._add_descriptors(attach_to_df=True)
                 self._drop_rows_with_null_required_descriptors()
+            self._finalize_loaded_dataframe(effective_limit)
             return self.df
             
         # 3. Robust Path: We need exactly `effective_limit` valid rows
@@ -1716,6 +1840,8 @@ class MaterialsProject:
         while True:
             attempt += 1
             self.df = self._sample_materials_df(full_df, candidate_target)
+            self.df = self._ensure_injection_columns(self.df)
+            self._apply_configured_injections()
             
             # Compute descriptors on the candidate pool
             tag_parts = [f"sample_n{candidate_target}", f"seed{self.sampling_seed}"]
@@ -1729,15 +1855,16 @@ class MaterialsProject:
             self._drop_rows_with_null_required_descriptors()
             
             # Did we end up with enough valid rows?
-            if self.df.height >= effective_limit:
-                self.df = self.df.head(effective_limit)
+            if self._base_row_count() >= effective_limit:
+                self._finalize_loaded_dataframe(effective_limit)
                 logger.success(f"Successfully reached requested limit of {effective_limit} valid rows (Attempt {attempt}).")
                 return self.df
                 
             # If we've processed everything and still don't have enough, return what we have
             if candidate_target >= full_df.height:
+                self._finalize_loaded_dataframe(effective_limit)
                 logger.warning(
-                    f"Exhausted the full dataset. Could only find {self.df.height} valid rows "
+                    f"Exhausted the full dataset. Could only find {self._base_row_count()} valid base rows "
                     f"(requested {effective_limit})."
                 )
                 return self.df
@@ -2031,6 +2158,8 @@ class MaterialsProject:
             "energy_above_hull": safe_float(get_val("energy_above_hull")),
             "avg_bond_length": safe_float(avg_bond_length),
             "max_bond_length": safe_float(max_bond_length),
+            "is_injected": 0,
+            "outlier_category": None,
         }
     def _get_structures(self) -> List[Structure]:
         logger.info("Reconstructing Pymatgen structures from JSON...")
@@ -2147,19 +2276,41 @@ class MaterialsProject:
                 mace_all.extend(mace_features)
 
         # 5. Attach features to DataFrame
-        # 5. Attach features to DataFrame
+        def _attach_or_fill_column(column_name: str, values: List[Optional[List[float]]]) -> None:
+            update_df = pl.DataFrame({
+                "_row_idx": np.arange(len(values), dtype=np.int64),
+                column_name: pa.array(values),
+            })
+            indexed_df = self.df.with_row_count("_row_idx")
+
+            if column_name not in self.df.columns:
+                self.df = indexed_df.join(update_df, on="_row_idx", how="left").drop("_row_idx")
+                return
+
+            self.df = (
+                indexed_df
+                .join(update_df, on="_row_idx", how="left", suffix="_new")
+                .with_columns(
+                    pl.coalesce(
+                        pl.col(f"{column_name}_new"),
+                        pl.col(column_name),
+                    ).alias(column_name)
+                )
+                .drop("_row_idx", f"{column_name}_new")
+            )
+
         if attach_to_df:
-            if self.add_soap and "soap_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("soap_embedding", pa.array(soap_all)))
+            if self.add_soap:
+                _attach_or_fill_column("soap_embedding", soap_all)
                 
-            if self.add_acsf and "acsf_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("acsf_embedding", pa.array(acsf_all)))
+            if self.add_acsf:
+                _attach_or_fill_column("acsf_embedding", acsf_all)
                 
-            if getattr(self, "add_coulomb", False) and "coulomb_matrix" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("coulomb_matrix", pa.array(coulomb_all)))
+            if getattr(self, "add_coulomb", False):
+                _attach_or_fill_column("coulomb_matrix", coulomb_all)
                 
-            if getattr(self, "add_mace", False) and "mace_embedding" not in self.df.columns:
-                self.df = self.df.with_columns(pl.Series("mace_embedding", pa.array(mace_all)))
+            if getattr(self, "add_mace", False):
+                _attach_or_fill_column("mace_embedding", mace_all)
 
         logger.success("All requested descriptors successfully added to dataframe.")
 
