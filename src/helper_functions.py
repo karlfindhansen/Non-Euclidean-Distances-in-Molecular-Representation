@@ -1043,14 +1043,17 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         qm9_cols = {
             "mol_id": "mol_id",
             "Formula": "formula",
-            "smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
-            "sefiles": "selfies",
+            #"smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
+            #"sefiles": "selfies",
             "num_atoms": "num_atoms",
             "structure_class": "structure_class",
             "functional_groups": "functional_groups",
             "hybridization_ratio": "sp_ratio_set",
-            "scaffold": "scaffold",
+            #"scaffold": "scaffold",
             "outlier_type": "outlier_category",
+            "hdbscan_label": "hdbscan_label",
+            "lof_label": "lof_label",
+            "knn_label": "knn_label",
         }
         for prop_name, col_name in qm9_cols.items():
             if col_name in df.columns:
@@ -1068,6 +1071,8 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
                     properties[prop_name] = df[col_name].fill_null(float('nan')).to_list()
                 else:
                     properties[prop_name] = df[col_name].fill_null("N/A").to_list()
+
+
 
     settings = {
         "map": {
