@@ -44,12 +44,12 @@ def hdbscan_outliers(
 
     # 1. Define the search space boundaries
     # Don't let the max cluster size exceed 10% of the data, capped at 500
-    max_mcs = min(500, max(20, n_samples // 10)) 
-    min_mcs = 5
+    max_mcs = min(1000, max(20, n_samples // 10)) 
+    min_mcs = 2
     
     # 2. Generate ~12 min_cluster_size candidates geometrically
     # This samples densely at lower values and sparsely at higher values
-    raw_mcs = np.geomspace(min_mcs, max_mcs, num=25)
+    raw_mcs = np.geomspace(min_mcs, max_mcs, num=30)
     mcs_candidates = sorted(list(set(raw_mcs.astype(int))))
 
     # 3. Build the combinations
@@ -82,7 +82,7 @@ def hdbscan_outliers(
             
             # Logic: Only keep results that meet your quality thresholds
             # Adjust these based on your specific QM9 distribution needs
-            if res["noise"] <= 0.2 and res["clusters"] >= 3:
+            if res["noise"] <= 0.25:
                 results.append(res)
             
             pbar.update(1)

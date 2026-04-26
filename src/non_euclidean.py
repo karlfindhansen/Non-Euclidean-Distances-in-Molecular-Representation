@@ -46,13 +46,94 @@ def _ensure_feature_matrix_d_by_n(
     raise ValueError(f"Unknown input_orientation '{input_orientation}'.")
 
 
-def _normalize_external_feature_matrices(
-    feature_matrices: Sequence[np.ndarray],
-    input_orientation: Literal["rowwise", "columnwise"],
+def _ensure_feature_matrix_n_by_d(
+    matrix: np.ndarray,
+    input_orientation: Literal["rowwise", "columnwise"] = "rowwise",
+) -> np.ndarray:
+    """
+    Normalize an input feature matrix to shape (N_samples_per_structure, D).
+    `rowwise` expects (N, D) and preserves that convention.
+    `columnwise` expects (D, N) and converts to (N, D).
+    """
+    arr = np.asarray(matrix, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+
+    if arr.size == 0:
+        return arr.reshape(0, 0)
+
+    if input_orientation == "rowwise":
+        return arr
+    if input_orientation == "columnwise":
+        return arr.T
+
+    raise ValueError(f"Unknown input_orientation '{input_orientation}'.")
+
+
+def _feature_input_orientation(feature_type: str) -> Literal["rowwise", "columnwise"]:
+    """
+    External invariant features are historically passed as (D, N).
+    All structure-level descriptor vectors such as SOAP/ACSF/MACE are treated as (N, D).
+    """
+    return "columnwise" if str(feature_type).lower() == "invariant" else "rowwise"
+
+
+def _coerce_external_feature_collection(
+    feature_matrices: Sequence[np.ndarray] | np.ndarray,
 ) -> List[np.ndarray]:
+    """
+    Accept either:
+    - a sequence of per-structure feature matrices/vectors, or
+    - a single 2D (N_structures, D_features) descriptor matrix.
+    """
+    if isinstance(feature_matrices, np.ndarray):
+        arr = np.asarray(feature_matrices, dtype=np.float64)
+        if arr.ndim == 0:
+            return [arr.reshape(1, 1)]
+        if arr.ndim == 1:
+            return [arr.reshape(1, -1)]
+        if arr.ndim == 2:
+            return [row.reshape(1, -1) for row in arr]
+        if arr.ndim == 3:
+            return [arr[i] for i in range(arr.shape[0])]
+        raise ValueError(
+            "feature_matrices must be a 1D/2D/3D array or a sequence of per-structure matrices."
+        )
+
+    matrices = list(feature_matrices)
+    if not matrices:
+        return []
+
+    first = np.asarray(matrices[0])
+    if first.ndim <= 1:
+        return [np.asarray(matrix, dtype=np.float64).reshape(1, -1) for matrix in matrices]
+
+    return [np.asarray(matrix, dtype=np.float64) for matrix in matrices]
+
+
+def _normalize_external_feature_matrices_d_by_n(
+    feature_matrices: Sequence[np.ndarray] | np.ndarray,
+    feature_type: str,
+) -> List[np.ndarray]:
+    input_orientation = _feature_input_orientation(feature_type)
     return [
         _ensure_feature_matrix_d_by_n(matrix, input_orientation=input_orientation)
-        for matrix in feature_matrices
+        for matrix in _coerce_external_feature_collection(feature_matrices)
+    ]
+
+
+def _normalize_external_feature_matrices_n_by_d(
+    feature_matrices: Sequence[np.ndarray] | np.ndarray,
+    feature_type: str,
+) -> List[np.ndarray]:
+    input_orientation = _feature_input_orientation(feature_type)
+    return [
+        _ensure_feature_matrix_n_by_d(matrix, input_orientation=input_orientation)
+        for matrix in _coerce_external_feature_collection(feature_matrices)
     ]
 
 
@@ -177,11 +258,11 @@ class Wasserstein:
     @staticmethod
     def compute_feature_distance(feat_i: np.ndarray, feat_j: np.ndarray, metric: str = 'sqeuclidean') -> float:
         """
-        Computes EMD between two matrices of shape (D, N_atoms).
+        Computes EMD between two matrices of shape (N_atoms, D_features).
         """
-        # Transpose to (N_atoms, D) for the POT (ot) library
-        pos_i = feat_i.T
-        pos_j = feat_j.T
+        # We NO LONGER transpose here. We assume inputs are safely (N_atoms, D_features)
+        pos_i = np.asarray(feat_i)
+        pos_j = np.asarray(feat_j)
 
         # 1. Assign weights (Uniform: each atom is 1/N of the molecule's 'mass')
         weights_i = np.ones(pos_i.shape[0]) / pos_i.shape[0]
@@ -206,21 +287,23 @@ class Wasserstein:
         metric: str = 'sqeuclidean'
     ) -> np.ndarray:
         
-        # Step 1: Extract the correct feature matrices
+        # Step 1: Standardized feature extraction aligned with Riemann/Grassmann
         if feature_matrices is not None:
-            input_orientation = "columnwise" if feature_type == "invariant" else "rowwise"
-            raw_matrices = _normalize_external_feature_matrices(
-                feature_matrices,
-                input_orientation=input_orientation,
-            )
-        else:
+            # We assume these are already (N_atoms, D_features) 
+            raw_matrices = feature_matrices
+        elif frames is not None:
             if feature_type == 'invariant':
-                # Returns list of (3, N_atoms)
                 raw_matrices = _compute_feature_matrices(frames, normalized=True)
+                # Ensure they are (N_atoms, D_features)
+                raw_matrices = [x.T if x.shape[0] == 3 else x for x in raw_matrices]
             elif feature_type == 'soap':
                 raw_matrices = _compute_soap_feature_matrices(frames)
+                # Ensure they are (N_atoms, D_features)
+                raw_matrices = [x.T for x in raw_matrices]
             else:
                 raise ValueError(f"Unknown feature_type: {feature_type}")
+        else:
+            raise ValueError("Must provide either 'frames' or 'feature_matrices'.")
 
         n = len(raw_matrices)
         logger.info(f"Computing Wasserstein distance matrix | Features: {feature_type}")
@@ -236,7 +319,6 @@ class Wasserstein:
         )
         
         return dist_matrix
-
 
 class PersistentHomology:
     """
@@ -357,7 +439,7 @@ class PersistentHomology:
 class Grassmann:
     """
     Handles molecular representation on Grassmann Manifolds G(k, n).
-    Represents each molecule as a k-dimensional subspace in R^n (atom-space).
+    Represents each molecule as a k-dimensional subspace in R^D (feature space).
     """
 
     @classmethod
@@ -371,36 +453,42 @@ class Grassmann:
         precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
-        Maps 3D atomic coordinates to an orthonormal basis in R^n.
+        Maps 3D atomic coordinates to an orthonormal basis in R^D (feature space).
         """
         bases = []
         
-        # Extract raw (or normalized) features for ALL frames
+        # 1. Obtain raw feature matrices
         if precomputed_feature_matrices is not None:
-            input_orientation = "columnwise" if features == "invariant" else "rowwise"
-            raw_matrices = _normalize_external_feature_matrices(
-                precomputed_feature_matrices,
-                input_orientation=input_orientation,
-            )
-        else:
-            if frames is None:
-                raise ValueError("Must provide either 'frames' or 'precomputed_matrices'.")
+            # We assume these are (N_atoms, D_features)
+            raw_matrices = precomputed_feature_matrices
+        elif frames is not None:
             if features == 'invariant':
                 raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
+                # Ensure they are (N_atoms, D_features) to remain consistent
+                raw_matrices = [x.T if x.shape[0] == 3 else x for x in raw_matrices]
             elif features == 'soap':
                 raw_matrices = _compute_soap_feature_matrices(frames)
+                # SOAP natively returns (D, N) via _ensure_feature_matrix_d_by_n, transpose it
+                raw_matrices = [x.T for x in raw_matrices]
             else:
                 raise ValueError(f"Unknown feature type: {features}")
+        else:
+            raise ValueError("Must provide either 'frames' or 'precomputed_feature_matrices'.")
 
-        for raw_feat in raw_matrices:
+        for X in raw_matrices:
+            X = np.asarray(X)
+            
+            # Align with Riemann's assumption that X is (N_atoms, D_features).
+            # We extract the k-dimensional subspace spanning the feature dimension (D).
             if method.lower() == "qr":
-                # QR decomposition of feature matrix
-                q, _ = np.linalg.qr(raw_feat)
+                # QR decomposition on X.T (D x N) gives Q of shape (D, min(D,N))
+                q, _ = np.linalg.qr(X.T)
                 basis = q[:, :k]
             else:
-                # SVD gives a basis ordered by structural variance
-                u, _, _ = np.linalg.svd(raw_feat, full_matrices=False)
-                basis = u[:, :k]
+                # SVD on X (N x D): U is (N, M), S is (M,), Vh is (M, D)
+                # The right singular vectors (rows of Vh) span the feature space
+                _, _, vh = np.linalg.svd(X, full_matrices=False)
+                basis = vh.T[:, :k]
                 
             bases.append(basis)
         
@@ -499,9 +587,9 @@ class Riemann:
             raw_matrices = feature_matrices
         elif frames is not None:
             if feature_type == 'invariant':
-                raw_matrices = _compute_feature_matrices(frames, normalized=True)
+                raw_matrices = [matrix.T for matrix in _compute_feature_matrices(frames, normalized=True)]
             elif feature_type == 'soap':
-                raw_matrices = _compute_soap_feature_matrices(frames)
+                raw_matrices = [matrix.T for matrix in _compute_soap_feature_matrices(frames)]
             else:
                 raise ValueError(f"Unknown feature_type: {feature_type}")
         else:

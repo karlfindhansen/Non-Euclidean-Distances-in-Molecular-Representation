@@ -66,7 +66,19 @@ class QM9Dataset:
         "ether": Fragments.fr_ether,
         "nitro": Fragments.fr_nitro,
     }
-    REQUIRED_COLUMNS = {"mol_id", "smiles", "canonical_smiles", "num_atoms", "selfies", "formula", "functional_groups", "avg_bond_length", "scaffold_smiles"}
+    REQUIRED_COLUMNS = {
+        "mol_id",
+        "smiles",
+        "canonical_smiles",
+        "num_atoms",
+        "selfies",
+        "formula",
+        "functional_groups",
+        "avg_bond_length",
+        "scaffold_smiles",
+        "coordinates",
+        "atomic_numbers",
+    }
     DESCRIPTOR_ALIASES = {
         "morgan": "morgan",
         "morgan_fingerprint": "morgan",
@@ -628,6 +640,17 @@ class QM9Dataset:
         if mol_dict is None:
             return None
 
+        coordinates = getattr(data, "pos", None)
+        atomic_numbers = getattr(data, "z", None)
+        if coordinates is not None:
+            mol_dict["coordinates"] = np.asarray(coordinates, dtype=np.float64).tolist()
+        else:
+            mol_dict["coordinates"] = None
+        if atomic_numbers is not None:
+            mol_dict["atomic_numbers"] = np.asarray(atomic_numbers, dtype=np.int64).tolist()
+        else:
+            mol_dict["atomic_numbers"] = None
+
         mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
         return mol_dict
 
@@ -1140,6 +1163,8 @@ class QM9Dataset:
             "soap_embedding",
             lambda frame: MolecularFeaturizer.compute_soap(
                 frame["canonical_smiles"],
+                coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
+                atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
                 r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma
             ),
         )
@@ -1151,7 +1176,10 @@ class QM9Dataset:
         updated = self._upsert_descriptor_column(
             "acsf_embedding",
             lambda frame: MolecularFeaturizer.compute_acsf(
-                frame["canonical_smiles"], r_cut=r_cut
+                frame["canonical_smiles"],
+                coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
+                atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
+                r_cut=r_cut
             ),
         )
         if updated:
@@ -1167,6 +1195,8 @@ class QM9Dataset:
             "mace_embedding",
             lambda frame: MolecularFeaturizer.compute_mace_embeddings(
                 frame["canonical_smiles"],
+                coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
+                atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
                 model=model,
                 batch_size=batch_size,
             ),
@@ -1184,6 +1214,8 @@ class QM9Dataset:
             "coulomb_matrix",
             lambda frame: MolecularFeaturizer.compute_coulomb_matrix(
                 frame["canonical_smiles"],
+                coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
+                atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
                 n_atoms_max=n_atoms_max,
                 permutation=permutation
             ),
