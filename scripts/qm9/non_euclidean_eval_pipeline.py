@@ -296,7 +296,7 @@ def _compute_manifold_distance_matrix(
 
     if manifold_key == "grassmann":
         return Grassmann.distance_matrix(
-            precomputed_feature_matrices=feature_matrices,
+            feature_matrices=feature_matrices,
             k=grassmann_k,
             method=grassmann_method,
         )

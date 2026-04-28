@@ -91,10 +91,13 @@ class QM9Dataset:
         "selfies_onehot": "onehot",
         "soap": "soap",
         "soap_embedding": "soap",
+        "soap_matrix": "soap",
         "acsf": "acsf",
         "acsf_embedding": "acsf",
+        "acsf_matrix": "acsf",
         "mace": "mace",
         "mace_embedding": "mace",
+        "mace_matrix": "mace",
         "coulomb": "coulomb",
         "coulomb_matrix": "coulomb",
         "chemprop": "chemprop",
@@ -264,6 +267,49 @@ class QM9Dataset:
             )
             .drop("_row_idx", f"{column_name}_new")
         )
+        return True
+
+    def _upsert_descriptor_columns(
+        self,
+        column_names: Sequence[str],
+        compute_columns: callable,
+    ) -> bool:
+        """
+        Adds multiple descriptor columns together, or fills rows where any of the
+        requested columns are missing/null/empty.
+        """
+        if self.df.is_empty():
+            return False
+
+        target_cols = list(column_names)
+        missing_cols = [col for col in target_cols if col not in self.df.columns]
+
+        if missing_cols:
+            computed = compute_columns(self.df)
+            self.df = self.df.with_columns([computed[col] for col in target_cols])
+            return True
+
+        indexed_df = self.df.with_row_count("_row_idx")
+        missing_expr = pl.lit(False)
+        for col in target_cols:
+            missing_expr = missing_expr | pl.col(col).is_null() | (pl.col(col).list.len() == 0)
+
+        missing_rows = indexed_df.filter(missing_expr)
+        if missing_rows.is_empty():
+            return False
+
+        computed = compute_columns(missing_rows)
+        updates = missing_rows.select("_row_idx").with_columns(
+            [computed[col] for col in target_cols]
+        )
+
+        merged = indexed_df.join(updates, on="_row_idx", how="left", suffix="_new")
+        coalesced = [
+            pl.coalesce(pl.col(f"{col}_new"), pl.col(col)).alias(col)
+            for col in target_cols
+        ]
+        drop_cols = ["_row_idx"] + [f"{col}_new" for col in target_cols]
+        self.df = merged.with_columns(coalesced).drop(*drop_cols)
         return True
 
     def _select_qm9_indices(self, dataset: QM9) -> List[int]:
@@ -1157,52 +1203,69 @@ class QM9Dataset:
         )
 
     def add_soap(self, r_cut=6.0, n_max=8, l_max=6, sigma=0.5) -> None:
-        """Adds SOAP descriptors to the dataframe."""
-        
-        updated = self._upsert_descriptor_column(
-            "soap_embedding",
-            lambda frame: MolecularFeaturizer.compute_soap(
+        """Adds pooled SOAP embeddings and atom-wise SOAP matrices to the dataframe."""
+
+        def _compute(frame: pl.DataFrame) -> Dict[str, pl.Series]:
+            pooled, matrix = MolecularFeaturizer.compute_soap_outputs(
                 frame["canonical_smiles"],
                 coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
                 atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
-                r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma
-            ),
+                r_cut=r_cut,
+                n_max=n_max,
+                l_max=l_max,
+                sigma=sigma,
+            )
+            return {"soap_embedding": pooled, "soap_matrix": matrix}
+
+        updated = self._upsert_descriptor_columns(
+            ["soap_embedding", "soap_matrix"],
+            _compute,
         )
         if updated:
-            logger.success("Added SOAP embeddings.")
+            logger.success("Added SOAP embeddings and matrices.")
 
     def add_acsf(self, r_cut=6.0) -> None:
-        """Adds ACSF descriptors to the dataframe."""
-        updated = self._upsert_descriptor_column(
-            "acsf_embedding",
-            lambda frame: MolecularFeaturizer.compute_acsf(
+        """Adds pooled ACSF embeddings and atom-wise ACSF matrices to the dataframe."""
+
+        def _compute(frame: pl.DataFrame) -> Dict[str, pl.Series]:
+            pooled, matrix = MolecularFeaturizer.compute_acsf_outputs(
                 frame["canonical_smiles"],
                 coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
                 atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
-                r_cut=r_cut
-            ),
+                r_cut=r_cut,
+            )
+            return {"acsf_embedding": pooled, "acsf_matrix": matrix}
+
+        updated = self._upsert_descriptor_columns(
+            ["acsf_embedding", "acsf_matrix"],
+            _compute,
         )
         if updated:
-            logger.success("Added ACSF embeddings.")
+            logger.success("Added ACSF embeddings and matrices.")
 
     def add_mace(
         self,
         model: str = "medium",
         batch_size: int = 32,
     ) -> None:
-        """Adds MACE embeddings to the dataframe."""
-        updated = self._upsert_descriptor_column(
-            "mace_embedding",
-            lambda frame: MolecularFeaturizer.compute_mace_embeddings(
+        """Adds pooled MACE embeddings and atom-wise MACE matrices to the dataframe."""
+
+        def _compute(frame: pl.DataFrame) -> Dict[str, pl.Series]:
+            pooled, matrix = MolecularFeaturizer.compute_mace_outputs(
                 frame["canonical_smiles"],
                 coordinates_series=frame["coordinates"] if "coordinates" in frame.columns else None,
                 atomic_numbers_series=frame["atomic_numbers"] if "atomic_numbers" in frame.columns else None,
                 model=model,
                 batch_size=batch_size,
-            ),
+            )
+            return {"mace_embedding": pooled, "mace_matrix": matrix}
+
+        updated = self._upsert_descriptor_columns(
+            ["mace_embedding", "mace_matrix"],
+            _compute,
         )
         if updated:
-            logger.success("Added MACE embeddings.")
+            logger.success("Added MACE embeddings and matrices.")
 
     def add_coulomb_matrix(
         self,
@@ -1260,7 +1323,8 @@ class QM9Dataset:
     ) -> List[np.ndarray]:
         """
         Returns per-molecule descriptor matrices with shape (n_atoms, d) when supported.
-        This does not mutate the dataframe's pooled descriptor columns.
+        If the cached matrix column is missing, the corresponding descriptor pair is
+        computed and attached to the dataframe first.
         """
         desc = self.DESCRIPTOR_ALIASES.get(descriptor.strip().lower())
         if desc is None:
@@ -1269,14 +1333,18 @@ class QM9Dataset:
         if self.df.is_empty():
             raise ValueError("Dataset is empty. Call `load()` before requesting descriptor matrices.")
 
-        smiles = self.df["canonical_smiles"]
-
         if desc == "soap":
-            series = MolecularFeaturizer.compute_soap(smiles, output_mode="matrix", **kwargs)
+            if "soap_matrix" not in self.df.columns:
+                self.add_soap(**kwargs)
+            series = self.df["soap_matrix"]
         elif desc == "acsf":
-            series = MolecularFeaturizer.compute_acsf(smiles, output_mode="matrix", **kwargs)
+            if "acsf_matrix" not in self.df.columns:
+                self.add_acsf(**kwargs)
+            series = self.df["acsf_matrix"]
         elif desc == "mace":
-            series = MolecularFeaturizer.compute_mace_embeddings(smiles, output_mode="matrix", **kwargs)
+            if "mace_matrix" not in self.df.columns:
+                self.add_mace(**kwargs)
+            series = self.df["mace_matrix"]
         else:
             raise ValueError(
                 f"Descriptor '{descriptor}' does not have a matrix-form API. "
@@ -1459,144 +1527,158 @@ class QM9Dataset:
         )
 
     def get_molecules(
-        self,
-        invariant: bool = True,
-        output_filename: str = "qm9_subset.xyz",
-        subset_size: Optional[int] = None,
-        seed: Optional[int] = None,
-    ) -> List[Atoms]:
-        """
-        Export QM9 molecules to a single .xyz file.
-        Uses extxyz format so atom-level arrays (mass, partial charge) are preserved.
-        """
-        if self.df.is_empty():
-            self.load()
+            self,
+            invariant: bool = True,
+            output_filename: str = "qm9_subset.xyz",
+            subset_size: Optional[int] = None,
+            seed: Optional[int] = None,
+        ) -> List[Atoms]:
+            """
+            Export QM9 molecules to a single .xyz file.
+            Uses native coordinates and atomic numbers extracted directly from the QM9 dataset
+            instead of generating them from SMILES. Uses extxyz format so atom-level arrays
+            (mass, partial charge) are preserved.
+            """
+            if self.df.is_empty():
+                self.load()
 
-        target_size = subset_size if subset_size is not None else self.subset_size
-        if target_size <= 0:
-            raise ValueError("subset_size must be a positive integer.")
+            target_size = subset_size if subset_size is not None else self.subset_size
+            if target_size <= 0:
+                raise ValueError("subset_size must be a positive integer.")
 
-        sample_df = self.df.head(min(target_size, self.df.height))
-        if sample_df.is_empty():
-            raise ValueError("No molecules available to export.")
+            sample_df = self.df.head(min(target_size, self.df.height))
+            if sample_df.is_empty():
+                raise ValueError("No molecules available to export.")
 
-        if seed is None:
-            seed = self.embed_seed
-        elif seed != self.embed_seed:
-            logger.warning(
-                f"get_positions(seed={seed}) differs from dataset embed_seed={self.embed_seed}; "
-                "this may change which molecules can be embedded."
-            )
-
-        frames: List[Atoms] = []
-        failed_count = 0
-        failed_ids: List[str] = []
-
-        for row in sample_df.iter_rows(named=True):
-            mol_id = row["mol_id"]
-            smiles = row["smiles"]
-            canonical_smiles = row["canonical_smiles"]
-            formula = row["formula"]
-
-            try:
-                mol = self._embed_molecule(
-                    smiles=smiles,
-                    seed=seed,
-                    invariant=invariant,
+            if seed is None:
+                seed = self.embed_seed
+            elif seed != self.embed_seed:
+                logger.warning(
+                    f"get_molecules(seed={seed}) differs from dataset embed_seed={self.embed_seed}; "
+                    "this may change which molecules can be embedded if falling back to SMILES."
                 )
-                if mol is None:
-                    raise ValueError("Embedding failed.")
 
-                conf = mol.GetConformer()
+            frames: List[Atoms] = []
+            failed_count = 0
+            failed_ids: List[str] = []
 
-                symbols = [atom.GetSymbol() for atom in mol.GetAtoms()]
-                positions = conf.GetPositions()
-                charges = np.array(
-                    [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
-                    dtype=np.float64,
-                )
-                heavy_atom_count = int(mol.GetNumHeavyAtoms())
-                element_counts = {"C": 0, "N": 0, "O": 0, "F": 0}
-                for atom in mol.GetAtoms():
-                    symbol = atom.GetSymbol()
-                    if symbol in element_counts:
-                        element_counts[symbol] += 1
-                heavy_atom_denom = float(heavy_atom_count) if heavy_atom_count > 0 else 1.0
+            for row in sample_df.iter_rows(named=True):
+                mol_id = row["mol_id"]
+                smiles = row["smiles"]
+                canonical_smiles = row["canonical_smiles"]
+                formula = row["formula"]
 
-                atoms = Atoms(symbols=symbols, positions=positions)
-                masses = atoms.get_masses()
-                atoms.set_initial_charges(charges)
-                # Keep explicit arrays for tools expecting named per-atom properties.
-                atoms.arrays["partial_charge"] = charges
-                atoms.arrays["mass"] = masses
-                atom_info = {
-                    "mol_id": mol_id,
-                    "smiles": smiles,
-                    "canonical_smiles": canonical_smiles,
+                try:
+                    positions = row.get("coordinates")
+                    atomic_numbers = row.get("atomic_numbers")
+
+                    # Core update: Extract directly from QM9 if available
+                    if positions is not None and atomic_numbers is not None:
+                        positions = np.array(positions, dtype=np.float64)
+                        atomic_numbers = np.array(atomic_numbers, dtype=np.int64)
+                        
+                        # Since we bypass RDKit embedding here, default charges to 0 
+                        # (QM9 uses mulliken, but it's not strictly mapped here)
+                        charges = np.zeros(len(atomic_numbers), dtype=np.float64)
                     
-                    "scaffold": row["scaffold_smiles"],
-                    "formula": formula,
-                    "structure_type": self._classify_structure_type(mol),
-                    "functional_groups": ",".join(self._detect_functional_groups(mol)),
-                    "heavy_atom_count": heavy_atom_count,
-                    "element_count_C": int(element_counts["C"]),
-                    "element_count_N": int(element_counts["N"]),
-                    "element_count_O": int(element_counts["O"]),
-                    "element_count_F": int(element_counts["F"]),
-                    "element_ratio_C": float(element_counts["C"] / heavy_atom_denom),
-                    "element_ratio_N": float(element_counts["N"] / heavy_atom_denom),
-                    "element_ratio_O": float(element_counts["O"] / heavy_atom_denom),
-                    "element_ratio_F": float(element_counts["F"] / heavy_atom_denom),
-                    "mu": float(row["mu"]) if row.get("mu") is not None else None,
-                    "gap": float(row["gap"]) if row.get("gap") is not None else None,
-                    "cv": float(row["cv"]) if row.get("cv") is not None else None,
-                    "u0": float(row["u0"]) if row.get("u0") is not None else None,
-                    "homo": float(row["homo"]) if row.get("homo") is not None else None,
-                    "lumo": float(row["lumo"]) if row.get("lumo") is not None else None,
-                    "num_atoms": int(len(atoms)),
-                    "total_mass": float(np.sum(masses)),
-                    "mean_partial_charge": float(np.mean(charges)),
-                    "branching_index": int(row["branching_index"]),
-                    "num_sp_carbons": int(row["num_sp_carbons"]),
-                    "num_sp2_carbons": int(row["num_sp2_carbons"]),
-                    "num_sp3_carbons": int(row["num_sp3_carbons"]),
-                    "main_chain_length": int(row["main_chain_length"]),
-                    "raw_token_count": int(row["raw_token_count"]),
-                    "avg_bond_length": float(row["avg_bond_length"]),
-                }
-                if "soap_embedding" in self.df.columns:
-                    atom_info["soap"] = row.get("soap_embedding")
-                atoms.info.update(atom_info)
-                frames.append(atoms)
-                
-            except Exception as e:
-                logger.debug(f"Skipping {mol_id}: {e}")
-                failed_count += 1
-                failed_ids.append(mol_id)
+                    else:
+                        # Fallback to SMILES embedding if QM9 coords are missing (e.g., injected outliers)
+                        mol = self._embed_molecule(
+                            smiles=smiles,
+                            seed=seed,
+                            invariant=invariant,
+                        )
+                        if mol is None:
+                            raise ValueError("No QM9 coordinates available and 3D embedding failed.")
 
-        if not frames:
-            raise ValueError("Failed to generate geometries for all selected molecules.")
-        #if failed_count > 0 or len(frames) != sample_df.height:
-        #    raise ValueError(
-        #        "Failed to generate geometries for all selected molecules: "
-        #        f"requested={sample_df.height}, generated={len(frames)}, failed={failed_count}. "
-        #        f"failed_ids={failed_ids}"
-        #    )
+                        conf = mol.GetConformer()
+                        atomic_numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int64)
+                        positions = conf.GetPositions()
+                        charges = np.array(
+                            [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
+                            dtype=np.float64,
+                        )
 
-        output_path = os.path.join(self.root, output_filename)
-        write(output_path, frames, format="extxyz")
-        logger.success(
-            f"Saved {len(frames)} molecules to {output_path} "
-            f"(failed: {failed_count}, requested: {target_size})."
-        )
-        
-        return frames
+                    # Initialize the ASE Atoms object
+                    atoms = Atoms(numbers=atomic_numbers, positions=positions)
+                    masses = atoms.get_masses()
+                    symbols = atoms.get_chemical_symbols()
+                    
+                    atoms.set_initial_charges(charges)
+                    # Keep explicit arrays for tools expecting named per-atom properties.
+                    atoms.arrays["partial_charge"] = charges
+                    atoms.arrays["mass"] = masses
+                    
+                    # Derive element counts and heavy atoms from the native array
+                    heavy_atom_count = sum(1 for z in atomic_numbers if z > 1)
+                    element_counts = {
+                        "C": symbols.count("C"),
+                        "N": symbols.count("N"),
+                        "O": symbols.count("O"),
+                        "F": symbols.count("F")
+                    }
+                    heavy_atom_denom = float(heavy_atom_count) if heavy_atom_count > 0 else 1.0
 
-    def get_grassmann_distance_matrix(self, frames: List) -> np.ndarray:
-        """
-        Computes a Grassmann distance matrix using only ASE frames as input.
-        """
-        return self.geometry_engine.get_grassmann_distance_matrix(frames)
+                    atom_info = {
+                        "mol_id": mol_id,
+                        "smiles": smiles,
+                        "canonical_smiles": canonical_smiles,
+                        
+                        "scaffold": row.get("scaffold_smiles", ""),
+                        "formula": formula,
+                        
+                        # Read structural topology features dynamically mapped in _build_smiles_row()
+                        "structure_type": row.get("structure_class", "Unknown"),
+                        "functional_groups": row.get("functional_groups", ""),
+                        
+                        "heavy_atom_count": heavy_atom_count,
+                        "element_count_C": element_counts["C"],
+                        "element_count_N": element_counts["N"],
+                        "element_count_O": element_counts["O"],
+                        "element_count_F": element_counts["F"],
+                        "element_ratio_C": float(element_counts["C"] / heavy_atom_denom),
+                        "element_ratio_N": float(element_counts["N"] / heavy_atom_denom),
+                        "element_ratio_O": float(element_counts["O"] / heavy_atom_denom),
+                        "element_ratio_F": float(element_counts["F"] / heavy_atom_denom),
+                        "mu": float(row["mu"]) if row.get("mu") is not None else None,
+                        "gap": float(row["gap"]) if row.get("gap") is not None else None,
+                        "cv": float(row["cv"]) if row.get("cv") is not None else None,
+                        "u0": float(row["u0"]) if row.get("u0") is not None else None,
+                        "homo": float(row["homo"]) if row.get("homo") is not None else None,
+                        "lumo": float(row["lumo"]) if row.get("lumo") is not None else None,
+                        "num_atoms": int(len(atoms)),
+                        "total_mass": float(np.sum(masses)),
+                        "mean_partial_charge": float(np.mean(charges)),
+                        "branching_index": int(row.get("branching_index", 0)),
+                        "num_sp_carbons": int(row.get("num_sp_carbons", 0)),
+                        "num_sp2_carbons": int(row.get("num_sp2_carbons", 0)),
+                        "num_sp3_carbons": int(row.get("num_sp3_carbons", 0)),
+                        "main_chain_length": int(row.get("main_chain_length", 0)),
+                        "raw_token_count": int(row.get("raw_token_count", 0)),
+                        "avg_bond_length": float(row.get("avg_bond_length", 0.0)),
+                    }
+                    
+                    if "soap_embedding" in self.df.columns:
+                        atom_info["soap"] = row.get("soap_embedding")
+                    atoms.info.update(atom_info)
+                    frames.append(atoms)
+                    
+                except Exception as e:
+                    logger.debug(f"Skipping {mol_id}: {e}")
+                    failed_count += 1
+                    failed_ids.append(mol_id)
+
+            if not frames:
+                raise ValueError("Failed to generate geometries for all selected molecules.")
+
+            output_path = os.path.join(self.root, output_filename)
+            write(output_path, frames, format="extxyz")
+            logger.success(
+                f"Saved {len(frames)} molecules to {output_path} "
+                f"(failed: {failed_count}, requested: {target_size})."
+            )
+            
+            return frames
     
     def apply_scaling(self, columns, mode="fit_transform"):
         """
@@ -2275,7 +2357,6 @@ class MaterialsProject:
                 unique_elements_set.update([el.symbol for el in comp.elements])
             
             unique_elements = sorted(list(unique_elements_set))
-            weighting = {el: element(el).atomic_number for el in unique_elements}
             logger.info(f"Found {len(unique_elements)} unique elements.")
 
         # 3. Initialize Engines
@@ -2285,7 +2366,7 @@ class MaterialsProject:
             soap_engine = SOAP(
                 species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, 
                 l_max=l_max, sigma=sigma, sparse=False, average="inner",
-                compression={"mode": "mu2", "species_weighting": weighting}
+                compression={"mode": "mu2"}
             )
         
         if self.add_acsf:
@@ -2304,7 +2385,6 @@ class MaterialsProject:
         if getattr(self, "add_mace", False):
             from mace.calculators import mace_mp
             logger.info("Loading MACE-MP model...")
-            from utils.file_ops import get_device
             mace_engine = mace_mp(model="medium", device='cpu', default_dtype="float32")
 
         # 4. Process in Chunks
@@ -2322,13 +2402,13 @@ class MaterialsProject:
             # --- PROCESS SOAP ---
             if self.add_soap:
                 logger.info(f"Computing SOAP chunk {chunk_idx} ({start_row} to {end_row})...")
-                soap_features = self._compute_feature(struct_strings, soap_engine, "SOAP")
+                soap_features = self._compute_feature(struct_strings, soap_engine)
                 soap_all.extend(soap_features)
 
             # --- PROCESS ACSF ---
             if self.add_acsf:
                 logger.info(f"Computing ACSF chunk {chunk_idx} ({start_row} to {end_row})...")
-                raw_acsf_features = self._compute_feature(struct_strings, acsf_engine, "ACSF")
+                raw_acsf_features = self._compute_feature(struct_strings, acsf_engine)
 
                 normalized_acsf = []
                 for v in raw_acsf_features:
@@ -2345,7 +2425,7 @@ class MaterialsProject:
             # --- PROCESS COULOMB ---
             if getattr(self, "add_coulomb", False):
                 logger.info(f"Computing Coulomb Matrix chunk {chunk_idx} ({start_row} to {end_row})...")
-                coulomb_features = self._compute_feature(struct_strings, coulomb_engine, "Coulomb")
+                coulomb_features = self._compute_feature(struct_strings, coulomb_engine)
                 coulomb_all.extend(coulomb_features)
 
             # --- PROCESS MACE ---
@@ -2463,14 +2543,11 @@ class MaterialsProject:
         self,
         struct_strings: List[str],
         engine,
-        desc_name: str,
         batch_size: int = 32,
         output_mode: str = "pooled",
     ) -> List[Optional[List[float] | List[List[float]]]]:
         features = []
         
-        # We disabled tqdm here so it doesn't spam your console during chunking,
-        # relying instead on the chunk logger in the parent function.
         for i in range(0, len(struct_strings), batch_size):
             batch_jsons = struct_strings[i : i + batch_size]
             batch_structs = [Structure.from_dict(json.loads(s)) for s in batch_jsons]
@@ -2578,7 +2655,6 @@ class MaterialsProject:
             values = self._compute_feature(
                 struct_strings,
                 engine,
-                "SOAP",
                 batch_size=batch_size,
                 output_mode="matrix",
             )
@@ -2593,7 +2669,6 @@ class MaterialsProject:
             values = self._compute_feature(
                 struct_strings,
                 engine,
-                "ACSF",
                 batch_size=batch_size,
                 output_mode="matrix",
             )

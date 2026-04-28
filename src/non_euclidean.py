@@ -1,9 +1,14 @@
-from typing import Dict, List, Sequence, Literal, Optional
+from typing import Dict, List, Sequence, Literal, Optional, Any
 import signal
+import json
+from joblib import Parallel, delayed
+import os
+import re
 
 import numpy as np
 import ot
 import persim
+import polars as pl
 
 from ase import Atoms
 from ase.data import covalent_radii
@@ -113,6 +118,230 @@ def _coerce_external_feature_collection(
         return [np.asarray(matrix, dtype=np.float64).reshape(1, -1) for matrix in matrices]
 
     return [np.asarray(matrix, dtype=np.float64) for matrix in matrices]
+
+
+def _descriptor_matrix_column(descriptor: str) -> str:
+    key = str(descriptor).strip().lower()
+    mapping = {
+        "soap": "soap_matrix",
+        "soap_matrix": "soap_matrix",
+        "acsf": "acsf_matrix",
+        "acsf_matrix": "acsf_matrix",
+        "mace": "mace_matrix",
+        "mace_matrix": "mace_matrix",
+    }
+    column = mapping.get(key)
+    if column is None:
+        raise ValueError(
+            f"Unknown descriptor '{descriptor}'. Expected one of: soap, acsf, mace."
+        )
+    return column
+
+
+def _feature_matrices_from_df(
+    df: Any,
+    descriptor: str,
+) -> List[np.ndarray]:
+    """
+    Extract per-structure atom-wise descriptor matrices from a dataframe column such as
+    `soap_matrix`, `acsf_matrix`, or `mace_matrix`.
+    """
+    if df is None:
+        raise ValueError("A dataframe must be provided.")
+
+    column_name = _descriptor_matrix_column(descriptor)
+    logger.info(f"Using column: {column_name} from df")
+
+    if isinstance(df, pl.DataFrame):
+        if column_name not in df.columns:
+            raise ValueError(
+                f"Dataframe is missing required descriptor column '{column_name}'."
+            )
+        values = df[column_name].to_list()
+    else:
+        try:
+            values = df[column_name].to_list()
+        except Exception as e:
+            raise ValueError(
+                f"Could not extract descriptor column '{column_name}' from dataframe-like input."
+            ) from e
+
+    matrices: List[np.ndarray] = []
+    for value in values:
+        arr = np.asarray(value, dtype=np.float64) if value is not None else np.empty((0, 0), dtype=np.float64)
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        elif arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        matrices.append(arr)
+    return matrices
+
+
+def _mol_ids_from_df(df: Any) -> List[str]:
+    if df is None:
+        raise ValueError("A dataframe must be provided.")
+
+    if isinstance(df, pl.DataFrame):
+        if "mol_id" not in df.columns:
+            raise ValueError("Dataframe must contain a 'mol_id' column for distance-matrix caching.")
+        return [str(mol_id) for mol_id in df["mol_id"].to_list()]
+
+    try:
+        values = df["mol_id"].to_list()
+    except Exception as e:
+        raise ValueError("Could not extract 'mol_id' from dataframe-like input.") from e
+    return [str(mol_id) for mol_id in values]
+
+
+def _mol_ids_from_frames(frames: Sequence[Atoms]) -> List[str]:
+    mol_ids: List[str] = []
+    for idx, frame in enumerate(frames):
+        mol_id = frame.info.get("mol_id")
+        if mol_id is None:
+            raise ValueError(
+                f"Frame at index {idx} is missing info['mol_id']; this is required for persistent-homology caching."
+            )
+        mol_ids.append(str(mol_id))
+    return mol_ids
+
+
+def _default_non_euclidean_cache_dir() -> str:
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    return os.path.join(repo_root, "data", "QM9", "non_euclidean_cache")
+
+
+def _cache_key_payload(
+    method_name: str,
+    mol_ids: Sequence[str],
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "method": method_name,
+        "mol_ids": list(mol_ids),
+        "params": params,
+    }
+
+
+def _sanitize_cache_token(value: Any) -> str:
+    token = str(value).strip().lower()
+    token = token.replace(" ", "-").replace("_", "-")
+    token = re.sub(r"[^a-z0-9.-]+", "-", token)
+    token = re.sub(r"-{2,}", "-", token).strip("-")
+    return token or "value"
+
+
+def _cache_file_stem(
+    method_name: str,
+    mol_ids: Sequence[str],
+    params: Dict[str, Any],
+) -> str:
+    descriptor = _sanitize_cache_token(params.get("descriptor", "unknown"))
+    stem_parts = [method_name, f"n{len(mol_ids)}", descriptor]
+
+    if method_name == "wasserstein":
+        stem_parts.append(_sanitize_cache_token(params.get("metric", "sqeuclidean")))
+    elif method_name == "grassmann":
+        stem_parts.append(f"k{int(params.get('k', 0))}")
+        stem_parts.append(_sanitize_cache_token(params.get("method", "svd")))
+        stem_parts.append("norm" if bool(params.get("normalized", True)) else "raw")
+    elif method_name == "riemann":
+        stem_parts.append(_sanitize_cache_token(params.get("metric", "affine-invariant")))
+        n_pca = params.get("n_pca", None)
+        stem_parts.append("nopca" if n_pca is None else f"pca{int(n_pca)}")
+    elif method_name == "persistent_homology":
+        stem_parts.append(_sanitize_cache_token(params.get("metric", "bottleneck")))
+        stem_parts.append(f"maxdim{int(params.get('max_homology_dim', 2))}")
+        dims = params.get("homology_dims", ())
+        dims_token = "-".join(str(int(d)) for d in dims) if dims else "none"
+        stem_parts.append(f"dims{dims_token}")
+
+    return "_".join(stem_parts)
+
+
+def _cache_paths(cache_dir: str, stem: str, index: Optional[int] = None) -> tuple[str, str]:
+    suffix = "" if index is None else f"_{index}"
+    return (
+        os.path.join(cache_dir, f"{stem}{suffix}.npy"),
+        os.path.join(cache_dir, f"{stem}{suffix}.json"),
+    )
+
+
+def _load_cached_distance_matrix(
+    method_name: str,
+    mol_ids: Sequence[str],
+    params: Dict[str, Any],
+    cache_dir: str,
+    force_recalculate: bool = False,
+) -> Optional[np.ndarray]:
+    stem = _cache_file_stem(method_name, mol_ids, params)
+
+    if force_recalculate or not os.path.isdir(cache_dir):
+        return None
+
+    for filename in sorted(os.listdir(cache_dir)):
+        if not filename.startswith(stem) or not filename.endswith(".json"):
+            continue
+
+        meta_path = os.path.join(cache_dir, filename)
+        matrix_path = meta_path[:-5] + ".npy"
+        if not os.path.exists(matrix_path):
+            continue
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except Exception as e:
+            logger.warning(f"Failed to read non-Euclidean cache metadata from {meta_path}: {e}")
+            continue
+
+        if metadata.get("mol_ids") != list(mol_ids):
+            continue
+        if metadata.get("params") != params:
+            continue
+
+        logger.info(f"Loading cached {method_name} distance matrix from {matrix_path}")
+        return np.load(matrix_path)
+
+    return None
+
+
+def _save_cached_distance_matrix(
+    matrix: np.ndarray,
+    method_name: str,
+    mol_ids: Sequence[str],
+    params: Dict[str, Any],
+    cache_dir: str,
+) -> None:
+    os.makedirs(cache_dir, exist_ok=True)
+    payload = _cache_key_payload(method_name, mol_ids, params)
+    stem = _cache_file_stem(method_name, mol_ids, params)
+
+    chosen_index: Optional[int] = None
+    for candidate in [None] + list(range(1, 10_000)):
+        matrix_path, meta_path = _cache_paths(cache_dir, stem, candidate)
+        if not (os.path.exists(matrix_path) and os.path.exists(meta_path)):
+            chosen_index = candidate
+            break
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except Exception:
+            chosen_index = candidate
+            break
+
+        if metadata.get("mol_ids") == list(mol_ids) and metadata.get("params") == params:
+            chosen_index = candidate
+            break
+
+    matrix_path, meta_path = _cache_paths(cache_dir, stem, chosen_index)
+
+    np.save(matrix_path, matrix)
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    logger.success(f"Saved cached {method_name} distance matrix to {matrix_path}")
 
 
 def _normalize_external_feature_matrices_d_by_n(
@@ -281,16 +510,39 @@ class Wasserstein:
     @classmethod
     def distance_matrix(
         cls, 
-        frames: Optional[Sequence] = None, 
+        frames: Optional[Sequence] = None,
+        df: Any = None,
         feature_matrices: Optional[Sequence[np.ndarray]] = None,
         feature_type: str = 'invariant',
-        metric: str = 'sqeuclidean'
+        descriptor: str = 'soap',
+        metric: str = 'sqeuclidean',
+        cache_dir: Optional[str] = None,
+        force_recalculate: bool = False,
     ) -> np.ndarray:
+        mol_ids: Optional[List[str]] = None
+        if df is not None:
+            mol_ids = _mol_ids_from_df(df)
+            cache_params = {
+                "descriptor": descriptor,
+                "metric": metric,
+            }
+            cached = _load_cached_distance_matrix(
+                method_name="wasserstein",
+                mol_ids=mol_ids,
+                params=cache_params,
+                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                force_recalculate=force_recalculate,
+            )
+            if cached is not None:
+                return cached
         
         # Step 1: Standardized feature extraction aligned with Riemann/Grassmann
         if feature_matrices is not None:
             # We assume these are already (N_atoms, D_features) 
             raw_matrices = feature_matrices
+        elif df is not None:
+            raw_matrices = _feature_matrices_from_df(df, descriptor)
+            feature_type = descriptor
         elif frames is not None:
             if feature_type == 'invariant':
                 raw_matrices = _compute_feature_matrices(frames, normalized=True)
@@ -317,6 +569,15 @@ class Wasserstein:
             pair_fn=pair_fn,
             desc=f"Wasserstein ({feature_type})",
         )
+
+        if mol_ids is not None:
+            _save_cached_distance_matrix(
+                dist_matrix,
+                method_name="wasserstein",
+                mol_ids=mol_ids,
+                params={"descriptor": descriptor, "metric": metric},
+                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+            )
         
         return dist_matrix
 
@@ -412,12 +673,30 @@ class PersistentHomology:
         frames: Sequence[Atoms],
         metric: str = "bottleneck",
         max_homology_dim: int = 2,
-        homology_dims: Sequence[int] = (0, 1, 2)
+        homology_dims: Sequence[int] = (0, 1, 2),
+        cache_dir: Optional[str] = None,
+        force_recalculate: bool = False,
     ) -> np.ndarray:
         """
         Generates a symmetric pairwise distance matrix comparing the topological 
         features of all molecular frames in the sequence.
         """
+        mol_ids = _mol_ids_from_frames(frames)
+        cache_params = {
+            "metric": metric,
+            "max_homology_dim": int(max_homology_dim),
+            "homology_dims": [int(d) for d in homology_dims],
+        }
+        cached = _load_cached_distance_matrix(
+            method_name="persistent_homology",
+            mol_ids=mol_ids,
+            params=cache_params,
+            cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+            force_recalculate=force_recalculate,
+        )
+        if cached is not None:
+            return cached
+
         logger.info(
             f"Computing persistent homology distance matrix for {len(frames)} frames "
             f"(metric='{metric}', max_homology_dim={max_homology_dim}, "
@@ -432,7 +711,15 @@ class PersistentHomology:
             pair_fn=lambda i, j: cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims),
             desc="Persistence distances",
         )
-                    
+
+        _save_cached_distance_matrix(
+            dist_mat,
+            method_name="persistent_homology",
+            mol_ids=mol_ids,
+            params=cache_params,
+            cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+        )
+
         logger.success("Finished persistent homology distance matrix computation.")
         return dist_mat
 
@@ -445,10 +732,12 @@ class Grassmann:
     @classmethod
     def _get_uk_bases(
         cls,
-        frames: Optional[Sequence['Atoms']], 
+        frames: Optional[Sequence['Atoms']],
+        df: Any = None,
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd",
         features : Literal['soap', 'invariant'] = 'invariant',
+        descriptor: str = 'soap',
         normalized: bool = True,
         precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
@@ -461,19 +750,26 @@ class Grassmann:
         if precomputed_feature_matrices is not None:
             # We assume these are (N_atoms, D_features)
             raw_matrices = precomputed_feature_matrices
+        elif df is not None:
+            raw_matrices = _feature_matrices_from_df(df, descriptor)
+            features = descriptor
         elif frames is not None:
             if features == 'invariant':
                 raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
                 # Ensure they are (N_atoms, D_features) to remain consistent
                 raw_matrices = [x.T if x.shape[0] == 3 else x for x in raw_matrices]
-            elif features == 'soap':
+            elif features in {'soap', 'acsf', 'mace'}:
+                if features != 'soap':
+                    raise ValueError(
+                        "Frame-based Grassmann features currently support only 'invariant' and 'soap'. "
+                        "Use the dataframe path for 'acsf' or 'mace'."
+                    )
                 raw_matrices = _compute_soap_feature_matrices(frames)
-                # SOAP natively returns (D, N) via _ensure_feature_matrix_d_by_n, transpose it
                 raw_matrices = [x.T for x in raw_matrices]
             else:
                 raise ValueError(f"Unknown feature type: {features}")
         else:
-            raise ValueError("Must provide either 'frames' or 'precomputed_feature_matrices'.")
+            raise ValueError("Must provide one of: 'df', 'frames', or 'precomputed_feature_matrices'.")
 
         for X in raw_matrices:
             X = np.asarray(X)
@@ -531,25 +827,58 @@ class Grassmann:
     def distance_matrix(
         cls, 
         frames: Optional[Sequence['Atoms']] = None, 
+        df: Any = None,
         k: int = 3, 
         method: Literal["qr", "svd"] = "svd",
         features : Literal['soap', 'invariant'] = 'invariant',
+        descriptor: str = 'soap',
         normalized: bool = True,
-        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
+        feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        cache_dir: Optional[str] = None,
+        force_recalculate: bool = False,
     ) -> np.ndarray:
         """
         Computes a symmetric pairwise distance matrix for a molecular trajectory.
         """
-        num_items = len(precomputed_feature_matrices) if precomputed_feature_matrices is not None else len(frames)
+        mol_ids: Optional[List[str]] = None
+        if df is not None:
+            mol_ids = _mol_ids_from_df(df)
+            cache_params = {
+                "descriptor": descriptor,
+                "k": int(k),
+                "method": str(method),
+                "normalized": bool(normalized),
+            }
+            cached = _load_cached_distance_matrix(
+                method_name="grassmann",
+                mol_ids=mol_ids,
+                params=cache_params,
+                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                force_recalculate=force_recalculate,
+            )
+            if cached is not None:
+                return cached
+
+        if feature_matrices is not None:
+            num_items = len(feature_matrices)
+        elif df is not None:
+            num_items = len(_feature_matrices_from_df(df, descriptor))
+            features = descriptor
+        elif frames is not None:
+            num_items = len(frames)
+        else:
+            raise ValueError("Must provide one of: 'df', 'frames', or 'feature_matrices'.")
         
         # Precompute bases
         bases = cls._get_uk_bases(
-            frames=frames, 
+            frames=frames,
+            df=df,
             k=k, 
             method=method, 
             features=features, 
+            descriptor=descriptor,
             normalized=normalized,
-            precomputed_feature_matrices=precomputed_feature_matrices
+            precomputed_feature_matrices=feature_matrices
         )
         
         # Initialize an empty symmetric matrix
@@ -562,6 +891,20 @@ class Grassmann:
                 d = cls._distance(bases[i], bases[j])
                 dist_matrix[i, j] = d
                 dist_matrix[j, i] = d # Matrix is symmetric
+
+        if mol_ids is not None:
+            _save_cached_distance_matrix(
+                dist_matrix,
+                method_name="grassmann",
+                mol_ids=mol_ids,
+                params={
+                    "descriptor": descriptor,
+                    "k": int(k),
+                    "method": str(method),
+                    "normalized": bool(normalized),
+                },
+                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+            )
                 
         return dist_matrix
 
@@ -576,8 +919,10 @@ class Riemann:
     def _get_spd_matrices(
         cls,
         frames=None,
+        df: Any = None,
         feature_matrices=None,
         feature_type: str = 'invariant',
+        descriptor: str = 'soap',
         regularization: float = 1e-3,
         n_pca: int = 30  # Strongly recommend keeping this low!
     ) -> np.ndarray:
@@ -585,15 +930,23 @@ class Riemann:
         # 1. Obtain raw feature matrices
         if feature_matrices is not None:
             raw_matrices = feature_matrices
+        elif df is not None:
+            raw_matrices = _feature_matrices_from_df(df, descriptor)
+            feature_type = descriptor
         elif frames is not None:
             if feature_type == 'invariant':
                 raw_matrices = [matrix.T for matrix in _compute_feature_matrices(frames, normalized=True)]
             elif feature_type == 'soap':
                 raw_matrices = [matrix.T for matrix in _compute_soap_feature_matrices(frames)]
+            elif feature_type in {'acsf', 'mace'}:
+                raise ValueError(
+                    "Frame-based Riemann features currently support only 'invariant' and 'soap'. "
+                    "Use the dataframe path for 'acsf' or 'mace'."
+                )
             else:
                 raise ValueError(f"Unknown feature_type: {feature_type}")
         else:
-            raise ValueError("Must provide 'frames' or 'feature_matrices'.")
+            raise ValueError("Must provide one of: 'df', 'frames', or 'feature_matrices'.")
 
         # 2. PCA Reduction (Mandatory for large D like SOAP's 2240)
         if n_pca is not None:
@@ -618,40 +971,70 @@ class Riemann:
         for X in raw_matrices:
             X = np.asarray(X)
             
-            # THE FIX: Transpose first! 
-            # (D_features, N_atoms) @ (N_atoms, D_features) = (D_features, D_features)
             C = (X.T @ X) / X.shape[0]
             
             # Regularization to ensure it is strictly Positive Definite
             C += np.eye(C.shape[0]) * regularization
             spd_matrices.append(C)
 
-        return np.array(spd_matrices)
+        return spd_matrices
 
     @staticmethod
     def _log_spd(C: np.ndarray) -> np.ndarray:
         eigvals, eigvecs = np.linalg.eigh(C)
         eigvals = np.clip(eigvals, 1e-9, None)
         return eigvecs @ np.diag(np.log(eigvals)) @ eigvecs.T
+    
+    @staticmethod
+    def _affine_dist(spd_matrices, i, j):
+        try:
+            evs = eigvalsh(spd_matrices[i], spd_matrices[j])
+            return i, j, np.sqrt(np.sum(np.log(np.clip(evs, 1e-9, None))**2))
+        except:
+            return i, j, np.nan
 
     @classmethod
     def distance_matrix(
         cls,
         frames=None,
+        df: Any = None,
         feature_matrices=None,
         feature_type: str = 'invariant',
-        metric: str = "log-euclidean",
+        descriptor: str = 'soap',
+        metric: str = "affine-invariant",
         regularization: float = 1e-3,
-        n_pca: int = None
+        n_pca: int = None,
+        cache_dir: Optional[str] = None,
+        force_recalculate: bool = False,
     ) -> np.ndarray:
+        mol_ids: Optional[List[str]] = None
+        if df is not None:
+            mol_ids = _mol_ids_from_df(df)
+            cache_params = {
+                "descriptor": descriptor,
+                "metric": metric,
+                "regularization": float(regularization),
+                "n_pca": None if n_pca is None else int(n_pca),
+            }
+            cached = _load_cached_distance_matrix(
+                method_name="riemann",
+                mol_ids=mol_ids,
+                params=cache_params,
+                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                force_recalculate=force_recalculate,
+            )
+            if cached is not None:
+                return cached
         
         logger.info(f"Computing Riemann distance matrix | Features: {feature_type} | Metric: {metric}")
 
         # Build SPD matrices
         spd_matrices = cls._get_spd_matrices(
             frames=frames, 
+            df=df,
             feature_matrices=feature_matrices,
             feature_type=feature_type,
+            descriptor=descriptor,
             regularization=regularization,
             n_pca=n_pca
         )
@@ -663,24 +1046,52 @@ class Riemann:
             # Log-Euclidean: Compute logs once (O(n * d^3))
             log_mats = np.array([cls._log_spd(C) for C in tqdm(spd_matrices, desc="Matrix Logs")])
             
-            for i in tqdm(range(n), desc="Computing Distances"):
-                for j in range(i + 1, n):
-                    d = np.linalg.norm(log_mats[i] - log_mats[j], ord="fro")
-                    dist_matrix[i, j] = dist_matrix[j, i] = d
+            # Vectorized: reshape to (n, d*d) and use broadcasting or cdist
+            flat = log_mats.reshape(n, -1)
+            from scipy.spatial.distance import cdist
+            dist_matrix = cdist(flat, flat, metric='euclidean')
 
         else:
             # Affine-Invariant: Solve generalized eigenvalue for every pair (O(n^2 * d^3))
-            for i in tqdm(range(n), desc="Computing Distances"):
-                for j in range(i + 1, n):
-                    try:
-                        evs = eigvalsh(spd_matrices[i], spd_matrices[j])
-                        d = np.sqrt(np.sum(np.log(np.clip(evs, 1e-9, None))**2))
-                    except:
-                        d = np.nan
-                    dist_matrix[i, j] = dist_matrix[j, i] = d
+            logger.info("Computing Affine-Invariant distances in parallel...")
+    
+            def calc_pair(i, j, C_i, C_j):
+                try:
+                    evs = eigvalsh(C_i, C_j)
+                    d = np.sqrt(np.sum(np.log(np.clip(evs, 1e-9, None))**2))
+                    return i, j, d
+                except:
+                    return i, j, np.nan
+
+            # Generate all combinations
+            from itertools import combinations
+            pairs = list(combinations(range(n), 2))
             
+            # Run in parallel using all available cores (n_jobs=-1)
+            results = Parallel(n_jobs=-1, batch_size='auto')(
+                delayed(calc_pair)(i, j, spd_matrices[i], spd_matrices[j]) for i, j in tqdm(pairs, desc="Distances")
+            )
+            
+            # Reconstruct the matrix
+            for i, j, d in results:
+                dist_matrix[i, j] = dist_matrix[j, i] = d
+                
             # Fill failed calculations with max distance
             if np.isnan(dist_matrix).any():
                 dist_matrix = np.nan_to_num(dist_matrix, nan=np.nanmax(dist_matrix))
+
+        if mol_ids is not None:
+            _save_cached_distance_matrix(
+                dist_matrix,
+                method_name="riemann",
+                mol_ids=mol_ids,
+                params={
+                    "descriptor": descriptor,
+                    "metric": metric,
+                    "regularization": float(regularization),
+                    "n_pca": None if n_pca is None else int(n_pca),
+                },
+                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+            )
 
         return dist_matrix

@@ -28,6 +28,149 @@ from ase import Atoms
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 
+import numpy as np
+import hdbscan
+import random
+
+
+def evaluate_hdbscan_grid(
+    dist_matrix,
+    mcs_values=None,
+    ms_ratios=None,
+    extra_ms=None,
+    n_random=None,
+    method="eom",
+    sort_by="score",
+    top_k=20,
+    verbose=True,
+):
+    """
+    Evaluate HDBSCAN over a structured grid + optional random search.
+
+    Parameters
+    ----------
+    dist_matrix : np.ndarray
+        Precomputed distance matrix (must be float64).
+        
+    mcs_values : list[int]
+        Values for min_cluster_size.
+        
+    ms_ratios : list[float]
+        min_samples = int(mcs * ratio)
+        
+    extra_ms : list[int]
+        Additional absolute min_samples values.
+        
+    n_random : int or None
+        Number of random samples to add (optional).
+        
+    method : str
+        HDBSCAN cluster_selection_method ('eom' or 'leaf').
+        
+    sort_by : str
+        One of ['score', 'persistence', 'noise']
+        
+    top_k : int
+        Number of top results to print.
+        
+    verbose : bool
+        Whether to print top results.
+
+    Returns
+    -------
+    results_sorted : list[dict]
+    """
+
+    dist_matrix = dist_matrix.astype(np.float64)
+
+    # Defaults (good general-purpose grid)
+    if mcs_values is None:
+        mcs_values = [10, 20, 40, 60, 80, 120, 150, 220, 300]
+
+    if ms_ratios is None:
+        ms_ratios = [0.1, 0.25, 0.5, 0.75, 1.0]
+
+    if extra_ms is None:
+        extra_ms = [1, 10, 40]
+
+    results = []
+
+    def run_single(mcs, ms):
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=mcs,
+            min_samples=ms,
+            metric="precomputed",
+            cluster_selection_method=method,
+        )
+
+        labels = clusterer.fit_predict(dist_matrix)
+
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        noise_frac = np.mean(labels == -1)
+
+        if n_clusters > 0:
+            persistence = np.mean(clusterer.cluster_persistence_)
+        else:
+            persistence = 0.0
+
+        score = persistence * (1 - noise_frac)
+
+        return {
+            "min_cluster_size": mcs,
+            "min_samples": ms,
+            "clusters": n_clusters,
+            "noise": noise_frac,
+            "persistence": persistence,
+            "score": score,
+            "labels": labels,
+        }
+
+    # --- Structured grid (ratios)
+    for mcs in mcs_values:
+        for ratio in ms_ratios:
+            ms = max(1, int(mcs * ratio))
+            results.append(run_single(mcs, ms))
+
+    # --- Extra absolute values
+    for mcs in mcs_values:
+        for ms in extra_ms:
+            if ms <= mcs:
+                results.append(run_single(mcs, ms))
+
+    # --- Optional random search
+    if n_random is not None:
+        for _ in range(n_random):
+            mcs = random.choice(mcs_values)
+            ms = random.randint(1, mcs)
+            results.append(run_single(mcs, ms))
+
+    # --- Sorting
+    if sort_by == "score":
+        key_fn = lambda x: -x["score"]
+    elif sort_by == "persistence":
+        key_fn = lambda x: (-x["persistence"], x["noise"])
+    elif sort_by == "noise":
+        key_fn = lambda x: x["noise"]
+    else:
+        raise ValueError("Invalid sort_by")
+
+    results_sorted = sorted(results, key=key_fn)
+
+    # --- Print top results
+    if verbose:
+        print("\nTop configurations:\n")
+        for r in results_sorted[:top_k]:
+            if r['noise'] < 0.5:
+                print(
+                    f"mcs={r['min_cluster_size']}, "
+                    f"ms={r['min_samples']}, "
+                    f"clusters={r['clusters']}, "
+                    f"noise={r['noise']:.2f}, "
+                    f"persistence={r['persistence']:.3f}, "
+                    f"score={r['score']:.3f}"
+                )
+
+    return results_sorted
 
 def get_structures(df, mol_id_list = None):
     # Extract both the IDs and the SMILES strings
@@ -244,7 +387,7 @@ def _project_distance_matrix(
         return reducer.fit_transform(dist_matrix)
 
     if method == "mds":
-        reducer = MDS(n_components=2, metric=True, dissimilarity="precomputed", random_state=random_state)
+        reducer = MDS(n_components=2, metric='precomputed', random_state=42, n_init=4)
         return reducer.fit_transform(dist_matrix)
 
     raise ValueError(
@@ -382,6 +525,7 @@ def plot_distance_matrix_projection(
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.show()
     plt.close(fig)
     logger.success(f"Saved {projection_label} projection plot to {output_path}")
 
@@ -918,7 +1062,7 @@ def _build_chemiscope_frames(df: pl.DataFrame, qm9_seed: int = 40, qm9_invariant
 
 
 def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
-    print("Running " + reduction_method + " dimensionality reduction...")
+    logger.info("Running " + reduction_method + " dimensionality reduction...")
 
     dist_matrix = np.asarray(dist_matrix)
     labels = np.asarray(labels)
@@ -927,7 +1071,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             f"labels length ({labels.shape[0]}) must match dataframe rows ({df.height})."
         )
 
-    print("Converting structures/molecules to ASE Atoms for Chemiscope...")
+    logger.info("Converting structures/molecules to ASE Atoms for Chemiscope...")
     frames, valid_indices, dataset_kind = _build_chemiscope_frames(df)
     if not frames:
         raise ValueError("No valid structures/molecules could be converted for Chemiscope.")
@@ -995,7 +1139,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     else:
         raise ValueError(f"Unsupported reduction method: {reduction_method}")
 
-    print("Assembling properties for Chemiscope...")
+    logger.info("Assembling properties for Chemiscope...")
 
     if "fraction_csp1" in df.columns:
         df = df.with_columns(
@@ -1090,7 +1234,7 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
     if dataset_kind == "materials":
         settings["structure"][0]["supercell"] = [2, 2, 2]
 
-    print("Generating Chemiscope widget...")
+    logger.info("Generating Chemiscope widget...")
     title_prefix = "Materials Project" if dataset_kind == "materials" else "QM9"
     output_prefix = "materials" if dataset_kind == "materials" else "qm9"
 
@@ -1121,13 +1265,13 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         settings=settings,
         metadata={"name": f"{title_prefix} - {reduction_method} Clustering"},
     )
-    print(f"Saved Chemiscope input to: {output_json}")
+    logger.success(f"Saved Chemiscope input to: {output_json}")
     viewer = chemiscope.show_input(output_json)
     viewer_url = getattr(viewer, "url", None)
     if viewer_url:
         _open_in_browser(viewer_url)
     else:
-        print(
+        logger.warning(
             "If the viewer does not open automatically, run "
             f"`chemiscope show {output_prefix}_{reduction_method}_clustering.json`."
         )

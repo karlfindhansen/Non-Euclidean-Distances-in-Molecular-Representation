@@ -80,7 +80,8 @@ class MolecularFeaturizer:
                     return Atoms(numbers=numbers, positions=positions)
             except Exception:
                 pass
-
+            
+        logger.warning("Generating molecule from smiles")
         mol = MolecularFeaturizer._generate_3d_mol(smiles or "")
         if mol is None:
             return None
@@ -146,6 +147,59 @@ class MolecularFeaturizer:
         if reduce == "mean":
             return np.mean(arr, axis=0).ravel().tolist()
         return arr.ravel().tolist()
+
+    @staticmethod
+    def _compute_atomwise_descriptor_pair(
+        smiles_series: pl.Series,
+        coordinates_series: pl.Series | None,
+        atomic_numbers_series: pl.Series | None,
+        descriptor_fn,
+        pooled_name: str,
+        matrix_name: str,
+        reduce: str = "mean",
+    ) -> tuple[pl.Series, pl.Series]:
+        """
+        Compute atom-wise descriptors once per molecule and return both
+        pooled and matrix-shaped outputs.
+        """
+        coordinate_rows = MolecularFeaturizer._series_values(coordinates_series, len(smiles_series))
+        atomic_number_rows = MolecularFeaturizer._series_values(atomic_numbers_series, len(smiles_series))
+
+        pooled_values: list[list[float] | None] = []
+        matrix_values: list[list[list[float]] | None] = []
+
+        for smiles, coordinates, atomic_numbers in zip(
+            smiles_series.to_list(),
+            coordinate_rows,
+            atomic_number_rows,
+        ):
+            try:
+                atoms = MolecularFeaturizer._build_ase_atoms(smiles, coordinates, atomic_numbers)
+                if atoms is None:
+                    pooled_values.append(None)
+                    matrix_values.append(None)
+                    continue
+
+                atomwise_values = descriptor_fn(atoms)
+                pooled_values.append(
+                    MolecularFeaturizer._format_descriptor_output(
+                        atomwise_values,
+                        output_mode="pooled",
+                        reduce=reduce,
+                    )
+                )
+                matrix_values.append(
+                    MolecularFeaturizer._format_descriptor_output(
+                        atomwise_values,
+                        output_mode="matrix",
+                        reduce=reduce,
+                    )
+                )
+            except Exception:
+                pooled_values.append(None)
+                matrix_values.append(None)
+
+        return pl.Series(pooled_name, pooled_values), pl.Series(matrix_name, matrix_values)
 
     @staticmethod
     def compute_morgan_fingerprints(smiles_series: pl.Series, radius: int = 3, fp_size: int = 2048) -> pl.Series:
@@ -293,6 +347,93 @@ class MolecularFeaturizer:
         )
 
     @staticmethod
+    def compute_soap_outputs(
+        smiles_series: pl.Series,
+        coordinates_series: pl.Series | None = None,
+        atomic_numbers_series: pl.Series | None = None,
+        r_cut=6.0,
+        n_max=8,
+        l_max=6,
+        sigma=0.5,
+    ) -> tuple[pl.Series, pl.Series]:
+        """
+        Computes both pooled SOAP embeddings and atom-level SOAP matrices.
+        The pooled output preserves the existing `average="inner"` behavior.
+        """
+        species = MolecularFeaturizer._collect_species(
+            smiles_series,
+            atomic_numbers_series=atomic_numbers_series,
+        )
+        if not species:
+            n_rows = len(smiles_series)
+            return (
+                pl.Series("soap_embedding", [None] * n_rows),
+                pl.Series("soap_matrix", [None] * n_rows),
+            )
+
+        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max})...")
+        pooled_engine = SOAP(
+            species=species,
+            periodic=False,
+            r_cut=r_cut,
+            n_max=n_max,
+            l_max=l_max,
+            sigma=sigma,
+            average="inner",
+            compression={"mode": "mu2"},
+        )
+        matrix_engine = SOAP(
+            species=species,
+            periodic=False,
+            r_cut=r_cut,
+            n_max=n_max,
+            l_max=l_max,
+            sigma=sigma,
+            average="off",
+            compression={"mode": "mu2"},
+        )
+
+        coordinate_rows = MolecularFeaturizer._series_values(coordinates_series, len(smiles_series))
+        atomic_number_rows = MolecularFeaturizer._series_values(atomic_numbers_series, len(smiles_series))
+        pooled_values: list[list[float] | None] = []
+        matrix_values: list[list[list[float]] | None] = []
+
+        for smiles, coordinates, atomic_numbers in zip(
+            smiles_series.to_list(),
+            coordinate_rows,
+            atomic_number_rows,
+        ):
+            try:
+                atoms = MolecularFeaturizer._build_ase_atoms(smiles, coordinates, atomic_numbers)
+                if atoms is None:
+                    pooled_values.append(None)
+                    matrix_values.append(None)
+                    continue
+
+                pooled_values.append(
+                    MolecularFeaturizer._format_descriptor_output(
+                        pooled_engine.create(atoms),
+                        output_mode="pooled",
+                        reduce="mean",
+                    )
+                )
+                matrix_values.append(
+                    MolecularFeaturizer._format_descriptor_output(
+                        matrix_engine.create(atoms),
+                        output_mode="matrix",
+                        reduce="mean",
+                    )
+                )
+            except Exception:
+                pooled_values.append(None)
+                matrix_values.append(None)
+
+        return (
+            pl.Series("soap_embedding", pooled_values),
+            pl.Series("soap_matrix", matrix_values),
+        )
+
+    @staticmethod
     def compute_acsf(
         smiles_series: pl.Series,
         coordinates_series: pl.Series | None = None,
@@ -347,6 +488,46 @@ class MolecularFeaturizer:
                     atomic_number_rows,
                 )
             ],
+        )
+
+    @staticmethod
+    def compute_acsf_outputs(
+        smiles_series: pl.Series,
+        coordinates_series: pl.Series | None = None,
+        atomic_numbers_series: pl.Series | None = None,
+        r_cut=6.0,
+    ) -> tuple[pl.Series, pl.Series]:
+        """
+        Computes both pooled ACSF embeddings and atom-level ACSF matrices.
+        """
+        species = MolecularFeaturizer._collect_species(
+            smiles_series,
+            atomic_numbers_series=atomic_numbers_series,
+        )
+        if not species:
+            n_rows = len(smiles_series)
+            return (
+                pl.Series("acsf_embedding", [None] * n_rows),
+                pl.Series("acsf_matrix", [None] * n_rows),
+            )
+
+        logger.info(f"Computing ACSF (rcut={r_cut})...")
+        acsf_engine = ACSF(
+            species=species,
+            periodic=False,
+            r_cut=r_cut,
+            g2_params=[[1, 1], [1, 2], [1, 3]],
+            g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
+        )
+
+        return MolecularFeaturizer._compute_atomwise_descriptor_pair(
+            smiles_series,
+            coordinates_series,
+            atomic_numbers_series,
+            descriptor_fn=acsf_engine.create,
+            pooled_name="acsf_embedding",
+            matrix_name="acsf_matrix",
+            reduce="mean",
         )
     
     @staticmethod
@@ -458,6 +639,38 @@ class MolecularFeaturizer:
                     embeddings.append(None)
 
         return pl.Series("mace_embedding", embeddings)
+
+    @staticmethod
+    def compute_mace_outputs(
+        smiles_series: pl.Series,
+        coordinates_series: pl.Series | None = None,
+        atomic_numbers_series: pl.Series | None = None,
+        model: str = "medium",
+        batch_size: int = 32,
+    ) -> tuple[pl.Series, pl.Series]:
+        """
+        Computes both pooled and atom-level MACE descriptors.
+        """
+        logger.info(f"Computing MACE embeddings (model={model}, batch_size={batch_size})...")
+        from mace.calculators import mace_off
+
+        mace_calc = mace_off(model=model, device="cpu", default_dtype="float32")
+
+        def _descriptor_fn(atoms):
+            desc = mace_calc.get_descriptors(atoms)
+            if isinstance(desc, (list, tuple)):
+                return np.asarray(desc[0])
+            return np.asarray(desc)
+
+        return MolecularFeaturizer._compute_atomwise_descriptor_pair(
+            smiles_series,
+            coordinates_series,
+            atomic_numbers_series,
+            descriptor_fn=_descriptor_fn,
+            pooled_name="mace_embedding",
+            matrix_name="mace_matrix",
+            reduce="mean",
+        )
 
 
     @staticmethod
