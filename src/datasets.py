@@ -108,7 +108,7 @@ class QM9Dataset:
         self,
         root: str = "data/QM9",
         filename: str = "dataset_cleaned.parquet",
-        limit: int = 2000,
+        limit: int = None,
         required_mol_ids: Optional[List[str]] = None,
         embed_seed: int = 40,
         sampling_strategy: str = "stratified",
@@ -246,8 +246,13 @@ class QM9Dataset:
             self.df = self.df.with_columns(compute_series(self.df).alias(column_name))
             return True
 
-        indexed_df = self.df.with_row_count("_row_idx")
-        missing_mask = pl.col(column_name).is_null() | (pl.col(column_name).list.len() == 0)
+        indexed_df = self.df.with_row_index("_row_idx")
+        
+        if self.df.schema[column_name] == pl.List:
+            missing_mask = pl.col(column_name).is_null() | (pl.col(column_name).list.len() == 0)
+        else:
+            missing_mask = pl.col(column_name).is_null()
+
         missing_rows = indexed_df.filter(missing_mask)
         if missing_rows.is_empty():
             return False
@@ -504,13 +509,16 @@ class QM9Dataset:
         *,
         is_injected: int,
         outlier_category: Optional[str] = None,
-        extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not smiles:
             return None
 
+        raw_mol = Chem.MolFromSmiles(smiles)
+        if raw_mol is None:
+            return None
+        canonical_smiles = Chem.MolToSmiles(raw_mol, canonical=True)
         mol = self._embed_molecule(
-            smiles=smiles,
+            smiles=canonical_smiles,
             seed=self.embed_seed,
             invariant=True,
         )
@@ -550,15 +558,7 @@ class QM9Dataset:
         else:
             struct_class = "Aliphatic Ring"
 
-        canonical = Chem.MolToSmiles(mol, canonical=True)
-        canonical_mol = self._embed_molecule(
-            smiles=canonical,
-            seed=self.embed_seed,
-            invariant=True,
-        )
-        if canonical_mol is None:
-            return None
-        selfies_str = sf.encoder(canonical)
+        selfies_str = sf.encoder(canonical_smiles)
         functional_groups = self._detect_functional_groups(mol)
         functional_groups_str = ",".join(functional_groups)
 
@@ -615,7 +615,7 @@ class QM9Dataset:
             "mol_id": mol_id,
             "formula": formula,
             "smiles": smiles,
-            "canonical_smiles": canonical,
+            "canonical_smiles": canonical_smiles,
             "scaffold_smiles": scaffold_smiles,
             "generic_scaffold": generic_scaffold,
             "root_scaffold": root_scaffold,
@@ -677,6 +677,7 @@ class QM9Dataset:
 
     def _build_qm9_row(self, i: int, data) -> Optional[Dict[str, Any]]:
         smiles = getattr(data, "smiles", None)
+        
         mol_dict = self._build_smiles_row(
             smiles=smiles,
             mol_id=f"qm9_{i}",
@@ -1165,18 +1166,27 @@ class QM9Dataset:
                 order = Chem.CanonicalRankAtoms(mol)
                 mol = Chem.RenumberAtoms(mol, list(order))
 
-            # Embed the molecule in 3D space using ETKDG
+            # Primary Attempt: Embed the molecule in 3D space using ETKDG
             params = AllChem.ETKDG()
             params.randomSeed = seed
+            
             if AllChem.EmbedMolecule(mol, params) == -1:
-                return None
+                # Fallback 1: Use random coordinates to jumpstart the algorithm
+                params.useRandomCoords = True
+                if AllChem.EmbedMolecule(mol, params) == -1:
+                    # Fallback 2: Disable chemical rules (crucial for highly strained QM9 rings)
+                    params.useBasicKnowledge = False
+                    params.useExpTorsionAnglePrefs = False
+                    if AllChem.EmbedMolecule(mol, params) == -1:
+                        # If it STILL fails, it's truly un-embeddable
+                        logger.warning(f"Failed to embed molecule {smiles}")
+                        return None
 
             return mol
             
         except Exception as e:
             logger.debug(f"Molecule embedding failed for SMILES '{smiles}': {e}")
             return None
-
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
         self._upsert_descriptor_column(
             "morgan_fingerprint",
@@ -1288,15 +1298,11 @@ class QM9Dataset:
 
     def add_chemprop(
         self,
-        model_path: str | None = None,
-        batch_size: int = 64
     ) -> None:
         self._upsert_descriptor_column(
             "chemprop_embedding",
             lambda frame: MolecularFeaturizer.compute_chemprop_embeddings(
                 frame["canonical_smiles"],
-                model_path=model_path,
-                batch_size=batch_size
             ),
         )
 
@@ -1796,13 +1802,17 @@ class MaterialsProject:
             return None
 
     def _required_descriptor_columns(self) -> List[str]:
-        """Returns a list of descriptor columns that should be present and valid."""
-        cols = []
-        if getattr(self, "add_soap", False): cols.append("soap_embedding")
-        if getattr(self, "add_acsf", False): cols.append("acsf_embedding")
-        if getattr(self, "add_coulomb", False): cols.append("coulomb_matrix")
-        if getattr(self, "add_mace", False): cols.append("mace_embedding")
-        return cols
+            """Returns a list of descriptor columns that should be present and valid."""
+            cols = []
+            if getattr(self, "add_soap", False):
+                cols.extend(["soap_embedding", "soap_matrix"])
+            if getattr(self, "add_acsf", False): 
+                cols.extend(["acsf_embedding", "acsf_matrix"])
+            if getattr(self, "add_coulomb", False): 
+                cols.append("coulomb_matrix")
+            if getattr(self, "add_mace", False): 
+                cols.extend(["mace_embedding", "mace_matrix"])
+            return cols
 
     def _drop_rows_with_null_required_descriptors(self) -> None:
         """Filters out rows where any of the requested 3D descriptors failed (are null or empty)."""
@@ -2360,12 +2370,17 @@ class MaterialsProject:
             logger.info(f"Found {len(unique_elements)} unique elements.")
 
         # 3. Initialize Engines
-        soap_engine, acsf_engine, coulomb_engine, mace_engine = None, None, None, None
+        soap_engine, soap_matrix_engine, acsf_engine, coulomb_engine, mace_engine = None, None, None, None, None
         
         if self.add_soap:
             soap_engine = SOAP(
                 species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, 
                 l_max=l_max, sigma=sigma, sparse=False, average="inner",
+                compression={"mode": "mu2"}
+            )
+            soap_matrix_engine = SOAP(
+                species=unique_elements, periodic=True, r_cut=r_cut, n_max=n_max, 
+                l_max=l_max, sigma=sigma, sparse=False, average="off",
                 compression={"mode": "mu2"}
             )
         
@@ -2390,9 +2405,15 @@ class MaterialsProject:
         # 4. Process in Chunks
         total_rows = len(self.df)
         soap_all: List[Optional[List[float]]] = []
+        soap_matrix_all: List[Optional[List[List[float]]]] = []
+        
         acsf_all: List[Optional[List[float]]] = []
+        acsf_matrix_all: List[Optional[List[List[float]]]] = []
+        
         coulomb_all: List[Optional[List[float]]] = []
+        
         mace_all: List[Optional[List[float]]] = []
+        mace_matrix_all: List[Optional[List[List[float]]]] = []
         
         for chunk_idx, start_row in enumerate(range(0, total_rows, chunk_size)):
             end_row = min(start_row + chunk_size, total_rows)
@@ -2402,40 +2423,28 @@ class MaterialsProject:
             # --- PROCESS SOAP ---
             if self.add_soap:
                 logger.info(f"Computing SOAP chunk {chunk_idx} ({start_row} to {end_row})...")
-                soap_features = self._compute_feature(struct_strings, soap_engine)
-                soap_all.extend(soap_features)
+                soap_all.extend(self._compute_feature(struct_strings, soap_engine, output_mode="pooled"))
+                soap_matrix_all.extend(self._compute_feature(struct_strings, soap_matrix_engine, output_mode="matrix"))
 
             # --- PROCESS ACSF ---
             if self.add_acsf:
                 logger.info(f"Computing ACSF chunk {chunk_idx} ({start_row} to {end_row})...")
-                raw_acsf_features = self._compute_feature(struct_strings, acsf_engine)
-
-                normalized_acsf = []
-                for v in raw_acsf_features:
-                    if v is None:
-                        normalized_acsf.append(None)
-                    else:
-                        arr = np.asarray(v)
-                        if arr.ndim == 2:
-                            normalized_acsf.append(np.mean(arr, axis=0).tolist())
-                        else:
-                            normalized_acsf.append(arr.ravel().tolist())
-                acsf_all.extend(normalized_acsf)
+                acsf_all.extend(self._compute_feature(struct_strings, acsf_engine, output_mode="pooled"))
+                acsf_matrix_all.extend(self._compute_feature(struct_strings, acsf_engine, output_mode="matrix"))
 
             # --- PROCESS COULOMB ---
             if getattr(self, "add_coulomb", False):
                 logger.info(f"Computing Coulomb Matrix chunk {chunk_idx} ({start_row} to {end_row})...")
-                coulomb_features = self._compute_feature(struct_strings, coulomb_engine)
-                coulomb_all.extend(coulomb_features)
+                coulomb_all.extend(self._compute_feature(struct_strings, coulomb_engine, output_mode="pooled"))
 
             # --- PROCESS MACE ---
             if getattr(self, "add_mace", False):
                 logger.info(f"Computing MACE chunk {chunk_idx} ({start_row} to {end_row})...")
-                mace_features = self._compute_mace_features(struct_strings, mace_engine)
-                mace_all.extend(mace_features)
+                mace_all.extend(self._compute_mace_features(struct_strings, mace_engine, output_mode="pooled"))
+                mace_matrix_all.extend(self._compute_mace_features(struct_strings, mace_engine, output_mode="matrix"))
 
         # 5. Attach features to DataFrame
-        def _attach_or_fill_column(column_name: str, values: List[Optional[List[float]]]) -> None:
+        def _attach_or_fill_column(column_name: str, values: List[Any]) -> None:
             update_df = pl.DataFrame({
                 "_row_idx": np.arange(len(values), dtype=np.int64),
                 column_name: pa.array(values),
@@ -2461,15 +2470,18 @@ class MaterialsProject:
         if attach_to_df:
             if self.add_soap:
                 _attach_or_fill_column("soap_embedding", soap_all)
+                _attach_or_fill_column("soap_matrix", soap_matrix_all)
                 
             if self.add_acsf:
                 _attach_or_fill_column("acsf_embedding", acsf_all)
+                _attach_or_fill_column("acsf_matrix", acsf_matrix_all)
                 
             if getattr(self, "add_coulomb", False):
                 _attach_or_fill_column("coulomb_matrix", coulomb_all)
                 
             if getattr(self, "add_mace", False):
                 _attach_or_fill_column("mace_embedding", mace_all)
+                _attach_or_fill_column("mace_matrix", mace_matrix_all)
 
         logger.success("All requested descriptors successfully added to dataframe.")
 
@@ -2599,213 +2611,3 @@ class MaterialsProject:
                 arr = arr.reshape(arr.shape[0], -1)
             matrices.append(arr)
         return matrices
-
-    def get_descriptor_matrices(
-        self,
-        descriptor: str,
-        r_cut: float = 6.0,
-        n_max: int = 8,
-        l_max: int = 6,
-        sigma: float = 0.5,
-        batch_size: int = 32,
-    ) -> List[np.ndarray]:
-        """
-        Returns per-structure descriptor matrices with shape (n_sites, d) when supported.
-        This does not mutate pooled dataframe descriptor columns.
-        """
-        if self.df.is_empty():
-            raise ValueError("Dataset is empty. Call `load()` before requesting descriptor matrices.")
-
-        key = descriptor.strip().lower()
-        desc = self.DESCRIPTOR_ALIASES.get(key)
-        if desc is None:
-            raise ValueError(f"Unknown descriptor '{descriptor}'.")
-
-        if desc not in {"soap", "acsf", "mace"}:
-            raise ValueError(
-                f"Descriptor '{descriptor}' does not have a matrix-form API. "
-                "Supported matrix descriptors: soap, acsf, mace."
-            )
-
-        struct_strings = self.df["raw_structure"].to_list()
-
-        if desc in {"soap", "acsf"}:
-            logger.info("Extracting unique elements from formulas for matrix-form descriptors...")
-            formulas = self.df["formula_pretty"].to_list()
-            unique_elements_set = set()
-            for formula in formulas:
-                comp = Composition(formula)
-                unique_elements_set.update([el.symbol for el in comp.elements])
-
-            unique_elements = sorted(list(unique_elements_set))
-            weighting = {el: element(el).atomic_number for el in unique_elements}
-
-        if desc == "soap":
-            engine = SOAP(
-                species=unique_elements,
-                periodic=True,
-                r_cut=r_cut,
-                n_max=n_max,
-                l_max=l_max,
-                sigma=sigma,
-                sparse=False,
-                average="off",
-                compression={"mode": "mu2", "species_weighting": weighting},
-            )
-            values = self._compute_feature(
-                struct_strings,
-                engine,
-                batch_size=batch_size,
-                output_mode="matrix",
-            )
-        elif desc == "acsf":
-            engine = ACSF(
-                species=unique_elements,
-                periodic=True,
-                r_cut=r_cut,
-                g2_params=[[1, 1], [1, 2], [1, 3]],
-                g4_params=[[1, 1, 1], [1, 2, 1], [1, 1, -1]],
-            )
-            values = self._compute_feature(
-                struct_strings,
-                engine,
-                batch_size=batch_size,
-                output_mode="matrix",
-            )
-        else:
-            from mace.calculators import mace_mp
-            logger.info("Loading MACE-MP model for matrix-form descriptors...")
-            mace_engine = mace_mp(model="medium", device="cpu", default_dtype="float32")
-            values = self._compute_mace_features(
-                struct_strings,
-                mace_engine,
-                batch_size=batch_size,
-                output_mode="matrix",
-            )
-
-        return self._values_to_feature_matrices(values)
-    
-    def get_distance_matrix(self, descriptor: str = "soap", dist_type: str = "euclidean", pca_components=None, force_calculate=False) -> np.ndarray:
-        """
-        Computes a distance matrix for a chosen descriptor in the Materials dataset.
-
-        Descriptors:
-            - soap
-            - acsf
-            - coulomb_matrix (alias: coulomb)
-            - mace
-
-        Distance types:
-            - euclidean
-            - cosine
-            - soap_kernel (1 - normalized SOAP dot product)
-            - jaccard (Not recommended for continuous embeddings)
-
-        Args:
-            pca_components: If provided, applies PCA to reduce the descriptor
-                to the requested number of dimensions before calculating
-                distances.
-        """
-
-        descriptor = descriptor.lower()
-        aliases = {
-            "coulomb": "coulomb_matrix",
-            "mace_embedding": "mace",
-            "soap_embedding": "soap",
-            "acsf_embedding": "acsf",
-        }
-        
-        if dist_type == 'tanimoto':
-            dist_type = 'jaccard'
-            
-        descriptor = aliases.get(descriptor, descriptor)
-
-        def _series_for(desc: str) -> pl.Series:
-            if desc == "soap":
-                if "soap_embedding" not in self.df.columns:
-                    self.add_soap = True
-                    self._add_descriptors(attach_to_df=True)
-                return self.df["soap_embedding"]
-            if desc == "acsf":
-                if "acsf_embedding" not in self.df.columns:
-                    self.add_acsf = True
-                    self._add_descriptors(attach_to_df=True)
-                return self.df["acsf_embedding"]
-            if desc == "coulomb_matrix":
-                if "coulomb_matrix" not in self.df.columns:
-                    self.add_coulomb = True
-                    self._add_descriptors(attach_to_df=True)
-                return self.df["coulomb_matrix"]
-            if desc == "mace":
-                if "mace_embedding" not in self.df.columns:
-                    self.add_mace = True
-                    self._add_descriptors(attach_to_df=True)
-                return self.df["mace_embedding"]
-            
-            raise ValueError(
-                f"Unknown descriptor: {desc}. "
-                "Expected one of: soap, acsf, coulomb_matrix, mace."
-            )
-
-        # Warn users if they use binary distances on continuous solid-state vectors
-        if dist_type in {"jaccard", "hamming"}:
-            logger.warning(
-                f"{dist_type.capitalize()} distance is usually used for binary fingerprints. "
-                f"Descriptor '{descriptor}' contains continuous float values and may yield unexpected results."
-            )
-        if dist_type == "soap_kernel" and descriptor != "soap":
-            logger.warning(
-                "SOAP kernel is designed for SOAP descriptors. "
-                f"Descriptor '{descriptor}' may not be compatible."
-            )
-
-        series = _series_for(descriptor)
-
-        if pca_components is not None:
-            if not isinstance(pca_components, int) or pca_components <= 0:
-                raise ValueError("pca_components must be a positive integer.")
-
-            # Convert Polars Series of lists/arrays to a 2D NumPy array
-            X = np.array(series.to_list())
-            
-            if X.shape[1] > pca_components:
-                logger.info(f"Applying PCA to reduce '{descriptor}' to {pca_components} dimensions.")
-
-                # Fit and transform
-                pca = PCA(n_components=pca_components)
-                X_reduced = pca.fit_transform(X)
-                explained_variance = float(np.sum(pca.explained_variance_ratio_))
-                logger.info(f"PCA kept {explained_variance * 100:.2f}% of the variance for '{descriptor}'.")
-
-                logger.info(f"PCA reduced '{descriptor}' dimensions from {X.shape[1]} to {X_reduced.shape[1]}")
-
-                # Convert back to a Polars Series of lists so distance_engine can process it
-                series = pl.Series(series.name, X_reduced.tolist())
-
-                # Append PCA info to the cache filename so it doesn't overwrite the full-dimension cache
-                filename = f"dist_{descriptor}_{dist_type}_pca{pca_components}.npy"
-            else:
-                logger.warning(
-                    f"Descriptor '{descriptor}' has {X.shape[1]} dimensions, "
-                    f"which is not greater than pca_components={pca_components}. "
-                    "Skipping reduction."
-                )
-                filename = f"dist_{descriptor}_{dist_type}.npy"
-        else:
-            filename = f"dist_{descriptor}_{dist_type}.npy"
-        # ---------------------------------------------------------
-
-        logger.info(f"Calculating distance matrix for {descriptor} using {dist_type} distance.")
-
-        # Instantiate DistanceCalculator dynamically if it wasn't added to __init__
-        distance_engine = getattr(self, "distance_engine", None)
-        if distance_engine is None:
-            distance_engine = DistanceCalculator(cache_dir=self.base_path)
-            self.distance_engine = distance_engine
-
-        return distance_engine.get_matrix(
-            series,
-            metric=dist_type,
-            filename=filename, 
-            force_calculate=force_calculate,
-        )

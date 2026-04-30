@@ -13,6 +13,7 @@ from ase import Atoms
 from dscribe.descriptors import SOAP, ACSF, CoulombMatrix
 
 from utils.file_ops import get_device
+from scripts.qm9.chemprop import CheMeleonFingerprint
 
 class MolecularFeaturizer:
     """
@@ -676,8 +677,6 @@ class MolecularFeaturizer:
     @staticmethod
     def compute_chemprop_embeddings(
         smiles_series: pl.Series,
-        model_path: str | None = None,
-        batch_size: int = 64,
         device: str = get_device()
     ) -> pl.Series:
         """
@@ -685,74 +684,11 @@ class MolecularFeaturizer:
         """
 
         logger.info(f"Computing Chemprop embeddings on {device}...")
+        chemeleon_fingerprint = CheMeleonFingerprint()
+        smiles_list = smiles_series.to_list()
+        descriptor = chemeleon_fingerprint(smiles_list)
+        return pl.Series("chemprop_embedding", descriptor)
 
-        # 1. LOAD OR INITIALIZE MODEL
-        if model_path is not None:
-            logger.info(f"Loading trained model from {model_path}...")
-            predictor = models.load_model(model_path)
-            model = predictor.encoder
-        else:
-            logger.warning("No model_path provided. Using RANDOM (untrained) MPNN weights.")
-            
-            d_h = 4
-            message_passing = nn.BondMessagePassing(d_h=d_h, depth=3)
-            aggregator = nn.MeanAggregation()
-            predictor = nn.RegressionFFN()
-            
-            model = models.MPNN(message_passing, aggregator, predictor)
-
-        model = model.to(device)
-        model.eval()
-
-        valid_indices = []
-        valid_smiles = []
-        
-        for idx, s in enumerate(smiles_series):
-            if s and Chem.MolFromSmiles(s):
-                valid_smiles.append(s)
-                valid_indices.append(idx)
-
-        if not valid_smiles:
-            return pl.Series([None] * len(smiles_series))
-
-        featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
-        
-        datapoints = [data.MoleculeDatapoint.from_smi(s) for s in valid_smiles]
-        
-        dset = data.MoleculeDataset(datapoints, featurizer=featurizer)
-        loader = data.build_dataloader(dset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-        # 4. INFERENCE
-        embeddings = []
-        
-        with torch.no_grad():
-            for batch in loader:
-                batch_graph = batch.bmg
-                batch_graph.to(device)
-
-                features = batch.X_d
-                if features is not None:
-                    features = features.to(device)
-                    
-                atom_descriptors = batch.V_d
-                if atom_descriptors is not None:
-                    atom_descriptors = atom_descriptors.to(device)
-
-                if hasattr(model, "fingerprint"):
-                    batch_vecs = model.fingerprint(batch_graph, V_d=atom_descriptors, X_d=features)
-                else:
-                    H_v = model.message_passing(batch_graph, V_d=atom_descriptors)
-                    batch_vecs = model.aggregator(H_v, batch_graph)
-
-                embeddings.extend(batch_vecs.cpu().numpy().tolist())
-
-        # 5. RECONSTRUCT RESULT
-        final_result = [None] * len(smiles_series)
-        for idx, emb in zip(valid_indices, embeddings):
-            final_result[idx] = emb
-
-        return pl.Series("chemprop_embedding", final_result)
-    
     
 def get_features_xyz(frames):
     """
