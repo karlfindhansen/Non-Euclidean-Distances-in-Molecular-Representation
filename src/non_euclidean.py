@@ -138,6 +138,41 @@ def _descriptor_matrix_column(descriptor: str) -> str:
     return column
 
 
+def _is_dataframe_like(value: Any) -> bool:
+    return isinstance(value, pl.DataFrame) or (
+        value is not None
+        and hasattr(value, "columns")
+        and hasattr(value, "__getitem__")
+    )
+
+
+def _normalize_distance_matrix_inputs(
+    frames: Any,
+    df: Any,
+    descriptor: str,
+) -> tuple[Any, Any, str]:
+    """
+    Allows notebook-friendly calls such as:
+        Grassmann.distance_matrix(df, descriptor="mace")
+        Grassmann.distance_matrix(df, "mace")
+
+    The second form arrives as `df="mace"` because `frames` is the first
+    positional parameter, so normalize it before any cache or feature handling.
+    """
+    if not _is_dataframe_like(frames):
+        return frames, df, descriptor
+
+    if isinstance(df, str):
+        descriptor = df
+    elif df is not None:
+        raise ValueError(
+            "When passing a dataframe as the first argument, the second positional "
+            "argument must be the descriptor string."
+        )
+
+    return None, frames, descriptor
+
+
 def _feature_matrices_from_df(
     df: Any,
     descriptor: str,
@@ -179,37 +214,80 @@ def _feature_matrices_from_df(
     return matrices
 
 
-def _mol_ids_from_df(df: Any) -> List[str]:
+def _id_column_from_df(df: Any) -> str:
     if df is None:
         raise ValueError("A dataframe must be provided.")
 
     if isinstance(df, pl.DataFrame):
-        if "mol_id" not in df.columns:
-            raise ValueError("Dataframe must contain a 'mol_id' column for distance-matrix caching.")
-        return [str(mol_id) for mol_id in df["mol_id"].to_list()]
+        columns = set(df.columns)
+    else:
+        columns = set(getattr(df, "columns", []))
+
+    if "mol_id" in columns:
+        return "mol_id"
+    if "material_id" in columns:
+        return "material_id"
+
+    raise ValueError(
+        "Dataframe must contain either a 'mol_id' or 'material_id' column "
+        "for distance-matrix caching."
+    )
+
+
+def _mol_ids_from_df(df: Any) -> List[str]:
+    id_column = _id_column_from_df(df)
+
+    if isinstance(df, pl.DataFrame):
+        return [str(mol_id) for mol_id in df[id_column].to_list()]
 
     try:
-        values = df["mol_id"].to_list()
+        values = df[id_column].to_list()
     except Exception as e:
-        raise ValueError("Could not extract 'mol_id' from dataframe-like input.") from e
+        raise ValueError(f"Could not extract '{id_column}' from dataframe-like input.") from e
     return [str(mol_id) for mol_id in values]
 
 
 def _mol_ids_from_frames(frames: Sequence[Atoms]) -> List[str]:
     mol_ids: List[str] = []
     for idx, frame in enumerate(frames):
-        mol_id = frame.info.get("mol_id")
+        mol_id = frame.info.get("mol_id", frame.info.get("material_id"))
         if mol_id is None:
             raise ValueError(
-                f"Frame at index {idx} is missing info['mol_id']; this is required for persistent-homology caching."
+                f"Frame at index {idx} is missing info['mol_id'] or info['material_id']; "
+                "this is required for persistent-homology caching."
             )
         mol_ids.append(str(mol_id))
     return mol_ids
 
 
-def _default_non_euclidean_cache_dir() -> str:
+def _maybe_mol_ids_from_frames(frames: Sequence[Atoms] | None) -> Optional[List[str]]:
+    if frames is None:
+        return None
+
+    mol_ids: List[str] = []
+    for frame in frames:
+        mol_id = frame.info.get("mol_id", frame.info.get("material_id"))
+        if mol_id is None:
+            return None
+        mol_ids.append(str(mol_id))
+    return mol_ids
+
+
+def _default_non_euclidean_cache_dir(dataset: str = "QM9") -> str:
     repo_root = os.path.dirname(os.path.dirname(__file__))
-    return os.path.join(repo_root, "data", "QM9", "non_euclidean_cache")
+    return os.path.join(repo_root, "data", dataset, "non_euclidean_cache")
+
+
+def _non_euclidean_cache_dir_for_df(df: Any) -> str:
+    id_column = _id_column_from_df(df)
+    dataset = "Materials Project" if id_column == "material_id" else "QM9"
+    return _default_non_euclidean_cache_dir(dataset)
+
+
+def _non_euclidean_cache_dir_for_frames(frames: Sequence[Atoms]) -> str:
+    has_material_ids = any(frame.info.get("material_id") is not None for frame in frames)
+    dataset = "Materials Project" if has_material_ids else "QM9"
+    return _default_non_euclidean_cache_dir(dataset)
 
 
 def _cache_key_payload(
@@ -232,13 +310,35 @@ def _sanitize_cache_token(value: Any) -> str:
     return token or "value"
 
 
+def _dataset_label_from_ids(mol_ids: Sequence[str]) -> str:
+    ids = [str(mol_id).strip().lower() for mol_id in mol_ids]
+    if any(mol_id.startswith("qm9_") for mol_id in ids):
+        return "QM9"
+    if any(
+        mol_id.startswith(("mp-", "mvc-", "material", "synthetic-"))
+        for mol_id in ids
+    ):
+        return "Materials Project"
+    return "Materials Project"
+
+
+def _log_distance_dataset_from_ids(method_name: str, mol_ids: Sequence[str] | None) -> None:
+    if mol_ids is None:
+        return
+    logger.info(
+        f"Using {_dataset_label_from_ids(mol_ids)} ids for {method_name} "
+        f"distance matrix (n={len(mol_ids)})."
+    )
+
+
 def _cache_file_stem(
     method_name: str,
     mol_ids: Sequence[str],
     params: Dict[str, Any],
 ) -> str:
     descriptor = _sanitize_cache_token(params.get("descriptor", "unknown"))
-    stem_parts = [method_name, f"n{len(mol_ids)}", descriptor]
+    dataset = _sanitize_cache_token(_dataset_label_from_ids(mol_ids))
+    stem_parts = [method_name, dataset, f"n{len(mol_ids)}", descriptor]
 
     if method_name == "wasserstein":
         stem_parts.append(_sanitize_cache_token(params.get("metric", "sqeuclidean")))
@@ -519,9 +619,13 @@ class Wasserstein:
         cache_dir: Optional[str] = None,
         force_recalculate: bool = False,
     ) -> np.ndarray:
+        frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
         mol_ids: Optional[List[str]] = None
+        resolved_cache_dir = cache_dir
+        cache_params: Optional[Dict[str, Any]] = None
         if df is not None:
             mol_ids = _mol_ids_from_df(df)
+            resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_df(df)
             cache_params = {
                 "descriptor": descriptor,
                 "metric": metric,
@@ -530,11 +634,28 @@ class Wasserstein:
                 method_name="wasserstein",
                 mol_ids=mol_ids,
                 params=cache_params,
-                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                cache_dir=resolved_cache_dir,
                 force_recalculate=force_recalculate,
             )
             if cached is not None:
                 return cached
+        elif frames is not None:
+            mol_ids = _maybe_mol_ids_from_frames(frames)
+            if mol_ids is not None:
+                resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
+                cache_params = {
+                    "descriptor": feature_type,
+                    "metric": metric,
+                }
+                cached = _load_cached_distance_matrix(
+                    method_name="wasserstein",
+                    mol_ids=mol_ids,
+                    params=cache_params,
+                    cache_dir=resolved_cache_dir,
+                    force_recalculate=force_recalculate,
+                )
+                if cached is not None:
+                    return cached
         
         # Step 1: Standardized feature extraction aligned with Riemann/Grassmann
         if feature_matrices is not None:
@@ -558,6 +679,7 @@ class Wasserstein:
             raise ValueError("Must provide either 'frames' or 'feature_matrices'.")
 
         n = len(raw_matrices)
+        _log_distance_dataset_from_ids("Wasserstein", mol_ids)
         logger.info(f"Computing Wasserstein distance matrix | Features: {feature_type}")
 
         # Step 2: Pairwise distance calculation
@@ -575,8 +697,8 @@ class Wasserstein:
                 dist_matrix,
                 method_name="wasserstein",
                 mol_ids=mol_ids,
-                params={"descriptor": descriptor, "metric": metric},
-                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                params=cache_params or {"descriptor": descriptor, "metric": metric},
+                cache_dir=resolved_cache_dir or _default_non_euclidean_cache_dir(),
             )
         
         return dist_matrix
@@ -682,6 +804,7 @@ class PersistentHomology:
         features of all molecular frames in the sequence.
         """
         mol_ids = _mol_ids_from_frames(frames)
+        resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
         cache_params = {
             "metric": metric,
             "max_homology_dim": int(max_homology_dim),
@@ -691,12 +814,13 @@ class PersistentHomology:
             method_name="persistent_homology",
             mol_ids=mol_ids,
             params=cache_params,
-            cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+            cache_dir=resolved_cache_dir,
             force_recalculate=force_recalculate,
         )
         if cached is not None:
             return cached
 
+        _log_distance_dataset_from_ids("persistent homology", mol_ids)
         logger.info(
             f"Computing persistent homology distance matrix for {len(frames)} frames "
             f"(metric='{metric}', max_homology_dim={max_homology_dim}, "
@@ -717,7 +841,7 @@ class PersistentHomology:
             method_name="persistent_homology",
             mol_ids=mol_ids,
             params=cache_params,
-            cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+            cache_dir=resolved_cache_dir,
         )
 
         logger.success("Finished persistent homology distance matrix computation.")
@@ -840,9 +964,13 @@ class Grassmann:
         """
         Computes a symmetric pairwise distance matrix for a molecular trajectory.
         """
+        frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
         mol_ids: Optional[List[str]] = None
+        resolved_cache_dir = cache_dir
+        cache_params: Optional[Dict[str, Any]] = None
         if df is not None:
             mol_ids = _mol_ids_from_df(df)
+            resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_df(df)
             cache_params = {
                 "descriptor": descriptor,
                 "k": int(k),
@@ -853,11 +981,30 @@ class Grassmann:
                 method_name="grassmann",
                 mol_ids=mol_ids,
                 params=cache_params,
-                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                cache_dir=resolved_cache_dir,
                 force_recalculate=force_recalculate,
             )
             if cached is not None:
                 return cached
+        elif frames is not None:
+            mol_ids = _maybe_mol_ids_from_frames(frames)
+            if mol_ids is not None:
+                resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
+                cache_params = {
+                    "descriptor": features,
+                    "k": int(k),
+                    "method": str(method),
+                    "normalized": bool(normalized),
+                }
+                cached = _load_cached_distance_matrix(
+                    method_name="grassmann",
+                    mol_ids=mol_ids,
+                    params=cache_params,
+                    cache_dir=resolved_cache_dir,
+                    force_recalculate=force_recalculate,
+                )
+                if cached is not None:
+                    return cached
 
         if feature_matrices is not None:
             num_items = len(feature_matrices)
@@ -883,6 +1030,7 @@ class Grassmann:
         
         # Initialize an empty symmetric matrix
         dist_matrix = np.zeros((num_items, num_items))
+        _log_distance_dataset_from_ids("Grassmann", mol_ids)
         logger.info(f"Computing Grassmann distance matrix for {num_items} items (k={k}, method='{method}', features='{features}', normalized={normalized}).")
         
         # Compute pairwise distances (upper triangle)
@@ -897,13 +1045,13 @@ class Grassmann:
                 dist_matrix,
                 method_name="grassmann",
                 mol_ids=mol_ids,
-                params={
+                params=cache_params or {
                     "descriptor": descriptor,
                     "k": int(k),
                     "method": str(method),
                     "normalized": bool(normalized),
                 },
-                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                cache_dir=resolved_cache_dir or _default_non_euclidean_cache_dir(),
             )
                 
         return dist_matrix
@@ -1007,9 +1155,13 @@ class Riemann:
         cache_dir: Optional[str] = None,
         force_recalculate: bool = False,
     ) -> np.ndarray:
+        frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
         mol_ids: Optional[List[str]] = None
+        resolved_cache_dir = cache_dir
+        cache_params: Optional[Dict[str, Any]] = None
         if df is not None:
             mol_ids = _mol_ids_from_df(df)
+            resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_df(df)
             cache_params = {
                 "descriptor": descriptor,
                 "metric": metric,
@@ -1020,12 +1172,32 @@ class Riemann:
                 method_name="riemann",
                 mol_ids=mol_ids,
                 params=cache_params,
-                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                cache_dir=resolved_cache_dir,
                 force_recalculate=force_recalculate,
             )
             if cached is not None:
                 return cached
+        elif frames is not None:
+            mol_ids = _maybe_mol_ids_from_frames(frames)
+            if mol_ids is not None:
+                resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
+                cache_params = {
+                    "descriptor": feature_type,
+                    "metric": metric,
+                    "regularization": float(regularization),
+                    "n_pca": None if n_pca is None else int(n_pca),
+                }
+                cached = _load_cached_distance_matrix(
+                    method_name="riemann",
+                    mol_ids=mol_ids,
+                    params=cache_params,
+                    cache_dir=resolved_cache_dir,
+                    force_recalculate=force_recalculate,
+                )
+                if cached is not None:
+                    return cached
         
+        _log_distance_dataset_from_ids("Riemann", mol_ids)
         logger.info(f"Computing Riemann distance matrix | Features: {feature_type} | Metric: {metric}")
 
         # Build SPD matrices
@@ -1085,13 +1257,13 @@ class Riemann:
                 dist_matrix,
                 method_name="riemann",
                 mol_ids=mol_ids,
-                params={
+                params=cache_params or {
                     "descriptor": descriptor,
                     "metric": metric,
                     "regularization": float(regularization),
                     "n_pca": None if n_pca is None else int(n_pca),
                 },
-                cache_dir=cache_dir or _default_non_euclidean_cache_dir(),
+                cache_dir=resolved_cache_dir or _default_non_euclidean_cache_dir(),
             )
 
         return dist_matrix

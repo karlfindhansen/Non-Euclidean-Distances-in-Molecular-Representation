@@ -118,10 +118,17 @@ class MolecularFeaturizer:
         return sorted(species_set)
 
     @staticmethod
+    def _l2_normalize_array(arr: np.ndarray, axis: int | None = None) -> np.ndarray:
+        norm = np.linalg.norm(arr, axis=axis, keepdims=axis is not None)
+        norm = np.where(norm == 0, 1.0, norm)
+        return arr / norm
+
+    @staticmethod
     def _format_descriptor_output(
         vec,
         output_mode: str = "pooled",
         reduce: str | None = "mean",
+        normalize: bool = False,
     ) -> list[float] | list[list[float]] | None:
         """
         Convert a descriptor output into either a pooled 1D list or a matrix-shaped
@@ -141,12 +148,20 @@ class MolecularFeaturizer:
             arr = arr.reshape(arr.shape[0], -1)
 
         if mode == "matrix":
+            if normalize:
+                arr = MolecularFeaturizer._l2_normalize_array(np.atleast_2d(arr), axis=1)
             return np.atleast_2d(arr).tolist()
 
         if arr.ndim == 1:
+            if normalize:
+                arr = MolecularFeaturizer._l2_normalize_array(arr)
             return arr.ravel().tolist()
         if reduce == "mean":
-            return np.mean(arr, axis=0).ravel().tolist()
+            arr = np.mean(arr, axis=0)
+        else:
+            arr = arr.ravel()
+        if normalize:
+            arr = MolecularFeaturizer._l2_normalize_array(arr)
         return arr.ravel().tolist()
 
     @staticmethod
@@ -158,6 +173,7 @@ class MolecularFeaturizer:
         pooled_name: str,
         matrix_name: str,
         reduce: str = "mean",
+        normalize: bool = False,
     ) -> tuple[pl.Series, pl.Series]:
         """
         Compute atom-wise descriptors once per molecule and return both
@@ -187,6 +203,7 @@ class MolecularFeaturizer:
                         atomwise_values,
                         output_mode="pooled",
                         reduce=reduce,
+                        normalize=normalize,
                     )
                 )
                 matrix_values.append(
@@ -194,6 +211,7 @@ class MolecularFeaturizer:
                         atomwise_values,
                         output_mode="matrix",
                         reduce=reduce,
+                        normalize=normalize,
                     )
                 )
             except Exception:
@@ -307,7 +325,7 @@ class MolecularFeaturizer:
         if not species:
             return pl.Series("soap_embedding", [None] * len(smiles_series))
 
-        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max})...")
+        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max}, normalize=True)...")
         soap_engine = SOAP(
             species=species, periodic=False,
             r_cut=r_cut,
@@ -331,6 +349,7 @@ class MolecularFeaturizer:
                     soap_values,
                     output_mode=mode,
                     reduce="mean",
+                    normalize=True,
                 )
             except Exception:
                 return None
@@ -372,7 +391,7 @@ class MolecularFeaturizer:
                 pl.Series("soap_matrix", [None] * n_rows),
             )
 
-        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max})...")
+        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max}, normalize=True)...")
         pooled_engine = SOAP(
             species=species,
             periodic=False,
@@ -416,6 +435,7 @@ class MolecularFeaturizer:
                         pooled_engine.create(atoms),
                         output_mode="pooled",
                         reduce="mean",
+                        normalize=True,
                     )
                 )
                 matrix_values.append(
@@ -423,6 +443,7 @@ class MolecularFeaturizer:
                         matrix_engine.create(atoms),
                         output_mode="matrix",
                         reduce="mean",
+                        normalize=True,
                     )
                 )
             except Exception:
@@ -454,7 +475,7 @@ class MolecularFeaturizer:
         if not species:
             return pl.Series("acsf_embedding", [None] * len(smiles_series))
         
-        logger.info(f"Computing ACSF (rcut={r_cut})...")
+        logger.info(f"Computing ACSF (rcut={r_cut}, normalize=True)...")
         
         acsf_engine = ACSF(
             species=species, periodic=False, r_cut=r_cut,
@@ -475,6 +496,7 @@ class MolecularFeaturizer:
                     atomic_acsf,
                     output_mode=mode,
                     reduce="mean",
+                    normalize=True,
                 )
             except Exception:
                 return None
@@ -512,7 +534,7 @@ class MolecularFeaturizer:
                 pl.Series("acsf_matrix", [None] * n_rows),
             )
 
-        logger.info(f"Computing ACSF (rcut={r_cut})...")
+        logger.info(f"Computing ACSF (rcut={r_cut}, normalize=True)...")
         acsf_engine = ACSF(
             species=species,
             periodic=False,
@@ -529,6 +551,7 @@ class MolecularFeaturizer:
             pooled_name="acsf_embedding",
             matrix_name="acsf_matrix",
             reduce="mean",
+            normalize=True,
         )
     
     @staticmethod
