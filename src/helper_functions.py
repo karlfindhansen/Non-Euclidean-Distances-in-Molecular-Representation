@@ -9,6 +9,7 @@ import polars as pl
 import numpy as np
 import selfies as sf
 
+from typing import Literal
 from pathlib import Path
 from ase.io import write
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -32,6 +33,79 @@ import numpy as np
 import hdbscan
 import random
 
+
+def get_isomers(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Return up to ``n`` QM9 rows from the most frequent molecular formula group.
+
+    In QM9, isomer groups are represented by shared ``formula`` values. The
+    returned dataframe preserves the original row order within the most frequent
+    formula group.
+    """
+    if df is None or df.is_empty():
+        raise ValueError("df must be a non-empty QM9 dataframe.")
+    if "formula" not in df.columns:
+        raise ValueError("df must contain a 'formula' column.")
+
+    formula_counts = (
+        df
+        .group_by("formula")
+        .len()
+        .sort(["len", "formula"], descending=[True, False])
+    )
+    if formula_counts.is_empty():
+        return df.clear()
+
+    top_formula = formula_counts["formula"][0]
+    top_count = int(formula_counts["len"][0])
+    isomer_df = df.filter(pl.col("formula") == top_formula)
+
+    logger.info(
+        "Selected most frequent QM9 isomer group: "
+        f"formula={top_formula}, available={top_count}, returned={isomer_df.height}."
+    )
+    return isomer_df
+
+def get_materials_isomers(
+    df: pl.DataFrame, 
+    group_by: Literal["formula_pretty", "structural_prototype", "anonymized_formula"] = "formula_pretty"
+) -> pl.DataFrame:
+    """
+    Return rows from the most frequent structural/compositional group in a materials dataset.
+    
+    Options:
+    - "formula_pretty": Exact Polymorphs (Same elements, different structure)
+    - "structural_prototype": Exact Isostructures (Different elements, identical crystal architecture)
+    - "anonymized_formula": Stoichiometric Families (e.g., all ABC3 perovskites)
+    """
+    if df is None or df.is_empty():
+        raise ValueError("df must be a non-empty materials dataframe.")
+    if group_by not in df.columns:
+        raise ValueError(f"df must contain the '{group_by}' column.")
+
+    # Count the frequencies of the chosen grouping column
+    group_counts = (
+        df
+        .group_by(group_by)
+        .len()
+        .sort(["len", group_by], descending=[True, False])
+    )
+    
+    if group_counts.is_empty():
+        return df.clear()
+
+    # Get the most frequent group
+    top_group = group_counts[group_by][0]
+    top_count = int(group_counts["len"][0])
+    
+    # Filter the dataframe to only include that group
+    isomer_df = df.filter(pl.col(group_by) == top_group)
+
+    logger.info(
+        f"Selected most frequent materials group based on '{group_by}': "
+        f"value='{top_group}', available={top_count}, returned={isomer_df.height}."
+    )
+    return isomer_df
 
 def evaluate_hdbscan_grid(
     dist_matrix,

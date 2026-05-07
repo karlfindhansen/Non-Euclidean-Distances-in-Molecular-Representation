@@ -345,6 +345,7 @@ def _cache_file_stem(
     elif method_name == "grassmann":
         stem_parts.append(f"k{int(params.get('k', 0))}")
         stem_parts.append(_sanitize_cache_token(params.get("method", "svd")))
+        stem_parts.append(_sanitize_cache_token(params.get("vector_side", "left")))
         stem_parts.append("norm" if bool(params.get("normalized", True)) else "raw")
     elif method_name == "riemann":
         stem_parts.append(_sanitize_cache_token(params.get("metric", "affine-invariant")))
@@ -863,11 +864,16 @@ class Grassmann:
         features : Literal['soap', 'invariant'] = 'invariant',
         descriptor: str = 'soap',
         normalized: bool = True,
+        vector_side: Literal["left", "right"] = "left",
         precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
         Maps 3D atomic coordinates to an orthonormal basis in R^D (feature space).
         """
+        vector_side = vector_side.strip().lower()
+        if vector_side not in {"left", "right"}:
+            raise ValueError("vector_side must be either 'left' or 'right'.")
+
         bases = []
         
         # 1. Obtain raw feature matrices
@@ -899,16 +905,15 @@ class Grassmann:
             X = np.asarray(X)
             
             # Align with Riemann's assumption that X is (N_atoms, D_features).
-            # We extract the k-dimensional subspace spanning the feature dimension (D).
+            # Right vectors span feature space (D); left vectors span atom/site space (N).
             if method.lower() == "qr":
-                # QR decomposition on X.T (D x N) gives Q of shape (D, min(D,N))
-                q, _ = np.linalg.qr(X.T)
+                qr_input = X if vector_side == "left" else X.T
+                q, _ = np.linalg.qr(qr_input)
                 basis = q[:, :k]
             else:
                 # SVD on X (N x D): U is (N, M), S is (M,), Vh is (M, D)
-                # The right singular vectors (rows of Vh) span the feature space
-                _, _, vh = np.linalg.svd(X, full_matrices=False)
-                basis = vh.T[:, :k]
+                u, _, vh = np.linalg.svd(X, full_matrices=False)
+                basis = u[:, :k] if vector_side == "left" else vh.T[:, :k]
                 
             bases.append(basis)
         
@@ -957,14 +962,24 @@ class Grassmann:
         features : Literal['soap', 'invariant'] = 'invariant',
         descriptor: str = 'soap',
         normalized: bool = True,
+        vector_side: Literal["left", "right"] = "left",
         feature_matrices: Optional[Sequence[np.ndarray]] = None,
         cache_dir: Optional[str] = None,
         force_recalculate: bool = False,
     ) -> np.ndarray:
         """
         Computes a symmetric pairwise distance matrix for a molecular trajectory.
+
+        Args:
+            vector_side: ``"left"`` uses the top-k left singular vectors (U);
+                ``"right"`` uses the top-k right singular vectors (V). The default
+                preserves the previous implementation's left-vector behavior.
         """
         frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
+        vector_side = vector_side.strip().lower()
+        if vector_side not in {"left", "right"}:
+            raise ValueError("vector_side must be either 'left' or 'right'.")
+
         mol_ids: Optional[List[str]] = None
         resolved_cache_dir = cache_dir
         cache_params: Optional[Dict[str, Any]] = None
@@ -975,6 +990,7 @@ class Grassmann:
                 "descriptor": descriptor,
                 "k": int(k),
                 "method": str(method),
+                "vector_side": vector_side,
                 "normalized": bool(normalized),
             }
             cached = _load_cached_distance_matrix(
@@ -994,6 +1010,7 @@ class Grassmann:
                     "descriptor": features,
                     "k": int(k),
                     "method": str(method),
+                    "vector_side": vector_side,
                     "normalized": bool(normalized),
                 }
                 cached = _load_cached_distance_matrix(
@@ -1025,13 +1042,14 @@ class Grassmann:
             features=features, 
             descriptor=descriptor,
             normalized=normalized,
+            vector_side=vector_side,
             precomputed_feature_matrices=feature_matrices
         )
         
         # Initialize an empty symmetric matrix
         dist_matrix = np.zeros((num_items, num_items))
         _log_distance_dataset_from_ids("Grassmann", mol_ids)
-        logger.info(f"Computing Grassmann distance matrix for {num_items} items (k={k}, method='{method}', features='{features}', normalized={normalized}).")
+        logger.info(f"Computing Grassmann distance matrix for {num_items} items (k={k}, method='{method}', vector_side='{vector_side}', features='{features}', normalized={normalized}).")
         
         # Compute pairwise distances (upper triangle)
         for i in tqdm(range(num_items), desc="Grassmann distances", unit="pair"):
@@ -1049,6 +1067,7 @@ class Grassmann:
                     "descriptor": descriptor,
                     "k": int(k),
                     "method": str(method),
+                    "vector_side": vector_side,
                     "normalized": bool(normalized),
                 },
                 cache_dir=resolved_cache_dir or _default_non_euclidean_cache_dir(),

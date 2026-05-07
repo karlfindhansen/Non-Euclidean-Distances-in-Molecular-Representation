@@ -890,7 +890,8 @@ class QM9Dataset:
                     np.ceil(self.subset_size * self.sampling_buffer),
                 ),
             )
-        )
+        ) if self.subset_size is not None else full_df.height
+
         attempt = 0
         while True:
             attempt += 1
@@ -1417,8 +1418,7 @@ class QM9Dataset:
             pca_components: If provided, applies PCA to reduce the descriptor
                 to the requested number of dimensions before calculating
                 distances.
-        """
-
+        """            
         descriptor = descriptor.lower()
         aliases = {
             "transformer": "selfies_transformer",
