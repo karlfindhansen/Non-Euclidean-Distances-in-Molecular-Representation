@@ -855,6 +855,43 @@ class Grassmann:
     """
 
     @classmethod
+    def _get_raw_feature_matrices(
+        cls,
+        frames: Optional[Sequence['Atoms']],
+        df: Any = None,
+        features: Literal['soap', 'invariant', 'acsf', 'mace'] = 'invariant',
+        descriptor: str = 'soap',
+        normalized: bool = True,
+        precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None,
+    ) -> List[np.ndarray]:
+        """
+        Returns per-structure feature matrices aligned as (N_atoms, D_features).
+        """
+        if precomputed_feature_matrices is not None:
+            return [np.asarray(matrix, dtype=np.float64) for matrix in precomputed_feature_matrices]
+
+        if df is not None:
+            return _feature_matrices_from_df(df, descriptor)
+
+        if frames is None:
+            raise ValueError("Must provide one of: 'df', 'frames', or 'precomputed_feature_matrices'.")
+
+        if features == 'invariant':
+            raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
+            return [x.T if x.shape[0] == 3 else x for x in raw_matrices]
+
+        if features in {'soap', 'acsf', 'mace'}:
+            if features != 'soap':
+                raise ValueError(
+                    "Frame-based Grassmann features currently support only 'invariant' and 'soap'. "
+                    "Use the dataframe path for 'acsf' or 'mace'."
+                )
+            raw_matrices = _compute_soap_feature_matrices(frames)
+            return [x.T for x in raw_matrices]
+
+        raise ValueError(f"Unknown feature type: {features}")
+
+    @classmethod
     def _get_uk_bases(
         cls,
         frames: Optional[Sequence['Atoms']],
@@ -864,7 +901,7 @@ class Grassmann:
         features : Literal['soap', 'invariant'] = 'invariant',
         descriptor: str = 'soap',
         normalized: bool = True,
-        vector_side: Literal["left", "right"] = "left",
+        vector_side: Literal["left", "right"] = "right",
         precomputed_feature_matrices: Optional[Sequence[np.ndarray]] = None
     ) -> np.ndarray:
         """
@@ -875,31 +912,14 @@ class Grassmann:
             raise ValueError("vector_side must be either 'left' or 'right'.")
 
         bases = []
-        
-        # 1. Obtain raw feature matrices
-        if precomputed_feature_matrices is not None:
-            # We assume these are (N_atoms, D_features)
-            raw_matrices = precomputed_feature_matrices
-        elif df is not None:
-            raw_matrices = _feature_matrices_from_df(df, descriptor)
-            features = descriptor
-        elif frames is not None:
-            if features == 'invariant':
-                raw_matrices = _compute_feature_matrices(frames, normalized=normalized)
-                # Ensure they are (N_atoms, D_features) to remain consistent
-                raw_matrices = [x.T if x.shape[0] == 3 else x for x in raw_matrices]
-            elif features in {'soap', 'acsf', 'mace'}:
-                if features != 'soap':
-                    raise ValueError(
-                        "Frame-based Grassmann features currently support only 'invariant' and 'soap'. "
-                        "Use the dataframe path for 'acsf' or 'mace'."
-                    )
-                raw_matrices = _compute_soap_feature_matrices(frames)
-                raw_matrices = [x.T for x in raw_matrices]
-            else:
-                raise ValueError(f"Unknown feature type: {features}")
-        else:
-            raise ValueError("Must provide one of: 'df', 'frames', or 'precomputed_feature_matrices'.")
+        raw_matrices = cls._get_raw_feature_matrices(
+            frames=frames,
+            df=df,
+            features=descriptor if df is not None else features,
+            descriptor=descriptor,
+            normalized=normalized,
+            precomputed_feature_matrices=precomputed_feature_matrices,
+        )
 
         for X in raw_matrices:
             X = np.asarray(X)
@@ -918,6 +938,198 @@ class Grassmann:
             bases.append(basis)
         
         return bases
+
+    @classmethod
+    def scree_plot(
+        cls,
+        frames: Optional[Sequence['Atoms']] = None,
+        df: Any = None,
+        k: Optional[int] = None,
+        max_k: Optional[int] = None,
+        features: Literal['soap', 'invariant', 'acsf', 'mace'] = 'invariant',
+        descriptor: str = 'soap',
+        normalized: bool = True,
+        feature_matrices: Optional[Sequence[np.ndarray]] = None,
+        cumulative_thresholds: Sequence[float] = (0.8, 0.9, 0.95),
+        show_individual: bool = False,
+        show: bool = True,
+        save_path: Optional[str] = None,
+        title: Optional[str] = None,
+        figsize: tuple[float, float] = (9, 6),
+    ) -> Dict[str, Any]:
+        """
+        Plot a scree curve for choosing the Grassmann subspace dimension ``k``.
+
+        The Grassmann basis is built from the top singular vectors of each
+        per-structure feature matrix. This plot uses the squared singular values
+        as the variance explained by each vector, averages that explained
+        variance across all structures, and overlays the cumulative average.
+
+        Args:
+            k: Number of top vectors to display. If omitted, all available
+                singular vectors are shown.
+            max_k: Alias for ``k`` kept for readability in notebooks.
+            show_individual: If ``True``, draw faint per-structure cumulative
+                curves behind the average cumulative curve.
+
+        Returns:
+            A dictionary containing the Matplotlib figure/axes, mean explained
+            variance ratios, cumulative ratios, and suggested k values for the
+            requested cumulative thresholds.
+        """
+        frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
+        if k is not None and max_k is not None and int(k) != int(max_k):
+            raise ValueError("Use either 'k' or 'max_k', or pass the same value for both.")
+        requested_k = int(k if k is not None else max_k) if (k is not None or max_k is not None) else None
+        if requested_k is not None and requested_k < 1:
+            raise ValueError("k/max_k must be at least 1.")
+
+        raw_matrices = cls._get_raw_feature_matrices(
+            frames=frames,
+            df=df,
+            features=descriptor if df is not None else features,
+            descriptor=descriptor,
+            normalized=normalized,
+            precomputed_feature_matrices=feature_matrices,
+        )
+        if not raw_matrices:
+            raise ValueError("No feature matrices were provided.")
+
+        variance_ratios = []
+        singular_values = []
+        max_components = 0
+        for idx, matrix in enumerate(raw_matrices):
+            X = np.asarray(matrix, dtype=np.float64)
+            if X.ndim == 0:
+                X = X.reshape(1, 1)
+            elif X.ndim == 1:
+                X = X.reshape(1, -1)
+            elif X.ndim > 2:
+                X = X.reshape(X.shape[0], -1)
+
+            if X.size == 0:
+                logger.warning(f"Skipping empty feature matrix at index {idx}.")
+                continue
+
+            _, s, _ = np.linalg.svd(X, full_matrices=False)
+            variances = s ** 2
+            total_variance = float(np.sum(variances))
+            if total_variance <= 0:
+                logger.warning(f"Skipping zero-variance feature matrix at index {idx}.")
+                continue
+
+            ratios = variances / total_variance
+            variance_ratios.append(ratios)
+            singular_values.append(s)
+            max_components = max(max_components, len(ratios))
+
+        if not variance_ratios:
+            raise ValueError("Could not compute variance ratios from the provided feature matrices.")
+
+        plot_k = requested_k or max_components
+        plot_k = min(plot_k, max_components)
+        padded_ratios = np.zeros((len(variance_ratios), plot_k), dtype=np.float64)
+        for idx, ratios in enumerate(variance_ratios):
+            n = min(plot_k, len(ratios))
+            padded_ratios[idx, :n] = ratios[:n]
+
+        mean_variance_ratio = np.mean(padded_ratios, axis=0)
+        cumulative_variance_ratio = np.cumsum(mean_variance_ratio)
+        components = np.arange(1, plot_k + 1)
+
+        threshold_k: Dict[float, Optional[int]] = {}
+        for threshold in cumulative_thresholds:
+            threshold = float(threshold)
+            if threshold <= 0 or threshold > 1:
+                raise ValueError("cumulative_thresholds must contain values in (0, 1].")
+            reached = np.where(cumulative_variance_ratio >= threshold)[0]
+            threshold_k[threshold] = int(reached[0] + 1) if reached.size else None
+
+        import matplotlib.pyplot as plt
+
+        plt.style.use("seaborn-v0_8-whitegrid")
+        fig, ax1 = plt.subplots(figsize=figsize)
+        ax1.bar(
+            components,
+            mean_variance_ratio,
+            width=0.75,
+            color="#4C78A8",
+            alpha=0.85,
+            label="Mean variance per vector",
+        )
+        ax1.set_xlabel("Number of Grassmann vectors (k)")
+        ax1.set_ylabel("Mean explained variance ratio")
+        if plot_k <= 30:
+            ax1.set_xticks(components)
+        else:
+            tick_positions = np.unique(np.linspace(1, plot_k, num=10, dtype=int))
+            ax1.set_xticks(tick_positions)
+        ax1.set_ylim(bottom=0)
+
+        ax2 = ax1.twinx()
+        if show_individual:
+            for ratios in variance_ratios:
+                individual = np.zeros(plot_k, dtype=np.float64)
+                n = min(plot_k, len(ratios))
+                individual[:n] = ratios[:n]
+                ax2.plot(
+                    components,
+                    np.cumsum(individual),
+                    color="#9ecae9",
+                    alpha=0.25,
+                    linewidth=1,
+                )
+
+        ax2.plot(
+            components,
+            cumulative_variance_ratio,
+            color="#F58518",
+            marker="o",
+            linewidth=2,
+            label="Cumulative mean variance",
+        )
+        ax2.set_ylabel("Cumulative explained variance ratio")
+        ax2.set_ylim(0, min(1.05, max(1.0, float(cumulative_variance_ratio[-1]) * 1.05)))
+
+        for threshold, selected_k in threshold_k.items():
+            ax2.axhline(threshold, color="#666666", linestyle="--", linewidth=1, alpha=0.45)
+            if selected_k is not None:
+                ax2.axvline(selected_k, color="#666666", linestyle=":", linewidth=1, alpha=0.45)
+                ax2.text(
+                    selected_k,
+                    threshold,
+                    f" k={selected_k} ({threshold:.0%})",
+                    va="bottom",
+                    ha="left",
+                    fontsize=9,
+                    color="#444444",
+                )
+
+        ax1.set_title(title or f"Grassmann Scree Plot ({len(variance_ratios)} structures)")
+        ax1.spines["top"].set_visible(False)
+        ax2.spines["top"].set_visible(False)
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", frameon=True)
+        fig.tight_layout()
+
+        if save_path is not None:
+            fig.savefig(save_path, dpi=300, bbox_inches="tight")
+            logger.success(f"Saved Grassmann scree plot to {save_path}")
+        if show:
+            plt.show()
+
+        return {
+            "fig": fig,
+            "ax_variance": ax1,
+            "ax_cumulative": ax2,
+            "components": components,
+            "mean_variance_ratio": mean_variance_ratio,
+            "cumulative_variance_ratio": cumulative_variance_ratio,
+            "per_structure_variance_ratio": variance_ratios,
+            "singular_values": singular_values,
+            "threshold_k": threshold_k,
+        }
 
     @staticmethod
     def _distance(U1: np.ndarray, U2: np.ndarray) -> float:

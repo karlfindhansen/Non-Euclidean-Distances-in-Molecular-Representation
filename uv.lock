@@ -211,6 +211,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "umap-learn" },
+    { name = "uqpy" },
 ]
 
 [package.metadata]
@@ -259,6 +260,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.2" },
     { name = "transformers", specifier = ">=5.1.0" },
     { name = "umap-learn", specifier = ">=0.5.11" },
+    { name = "uqpy", specifier = ">=4.1.6" },
 ]
 
 [[package]]
@@ -434,6 +436,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/7d/b2/51899539b6ceeeb420d40ed3cd4b7a40519404f9baf3d4ac99dc413a834b/babel-2.18.0.tar.gz", hash = "sha256:b80b99a14bd085fcacfa15c9165f651fbb3406e66cc603abf11c5750937c992d", size = 9959554, upload-time = "2026-02-01T12:30:56.078Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/77/f5/21d2de20e8b8b0408f0681956ca2c69f1320a3848ac50e6e7f39c6159675/babel-2.18.0-py3-none-any.whl", hash = "sha256:e2b422b277c2b9a9630c1d7903c2a00d0830c409c59ac8cae9081c92f1aeba35", size = 10196845, upload-time = "2026-02-01T12:30:53.445Z" },
+]
+
+[[package]]
+name = "beartype"
+version = "0.18.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/96/15/4e623478a9628ad4cee2391f19aba0b16c1dd6fedcb2a399f0928097b597/beartype-0.18.5.tar.gz", hash = "sha256:264ddc2f1da9ec94ff639141fbe33d22e12a9f75aa863b83b7046ffff1381927", size = 1193506, upload-time = "2024-04-21T07:25:58.64Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/43/7a1259741bd989723272ac7d381a43be932422abcff09a1d9f7ba212cb74/beartype-0.18.5-py3-none-any.whl", hash = "sha256:5301a14f2a9a5540fe47ec6d34d758e9cd8331d36c4760fc7a5499ab86310089", size = 917762, upload-time = "2024-04-21T07:25:55.758Z" },
 ]
 
 [[package]]
@@ -5604,6 +5615,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/fe/0c/cb09f33b26955399c675ab378e4063ed7e48422d3d49f96219ab0be5eba9/uncertainties-3.2.3.tar.gz", hash = "sha256:76a5653e686f617a42922d546a239e9efce72e6b35411b7750a1d12dcba03031", size = 160492, upload-time = "2025-04-21T19:58:28.63Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/5e/f1e1dd319e35e962a4e00b33150a8868b6329cc1d19fd533436ba5488f09/uncertainties-3.2.3-py3-none-any.whl", hash = "sha256:313353900d8f88b283c9bad81e7d2b2d3d4bcc330cbace35403faaed7e78890a", size = 60118, upload-time = "2025-04-21T19:58:26.864Z" },
+]
+
+[[package]]
+name = "uqpy"
+version = "4.1.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "beartype" },
+    { name = "fire" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/54/48fb859bb8575d45c88de35938234841d2cc865a3942d3271a54c19a8d14/UQpy-4.1.6.tar.gz", hash = "sha256:967bd06611700a23449fac4db2d27262ac4c6a296c94cb95f258fc421019bd64", size = 179182, upload-time = "2024-10-10T17:47:59.255Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/f6/ddffbb6c5dd6961cc13b768d90412514d20bac5a5f4c78e118b1cfb501f2/UQpy-4.1.6-py3-none-any.whl", hash = "sha256:bf3d0db3882e366f0df75fa947bcea2469c0ee74d34875e82b26f0eafa4f0f14", size = 296897, upload-time = "2024-10-10T17:47:57.976Z" },
 ]
 
 [[package]]

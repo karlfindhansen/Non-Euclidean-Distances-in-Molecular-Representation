@@ -1,12 +1,16 @@
+from io import StringIO
+
 import os
 import chemiscope
 import json
 import webbrowser
-from io import StringIO
 import kmedoids
 import matplotlib.pyplot as plt
 import polars as pl
 import numpy as np
+import hdbscan
+import random
+import pandas as pd
 import selfies as sf
 
 from typing import Literal
@@ -17,8 +21,11 @@ from tqdm import tqdm
 from pymatgen.core import Structure
 from sklearn.cluster import AgglomerativeClustering, DBSCAN, SpectralClustering
 from sklearn.manifold import TSNE, Isomap, MDS
+from sklearn.preprocessing import StandardScaler
 from geomstats.learning.pca import TangentPCA
 from sklearn.decomposition import PCA, KernelPCA
+from scipy.stats import spearmanr, pearsonr
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 from typing import Sequence, Optional, Iterable
 from loguru import logger
 from rdkit import Chem
@@ -27,12 +34,6 @@ from umap import UMAP
 from ase import Atoms
 
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
-from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
-
-import numpy as np
-import hdbscan
-import random
-
 
 def get_isomers(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -426,8 +427,8 @@ def _project_distance_matrix(
     random_state: int = 42,
 ) -> np.ndarray:
     dist_matrix = np.asarray(dist_matrix)
-    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
-        raise ValueError("dist_matrix must be a square matrix.")
+    #if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+    #    raise ValueError("dist_matrix must be a square matrix.")
 
     method = projection_method.strip().lower()
 
@@ -516,8 +517,8 @@ def plot_distance_matrix_projection(
         Random seed for stochastic projection methods.
     """
     dist_matrix = np.asarray(dist_matrix)
-    if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
-        raise ValueError("dist_matrix must be a square matrix.")
+    #if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+    #    raise ValueError("dist_matrix must be a square matrix.")
 
     n_samples = dist_matrix.shape[0]
     if labels is not None and len(labels) != n_samples:
@@ -1493,6 +1494,228 @@ def benchmark_functional_groups(df, cluster_col="labels_hier", fr_prefix="fr_"):
         })
         
     return results
+
+
+def analyze_distance_geometry(
+    distance_matrix,
+    features_df,
+    molecule_names=None,
+    method="mds",
+    n_components=2,
+    correlation="spearman",
+    top_k=5,
+    standardize_features=True,
+    random_state=42,
+):
+    """
+    Analyze correlations between latent embedding axes and molecular features.
+
+    Parameters
+    ----------
+    distance_matrix : np.ndarray or pd.DataFrame
+        NxN molecular distance matrix.
+
+    features_df : pd.DataFrame
+        Molecular descriptors/features aligned with distance matrix rows.
+
+    molecule_names : list or None
+        Optional molecule names aligned with rows.
+
+    method : str
+        Projection method:
+        ['mds', 'pca', 'tsne', 'umap', 'isomap']
+
+    n_components : int
+        Number of latent dimensions.
+
+    correlation : str
+        ['spearman', 'pearson']
+
+    top_k : int
+        Number of top correlated features per axis.
+
+    standardize_features : bool
+        Whether to z-score feature columns.
+
+    random_state : int
+        Random seed.
+
+    Returns
+    -------
+    results : dict
+        {
+            'embedding': pd.DataFrame,
+            'correlations': dict,
+            'full_correlation_table': pd.DataFrame
+        }
+    """
+
+    # ------------------------------------------------------------
+    # Convert inputs
+    # ------------------------------------------------------------
+
+    D = np.asarray(distance_matrix)
+
+    if D.shape[0] != D.shape[1]:
+        raise ValueError("Distance matrix must be square.")
+
+    if len(features_df) != D.shape[0]:
+        raise ValueError(
+            "features_df rows must match distance matrix size."
+        )
+
+    # ------------------------------------------------------------
+    # Keep only numeric features
+    # ------------------------------------------------------------
+
+    numeric_df = features_df.select_dtypes(include=[np.number]).copy()
+
+    # Remove constant columns
+    numeric_df = numeric_df.loc[
+        :, numeric_df.nunique() > 1
+    ]
+
+    # Handle NaNs
+    numeric_df = numeric_df.fillna(numeric_df.mean())
+
+    # Standardize
+    if standardize_features:
+        scaler = StandardScaler()
+        X_features = pd.DataFrame(
+            scaler.fit_transform(numeric_df),
+            columns=numeric_df.columns,
+            index=numeric_df.index,
+        )
+    else:
+        X_features = numeric_df.copy()
+
+    # ------------------------------------------------------------
+    # Projection
+    # ------------------------------------------------------------
+
+    method = method.lower()
+
+    if method == "mds":
+        projector = MDS(
+            n_components=n_components,
+            dissimilarity="precomputed",
+            random_state=random_state,
+        )
+        embedding = projector.fit_transform(D)
+
+    elif method == "tsne":
+        projector = TSNE(
+            n_components=n_components,
+            metric="precomputed",
+            random_state=random_state,
+        )
+        embedding = projector.fit_transform(D)
+
+    elif method == "umap":
+        projector = UMAP(
+            n_components=n_components,
+            metric="precomputed",
+            random_state=random_state,
+        )
+        embedding = projector.fit_transform(D)
+
+    elif method == "isomap":
+        projector = Isomap(
+            n_components=n_components,
+            metric="precomputed",
+        )
+        embedding = projector.fit_transform(D)
+
+    elif method == "pca":
+        # PCA requires coordinates, not distances
+        raise ValueError(
+            "PCA cannot operate directly on a distance matrix."
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown method: {method}"
+        )
+
+    # ------------------------------------------------------------
+    # Create embedding dataframe
+    # ------------------------------------------------------------
+
+    axis_names = [
+        f"{method.upper()}_{i+1}"
+        for i in range(n_components)
+    ]
+
+    embedding_df = pd.DataFrame(
+        embedding,
+        columns=axis_names,
+    )
+
+    if molecule_names is not None:
+        embedding_df.index = molecule_names
+
+    # ------------------------------------------------------------
+    # Correlation analysis
+    # ------------------------------------------------------------
+
+    all_results = []
+    top_results = {}
+
+    for axis in axis_names:
+
+        axis_values = embedding_df[axis].values
+
+        correlations = []
+
+        for feature in X_features.columns:
+
+            feat_values = X_features[feature].values
+
+            if correlation == "spearman":
+                corr, pval = spearmanr(
+                    axis_values,
+                    feat_values,
+                )
+
+            elif correlation == "pearson":
+                corr, pval = pearsonr(
+                    axis_values,
+                    feat_values,
+                )
+
+            else:
+                raise ValueError(
+                    "correlation must be "
+                    "'spearman' or 'pearson'"
+                )
+
+            correlations.append({
+                "axis": axis,
+                "feature": feature,
+                "correlation": corr,
+                "abs_correlation": abs(corr),
+                "p_value": pval,
+            })
+
+        corr_df = pd.DataFrame(correlations)
+
+        # Sort by absolute correlation
+        corr_df = corr_df.sort_values(
+            "abs_correlation",
+            ascending=False,
+        )
+
+        top_results[axis] = corr_df.head(top_k)
+
+        all_results.append(corr_df)
+
+    full_corr_df = pd.concat(all_results)
+
+    return {
+        "embedding": embedding_df,
+        "correlations": top_results,
+        "full_correlation_table": full_corr_df,
+    }
 
 if __name__ == '__main__':
     from src.datasets import QM9Dataset
