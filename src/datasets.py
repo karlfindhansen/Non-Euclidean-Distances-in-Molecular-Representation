@@ -153,7 +153,7 @@ class QM9Dataset:
         
         # Initialize Sub-Components
         self.geometry_engine = GeometryPerturber(save_path=os.path.join(root, "stress_test.xyz"))
-        self.distance_engine = DistanceCalculator(cache_dir=root)
+        self.distance_engine = DistanceCalculator()
 
         RDLogger.DisableLog("rdApp.error")
 
@@ -1410,7 +1410,7 @@ class QM9Dataset:
         logger.success("Finished adding all requested descriptors.")
     
 
-    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", pca_components=None, force_calculate=False) -> np.ndarray:
+    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", pca_components=None) -> np.ndarray:
         """
         Computes a distance matrix for a chosen descriptor.
         
@@ -1418,7 +1418,7 @@ class QM9Dataset:
             pca_components: If provided, applies PCA to reduce the descriptor
                 to the requested number of dimensions before calculating
                 distances.
-        """            
+        """
         descriptor = descriptor.lower()
         aliases = {
             "transformer": "selfies_transformer",
@@ -1486,23 +1486,17 @@ class QM9Dataset:
                 
                 # Convert back to Polars Series of lists
                 series = pl.Series(series.name, X_reduced.tolist())
-                filename = f"dist_{descriptor}_{dist_type}_pca{pca_components}.npy"
             else:
                 logger.warning(
                     f"Descriptor '{descriptor}' has {X.shape[1]} dimensions, "
                     f"which is not greater than pca_components={pca_components}. "
                     "Skipping reduction."
                 )
-                filename = f"dist_{descriptor}_{dist_type}.npy"
-        else:
-            filename = f"dist_{descriptor}_{dist_type}.npy"
 
         logger.info(f"Calculating distance matrix for {descriptor} using {dist_type} distance.")
         return self.distance_engine.get_matrix(
             series,
             metric=dist_type,
-            filename=filename, 
-            force_calculate=force_calculate,
         )
 
     def run_stress_test(

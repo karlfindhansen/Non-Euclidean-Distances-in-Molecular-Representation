@@ -16,6 +16,7 @@ from ase.neighborlist import neighbor_list
 from loguru import logger
 from scipy.linalg import logm, eigvalsh
 from pymatgen.core import Element
+from pyriemann.utils.distance import pairwise_distance
 from ripser import ripser
 from scipy.linalg import subspace_angles
 from sklearn.decomposition import PCA
@@ -1291,45 +1292,43 @@ class Grassmann:
 class Riemann:
     """
     Handles molecular representation on the Riemannian Manifold.
-    Supports both atomic invariant feature matrices and global descriptors (SOAP).
+    Supports global descriptors by converting them into SPD covariance matrices.
     """
 
     @classmethod
     def _get_spd_matrices(
         cls,
-        frames=None,
-        df: Any = None,
-        feature_matrices=None,
-        feature_type: str = 'invariant',
+        df: Any,
         descriptor: str = 'soap',
         regularization: float = 1e-3,
-        n_pca: int = 30  # Strongly recommend keeping this low!
+        n_pca: Optional[int] = 30
     ) -> np.ndarray:
         
-        # 1. Obtain raw feature matrices
-        if feature_matrices is not None:
-            raw_matrices = feature_matrices
-        elif df is not None:
-            raw_matrices = _feature_matrices_from_df(df, descriptor)
-            feature_type = descriptor
-        elif frames is not None:
-            if feature_type == 'invariant':
-                raw_matrices = [matrix.T for matrix in _compute_feature_matrices(frames, normalized=True)]
-            elif feature_type == 'soap':
-                raw_matrices = [matrix.T for matrix in _compute_soap_feature_matrices(frames)]
-            elif feature_type in {'acsf', 'mace'}:
-                raise ValueError(
-                    "Frame-based Riemann features currently support only 'invariant' and 'soap'. "
-                    "Use the dataframe path for 'acsf' or 'mace'."
-                )
-            else:
-                raise ValueError(f"Unknown feature_type: {feature_type}")
-        else:
-            raise ValueError("Must provide one of: 'df', 'frames', or 'feature_matrices'.")
+        # 1. Obtain raw feature matrices directly from df
+        raw_matrices = _feature_matrices_from_df(df, descriptor)
 
-        # 2. PCA Reduction (Mandatory for large D like SOAP's 2240)
+        # 2. PCA Reduction
+        n_pca = df['num_atoms'].min() - 2
+        raw_matrices = cls.matrix_pca(n_pca, raw_matrices)
+
+        # 3. Build SPD Matrices (Empirical Covariance)
+        spd_matrices = []
+        for X in raw_matrices:
+            X = np.asarray(X)
+            # Compute covariance
+            C = (X.T @ X) / X.shape[0]
+            # Regularization to ensure strict positive-definiteness
+            C += np.eye(C.shape[0]) * regularization
+            spd_matrices.append(C)
+
+        # Pyriemann expects a 3D array of shape (N_matrices, n_channels, n_channels)
+        return np.array(spd_matrices)
+
+    @classmethod
+    def matrix_pca(cls, n_pca, raw_matrices):
         if n_pca is not None:
             logger.info(f"Applying PCA to reduce feature dimension to {n_pca}...")
+            
             # Stack all atoms from all molecules into one giant 2D matrix
             stacked_features = np.vstack(raw_matrices)
             pca = PCA(n_components=n_pca)
@@ -1342,159 +1341,47 @@ class Riemann:
                 n_atoms = X.shape[0]
                 reduced_matrices.append(stacked_reduced[current_idx : current_idx + n_atoms, :])
                 current_idx += n_atoms
+
+            logger.info(f"PCA explained variance ratio: {pca.explained_variance_ratio_.sum():.4f} (cumulative for {n_pca} components)")
                 
             raw_matrices = reduced_matrices
 
-        # 3. Build SPD Matrices (Covariance)
-        spd_matrices = []
-        for X in raw_matrices:
-            X = np.asarray(X)
-            
-            C = (X.T @ X) / X.shape[0]
-            
-            # Regularization to ensure it is strictly Positive Definite
-            C += np.eye(C.shape[0]) * regularization
-            spd_matrices.append(C)
-
-        return spd_matrices
-
-    @staticmethod
-    def _log_spd(C: np.ndarray) -> np.ndarray:
-        eigvals, eigvecs = np.linalg.eigh(C)
-        eigvals = np.clip(eigvals, 1e-9, None)
-        return eigvecs @ np.diag(np.log(eigvals)) @ eigvecs.T
-    
-    @staticmethod
-    def _affine_dist(spd_matrices, i, j):
-        try:
-            evs = eigvalsh(spd_matrices[i], spd_matrices[j])
-            return i, j, np.sqrt(np.sum(np.log(np.clip(evs, 1e-9, None))**2))
-        except:
-            return i, j, np.nan
+        return raw_matrices
 
     @classmethod
     def distance_matrix(
         cls,
-        frames=None,
-        df: Any = None,
-        feature_matrices=None,
-        feature_type: str = 'invariant',
+        df: Any,
         descriptor: str = 'soap',
-        metric: str = "affine-invariant",
+        distance_type: str = "affine-invariant",
         regularization: float = 1e-3,
-        n_pca: int = None,
-        cache_dir: Optional[str] = None,
-        force_recalculate: bool = False,
     ) -> np.ndarray:
-        frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
-        mol_ids: Optional[List[str]] = None
-        resolved_cache_dir = cache_dir
-        cache_params: Optional[Dict[str, Any]] = None
-        if df is not None:
-            mol_ids = _mol_ids_from_df(df)
-            resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_df(df)
-            cache_params = {
-                "descriptor": descriptor,
-                "metric": metric,
-                "regularization": float(regularization),
-                "n_pca": None if n_pca is None else int(n_pca),
-            }
-            cached = _load_cached_distance_matrix(
-                method_name="riemann",
-                mol_ids=mol_ids,
-                params=cache_params,
-                cache_dir=resolved_cache_dir,
-                force_recalculate=force_recalculate,
-            )
-            if cached is not None:
-                return cached
-        elif frames is not None:
-            mol_ids = _maybe_mol_ids_from_frames(frames)
-            if mol_ids is not None:
-                resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
-                cache_params = {
-                    "descriptor": feature_type,
-                    "metric": metric,
-                    "regularization": float(regularization),
-                    "n_pca": None if n_pca is None else int(n_pca),
-                }
-                cached = _load_cached_distance_matrix(
-                    method_name="riemann",
-                    mol_ids=mol_ids,
-                    params=cache_params,
-                    cache_dir=resolved_cache_dir,
-                    force_recalculate=force_recalculate,
-                )
-                if cached is not None:
-                    return cached
         
-        _log_distance_dataset_from_ids("Riemann", mol_ids)
-        logger.info(f"Computing Riemann distance matrix | Features: {feature_type} | Metric: {metric}")
+        metric_map = {
+            "affine-invariant": "riemann",
+            "log-euclidean": "logeuclid",
+            "euclidean": "euclid"
+        }
+        pyriemann_metric = metric_map.get(distance_type.lower())
+        if not pyriemann_metric:
+            raise ValueError(f"Unknown distance_type: '{distance_type}'. Must be one of {list(metric_map.keys())}.")
 
-        # Build SPD matrices
+        logger.info(f"Computing Riemann distance matrix | Features: {descriptor} | Distance: {distance_type}")
+
+        # 1. Build SPD matrices
         spd_matrices = cls._get_spd_matrices(
-            frames=frames, 
             df=df,
-            feature_matrices=feature_matrices,
-            feature_type=feature_type,
             descriptor=descriptor,
             regularization=regularization,
-            n_pca=n_pca
         )
         
-        n = len(spd_matrices)
-        dist_matrix = np.zeros((n, n))
+        # 2. Compute Distances
+        # This replaces the manual loops, generalized eigenvalue calculations, and joblib parallelization.
+        logger.info(f"Computing {distance_type} distances...")
+        dist_matrix = pairwise_distance(spd_matrices, metric=pyriemann_metric)
 
-        if metric.lower() == "log-euclidean":
-            # Log-Euclidean: Compute logs once (O(n * d^3))
-            log_mats = np.array([cls._log_spd(C) for C in tqdm(spd_matrices, desc="Matrix Logs")])
-            
-            # Vectorized: reshape to (n, d*d) and use broadcasting or cdist
-            flat = log_mats.reshape(n, -1)
-            from scipy.spatial.distance import cdist
-            dist_matrix = cdist(flat, flat, metric='euclidean')
-
-        else:
-            # Affine-Invariant: Solve generalized eigenvalue for every pair (O(n^2 * d^3))
-            logger.info("Computing Affine-Invariant distances in parallel...")
-    
-            def calc_pair(i, j, C_i, C_j):
-                try:
-                    evs = eigvalsh(C_i, C_j)
-                    d = np.sqrt(np.sum(np.log(np.clip(evs, 1e-9, None))**2))
-                    return i, j, d
-                except:
-                    return i, j, np.nan
-
-            # Generate all combinations
-            from itertools import combinations
-            pairs = list(combinations(range(n), 2))
-            
-            # Run in parallel using all available cores (n_jobs=-1)
-            results = Parallel(n_jobs=-1, batch_size='auto')(
-                delayed(calc_pair)(i, j, spd_matrices[i], spd_matrices[j]) for i, j in tqdm(pairs, desc="Distances")
-            )
-            
-            # Reconstruct the matrix
-            for i, j, d in results:
-                dist_matrix[i, j] = dist_matrix[j, i] = d
-                
-            # Fill failed calculations with max distance
-            if np.isnan(dist_matrix).any():
-                dist_matrix = np.nan_to_num(dist_matrix, nan=np.nanmax(dist_matrix))
-
-        if mol_ids is not None:
-            _save_cached_distance_matrix(
-                dist_matrix,
-                method_name="riemann",
-                mol_ids=mol_ids,
-                params=cache_params or {
-                    "descriptor": descriptor,
-                    "metric": metric,
-                    "regularization": float(regularization),
-                    "n_pca": None if n_pca is None else int(n_pca),
-                },
-                cache_dir=resolved_cache_dir or _default_non_euclidean_cache_dir(),
-            )
+        # Fallback for severe numerical instability
+        if np.isnan(dist_matrix).any():
+            logger.warning("NaNs detected in distance matrix. Filling with maximum matrix distance.")
 
         return dist_matrix
