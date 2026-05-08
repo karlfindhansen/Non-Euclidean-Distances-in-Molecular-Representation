@@ -1,47 +1,41 @@
 import json
-from mendeleev import element
 import os
-import polars as pl
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
+
 import numpy as np
 import pyarrow as pa
+import polars as pl
 import selfies as sf
-
-from ase.io import write
-from typing import Optional, List, Dict, Any, Set, Sequence, Union
-from torch_geometric.datasets import QM9
-from ase import Atoms
+from dscribe.descriptors import ACSF, SOAP, EwaldSumMatrix
+from loguru import logger
+from mendeleev import element
+from mp_api.client import MPRester
+from pymatgen.core import Composition, Structure
+from pymatgen.io.ase import AseAtomsAdaptor
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from rdkit import Chem
 from rdkit import RDLogger
-from rdkit.Chem import AllChem,  Descriptors, rdMolDescriptors, Fragments
-from rdkit.Chem.Scaffolds import MurckoScaffold
-from rdkit.Chem import BRICS
+from rdkit.Chem import AllChem, BRICS, Descriptors, Fragments, rdMolDescriptors
 from rdkit.Chem.Scaffolds import rdScaffoldNetwork
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
-from mp_api.client import MPRester
-from loguru import logger
-from tqdm import tqdm 
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from pymatgen.core import Structure
-from dscribe.descriptors import SOAP, ACSF, EwaldSumMatrix
-from pymatgen.io.ase import AseAtomsAdaptor
-from pymatgen.core import Composition
-from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+from torch_geometric.datasets import QM9
+from tqdm import tqdm
 from transformers import logging as tf_log
 
 from utils.file_ops import ensure_directory, validate_columns
 from src.features import MolecularFeaturizer
-from src.geometry import GeometryPerturber
 from src.distance import DistanceCalculator
 
 tf_log.set_verbosity_error()
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["REPORT_TO"] = "none"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
 lg = RDLogger.logger()
 lg.setLevel(RDLogger.CRITICAL)
+
 
 class QM9Dataset:
     """
@@ -103,6 +97,26 @@ class QM9Dataset:
         "chemprop": "chemprop",
         "chemprop_embedding": "chemprop",
     }
+    SUPPORTED_SAMPLING_STRATEGIES = {"head", "random", "stratified"}
+    DEFAULT_STRATIFY_BY = ["num_atoms", "gap"]
+    DESCRIPTOR_COLUMNS = {
+        "morgan": "morgan_fingerprint",
+        "transformer": "selfies_transformer",
+        "onehot": "selfies_onehot",
+        "soap": "soap_embedding",
+        "acsf": "acsf_embedding",
+        "mace": "mace_embedding",
+        "coulomb": "coulomb_matrix",
+        "chemprop": "chemprop_embedding",
+    }
+    DESCRIPTORS_REQUIRING_VALID_ROWS = {
+        "soap": "soap_embedding",
+        "acsf": "acsf_embedding",
+        "mace": "mace_embedding",
+    }
+    DISTANCE_METRIC_ALIASES = {
+        "tanimoto": "jaccard",
+    }
 
     def __init__(
         self,
@@ -113,10 +127,6 @@ class QM9Dataset:
         embed_seed: int = 40,
         sampling_strategy: str = "stratified",
         stratify_by: Optional[List[str]] = None,
-        stratify_bins: int = 10,
-        sampling_seed: int = 40,
-        min_per_stratum: int = 1,
-        sampling_buffer: float = 1.1,
         injected_molecules: Optional[Union[pl.DataFrame, Sequence[str]]] = None,
         descriptors: Optional[Sequence[str]] = None,
     ):
@@ -127,35 +137,32 @@ class QM9Dataset:
         self.required_mol_ids = required_mol_ids or []
         self.embed_seed = embed_seed
         self.sampling_strategy = sampling_strategy
-        self.stratify_by = stratify_by or ["num_atoms", "gap"]
-        self.stratify_bins = stratify_bins
-        self.sampling_seed = sampling_seed
-        self.min_per_stratum = min_per_stratum
-        self.sampling_buffer = sampling_buffer
+        self.stratify_by = list(stratify_by or self.DEFAULT_STRATIFY_BY)
+        self.stratify_bins = 10
+        self.sampling_seed = 40
+        self.min_per_stratum = 1
         self.injected_molecules = injected_molecules
-        requested_descriptors = self._normalize_descriptors(descriptors)
-        self.add_morgan_fingerprint_flag = False
-        self.add_selfies_transformer_flag = False
-        self.add_selfies_onehot_flag = False
-        self.add_soap_embedding_flag = False
-        self.add_acsf_embedding_flag = False
-        self.add_mace_embedding_flag = False
-        self.add_coulomb_matrix_flag = False
-        self.add_chemprop_embedding_flag = False
-        self._set_descriptor_flags(requested_descriptors)
+        self.requested_descriptors = self._normalize_descriptors(descriptors)
         self.df = pl.DataFrame()
-        self.scaler = StandardScaler()
-        self.is_scaled = False
         self._electron_affinity_cache: Dict[int, float] = {}
         self._ionization_energy_cache: Dict[int, float] = {}
         
+        self._validate_config()
         ensure_directory(self.root)
         
-        # Initialize Sub-Components
-        self.geometry_engine = GeometryPerturber(save_path=os.path.join(root, "stress_test.xyz"))
         self.distance_engine = DistanceCalculator()
 
         RDLogger.DisableLog("rdApp.error")
+
+    def _validate_config(self) -> None:
+        if self.subset_size is not None and self.subset_size < 0:
+            raise ValueError("limit must be non-negative or None.")
+        if self.sampling_strategy not in self.SUPPORTED_SAMPLING_STRATEGIES:
+            valid = ", ".join(sorted(self.SUPPORTED_SAMPLING_STRATEGIES))
+            raise ValueError(
+                f"Unsupported sampling_strategy='{self.sampling_strategy}'. "
+                f"Use one of: {valid}."
+            )
 
     @classmethod
     def _normalize_descriptors(cls, descriptors: Optional[Sequence[str]]) -> List[str]:
@@ -182,20 +189,9 @@ class QM9Dataset:
 
         return normalized
 
-    def _set_descriptor_flags(self, descriptors: Sequence[str]) -> None:
-        requested = set(descriptors)
-        self.add_morgan_fingerprint_flag = "morgan" in requested
-        self.add_selfies_transformer_flag = "transformer" in requested
-        self.add_selfies_onehot_flag = "onehot" in requested
-        self.add_soap_embedding_flag = "soap" in requested
-        self.add_acsf_embedding_flag = "acsf" in requested
-        self.add_mace_embedding_flag = "mace" in requested
-        self.add_coulomb_matrix_flag = "coulomb" in requested
-        self.add_chemprop_embedding_flag = "chemprop" in requested
-
     def _add_requested_descriptors(self) -> bool:
         """Adds descriptor columns requested at init-time; returns True if dataframe schema changed."""
-        if self.df.is_empty():
+        if self.df.is_empty() or not self.requested_descriptors:
             return False
 
         before_cols = set(self.df.columns)
@@ -204,22 +200,8 @@ class QM9Dataset:
             f"(rows={self.df.height})."
         )
 
-        if self.add_morgan_fingerprint_flag:
-            self.add_morgan_fingerprints()
-        if self.add_selfies_transformer_flag:
-            self.add_selfies_transformer()
-        if self.add_selfies_onehot_flag:
-            self.add_selfies_onehot()
-        if self.add_soap_embedding_flag:
-            self.add_soap()
-        if self.add_acsf_embedding_flag:
-            self.add_acsf()
-        if self.add_mace_embedding_flag:
-            self.add_mace()
-        if self.add_coulomb_matrix_flag:
-            self.add_coulomb_matrix()
-        if self.add_chemprop_embedding_flag:
-            self.add_chemprop()
+        for descriptor in self.requested_descriptors:
+            self._ensure_descriptor(descriptor)
 
         after_cols = set(self.df.columns)
         added_cols = sorted(list(after_cols - before_cols))
@@ -229,10 +211,52 @@ class QM9Dataset:
             logger.info("No new descriptor columns added (already present or none requested).")
         return after_cols != before_cols
 
+    def _ensure_descriptor(self, descriptor: str) -> str:
+        """Computes a descriptor if needed and returns its dataframe column name."""
+        desc = self._canonical_descriptor(descriptor)
+
+        if desc == "morgan":
+            self.add_morgan_fingerprints()
+        elif desc == "transformer":
+            self.add_selfies_transformer()
+        elif desc == "onehot":
+            self.add_selfies_onehot()
+        elif desc == "soap":
+            self.add_soap()
+        elif desc == "acsf":
+            self.add_acsf()
+        elif desc == "mace":
+            self.add_mace()
+        elif desc == "coulomb":
+            self.add_coulomb_matrix()
+        elif desc == "chemprop":
+            self.add_chemprop()
+        else:
+            raise ValueError(f"Unknown descriptor '{descriptor}'.")
+
+        return self.DESCRIPTOR_COLUMNS[desc]
+
+    @classmethod
+    def _canonical_descriptor(cls, descriptor: str) -> str:
+        key = str(descriptor).strip().lower()
+        canonical = cls.DESCRIPTOR_ALIASES.get(key)
+        if canonical is None:
+            valid = ", ".join(sorted(set(cls.DESCRIPTOR_ALIASES.values())))
+            raise ValueError(
+                f"Unknown QM9 descriptor '{descriptor}'. "
+                f"Supported descriptors: {valid}."
+            )
+        return canonical
+
+    @staticmethod
+    def _is_list_dtype(dtype: pl.DataType) -> bool:
+        base_type = getattr(dtype, "base_type", lambda: dtype)()
+        return base_type == pl.List
+
     def _upsert_descriptor_column(
         self,
         column_name: str,
-        compute_series: callable,
+        compute_series: Callable[[pl.DataFrame], pl.Series],
     ) -> bool:
         """
         Adds a descriptor column if missing, or fills null/empty values for rows that
@@ -248,7 +272,7 @@ class QM9Dataset:
 
         indexed_df = self.df.with_row_index("_row_idx")
         
-        if self.df.schema[column_name] == pl.List:
+        if self._is_list_dtype(self.df.schema[column_name]):
             missing_mask = pl.col(column_name).is_null() | (pl.col(column_name).list.len() == 0)
         else:
             missing_mask = pl.col(column_name).is_null()
@@ -277,7 +301,7 @@ class QM9Dataset:
     def _upsert_descriptor_columns(
         self,
         column_names: Sequence[str],
-        compute_columns: callable,
+        compute_columns: Callable[[pl.DataFrame], Dict[str, pl.Series]],
     ) -> bool:
         """
         Adds multiple descriptor columns together, or fills rows where any of the
@@ -294,10 +318,13 @@ class QM9Dataset:
             self.df = self.df.with_columns([computed[col] for col in target_cols])
             return True
 
-        indexed_df = self.df.with_row_count("_row_idx")
+        indexed_df = self.df.with_row_index("_row_idx")
         missing_expr = pl.lit(False)
         for col in target_cols:
-            missing_expr = missing_expr | pl.col(col).is_null() | (pl.col(col).list.len() == 0)
+            col_missing = pl.col(col).is_null()
+            if self._is_list_dtype(self.df.schema[col]):
+                col_missing = col_missing | (pl.col(col).list.len() == 0)
+            missing_expr = missing_expr | col_missing
 
         missing_rows = indexed_df.filter(missing_expr)
         if missing_rows.is_empty():
@@ -316,147 +343,6 @@ class QM9Dataset:
         drop_cols = ["_row_idx"] + [f"{col}_new" for col in target_cols]
         self.df = merged.with_columns(coalesced).drop(*drop_cols)
         return True
-
-    def _select_qm9_indices(self, dataset: QM9) -> List[int]:
-        """Selects QM9 indices using the configured sampling strategy."""
-        if self.sampling_strategy not in {"stratified", "head", "random"}:
-            raise ValueError(
-                f"Unsupported sampling_strategy='{self.sampling_strategy}'. "
-                "Use 'stratified', 'random', or 'head'."
-            )
-
-        if self.sampling_strategy == "head":
-            buffer_size = int(self.subset_size * self.sampling_buffer)
-            required_indices = self._parse_required_indices()
-            max_required_index = max(required_indices) if required_indices else -1
-            limit = max(buffer_size, max_required_index + 1)
-            return list(range(min(limit, len(dataset))))
-
-        required_indices = set(self._parse_required_indices())
-        out_of_range = [i for i in required_indices if i < 0 or i >= len(dataset)]
-        if out_of_range:
-            logger.warning(
-                "Some required mol_id indices are outside QM9 range and will be ignored: "
-                f"{sorted(out_of_range)}"
-            )
-            required_indices = {i for i in required_indices if 0 <= i < len(dataset)}
-
-        if self.sampling_strategy == "random":
-            n = len(dataset)
-            if n == 0:
-                return []
-            target_size = int(np.ceil(self.subset_size * self.sampling_buffer))
-            slots = max(target_size - len(required_indices), 0)
-            if slots <= 0:
-                return sorted(required_indices)
-
-            available = [i for i in range(n) if i not in required_indices]
-            rng = np.random.default_rng(self.sampling_seed)
-            if not available:
-                return sorted(required_indices)
-            take = min(slots, len(available))
-            chosen = rng.choice(available, size=take, replace=False)
-            selected = set(required_indices)
-            selected.update(chosen.tolist())
-            return sorted(selected)
-            
-        valid_stratify_keys = set(self.QM9_TARGETS) | {"num_atoms"}
-        invalid = [k for k in self.stratify_by if k not in valid_stratify_keys]
-        if invalid:
-            raise ValueError(
-                f"Invalid stratify_by key(s): {invalid}. "
-                f"Valid keys: {sorted(valid_stratify_keys)}"
-            )
-
-        n = len(dataset)
-        if n == 0:
-            return []
-
-        # 1. Extract values
-        values: Dict[str, np.ndarray] = {}
-        for key in self.stratify_by:
-            values[key] = np.zeros(n, dtype=float)
-
-        for i, data in enumerate(dataset):
-            for key in self.stratify_by:
-                if key == "num_atoms":
-                    values[key][i] = float(data.num_nodes)
-                else:
-                    target_idx = self.QM9_TARGETS.index(key)
-                    values[key][i] = float(data.y[0, target_idx].item())
-
-        # 2. Assign values to bins
-        binned: Dict[str, np.ndarray] = {}
-        for key in self.stratify_by:
-            if key == "num_atoms":
-                # Discrete variable: Use exact integer as the bin
-                binned[key] = values[key].astype(int)
-            else:
-                # Continuous variable: Classical equal-width binning
-                series = values[key]
-                val_min, val_max = series.min(), series.max()
-                if self.stratify_bins <= 1 or val_min == val_max:
-                    binned[key] = np.zeros_like(series, dtype=int)
-                else:
-                    edges = np.linspace(val_min, val_max, self.stratify_bins + 1)
-                    edges[-1] += 1e-9  # Catch the absolute max value
-                    binned[key] = np.digitize(series, edges, right=False)
-
-        # 3. Form Strata intersections (e.g., bin 4 for num_atoms AND bin 2 for gap)
-        strata: Dict[tuple, List[int]] = {}
-        for i in range(n):
-            if i in required_indices:
-                continue
-            key = tuple(int(binned[k][i]) for k in self.stratify_by)
-            strata.setdefault(key, []).append(i)
-
-        target_size = int(np.ceil(self.subset_size * self.sampling_buffer))
-        slots = max(target_size - len(required_indices), 0)
-        
-        total_available = sum(len(v) for v in strata.values())
-        if slots <= 0 or total_available == 0:
-            return sorted(required_indices)
-
-        # 4. Proportional Allocation
-        chosen_indices = []
-        rng = np.random.default_rng(self.sampling_seed)
-
-        for _, indices in strata.items():
-            # Proportion of this specific strata in the full dataset
-            proportion = len(indices) / total_available
-            take = int(np.round(slots * proportion))
-            take = min(take, len(indices))
-            
-            if take > 0:
-                chosen = rng.choice(indices, size=take, replace=False)
-                chosen_indices.extend(chosen.tolist())
-
-        # 5. Fill remaining slots due to rounding down
-        remaining_slots = slots - len(chosen_indices)
-        if remaining_slots > 0:
-            chosen_set = set(chosen_indices)
-            all_unchosen = [idx for indices in strata.values() for idx in indices if idx not in chosen_set]
-            if all_unchosen:
-                extra = rng.choice(
-                    all_unchosen,
-                    size=min(remaining_slots, len(all_unchosen)),
-                    replace=False
-                )
-                chosen_indices.extend(extra.tolist())
-
-        selected = set(required_indices)
-        selected.update(chosen_indices)
-        return sorted(selected)
-
-    def _parse_required_indices(self) -> List[int]:
-        required_set: Set[str] = set(self.required_mol_ids)
-        required_indices = []
-        for mol_id in required_set:
-            if mol_id.startswith("qm9_"):
-                suffix = mol_id.split("qm9_", 1)[1]
-                if suffix.isdigit():
-                    required_indices.append(int(suffix))
-        return required_indices
 
     @staticmethod
     def _classify_structure_type(mol: Chem.Mol) -> str:
@@ -502,6 +388,34 @@ class QM9Dataset:
             count += 1
         return float(total / count) if count > 0 else 0.0
 
+    def _mean_cached_atomic_property(
+        self,
+        mol: Chem.Mol,
+        cache: Dict[int, float],
+        loader: Callable[[int], float],
+    ) -> float:
+        values: List[float] = []
+        for atom in mol.GetAtoms():
+            atomic_num = int(atom.GetAtomicNum())
+            if atomic_num not in cache:
+                try:
+                    cache[atomic_num] = float(loader(atomic_num) or 0.0)
+                except Exception:
+                    cache[atomic_num] = 0.0
+            values.append(cache[atomic_num])
+        return float(np.mean(values)) if values else 0.0
+
+    @staticmethod
+    def _load_electron_affinity(atomic_num: int) -> float:
+        return float(getattr(element(atomic_num), "electron_affinity", 0.0) or 0.0)
+
+    @staticmethod
+    def _load_first_ionization_energy(atomic_num: int) -> float:
+        ionization_energies = getattr(element(atomic_num), "ionenergies", None)
+        if not isinstance(ionization_energies, dict):
+            return 0.0
+        return float(ionization_energies.get(1, 0.0) or 0.0)
+
     def _build_smiles_row(
         self,
         smiles: str,
@@ -509,6 +423,7 @@ class QM9Dataset:
         *,
         is_injected: int,
         outlier_category: Optional[str] = None,
+        extra_fields: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not smiles:
             return None
@@ -591,27 +506,16 @@ class QM9Dataset:
         fraction_csp2 = float(num_sp2_carbons / denom_c)
         fraction_csp3 = float(num_sp3_carbons / denom_c)
         coordination = float(np.mean([atom.GetDegree() for atom in mol.GetAtoms()])) if mol.GetNumAtoms() > 0 else 0.0
-        electron_affinities = []
-        ionization_energies = []
-        for atom in mol.GetAtoms():
-            atomic_num = int(atom.GetAtomicNum())
-            if atomic_num not in self._electron_affinity_cache:
-                try:
-                    ea_val = getattr(element(atomic_num), "electron_affinity", 0.0) or 0.0
-                    self._electron_affinity_cache[atomic_num] = float(ea_val)
-                except Exception:
-                    self._electron_affinity_cache[atomic_num] = 0.0
-            if atomic_num not in self._ionization_energy_cache:
-                try:
-                    ion_list = getattr(element(atomic_num), "ionenergies", None)
-                    first_ion = ion_list.get(1, 0.0) if isinstance(ion_list, dict) else 0.0
-                    self._ionization_energy_cache[atomic_num] = float(first_ion or 0.0)
-                except Exception:
-                    self._ionization_energy_cache[atomic_num] = 0.0
-            electron_affinities.append(self._electron_affinity_cache[atomic_num])
-            ionization_energies.append(self._ionization_energy_cache[atomic_num])
-        election_affinity = float(np.mean(electron_affinities)) if electron_affinities else 0.0
-        ionization_energies_value = float(np.mean(ionization_energies)) if ionization_energies else 0.0
+        election_affinity = self._mean_cached_atomic_property(
+            mol,
+            self._electron_affinity_cache,
+            self._load_electron_affinity,
+        )
+        ionization_energies_value = self._mean_cached_atomic_property(
+            mol,
+            self._ionization_energy_cache,
+            self._load_first_ionization_energy,
+        )
 
         row = {
             "mol_id": mol_id,
@@ -674,6 +578,14 @@ class QM9Dataset:
             "fr_ether": int(Fragments.fr_ether(mol)),
             "fr_nitro": int(Fragments.fr_nitro(mol)),
         }
+
+        if extra_fields:
+            protected = {"smiles", "canonical_smiles", "mol_id", "is_injected"}
+            for key, value in extra_fields.items():
+                if key in protected:
+                    continue
+                if key not in row or row[key] is None:
+                    row[key] = value
 
         return row
 
@@ -749,11 +661,52 @@ class QM9Dataset:
             )
         return aligned.select(columns)
 
+    @staticmethod
+    def _sort_by_qm9_id(df: pl.DataFrame) -> pl.DataFrame:
+        if df.is_empty() or "mol_id" not in df.columns:
+            return df
+        return (
+            df
+            .with_columns(
+                pl.col("mol_id")
+                .str.replace("qm9_", "")
+                .cast(pl.Int64, strict=False)
+                .alias("_qm9_idx")
+            )
+            .sort("_qm9_idx")
+            .drop("_qm9_idx")
+        )
+
     def _apply_configured_injections(self) -> None:
         """Inject molecules provided at init-time into the current sampled dataframe."""
         if self.injected_molecules is None:
             return
         self.inject_outliers(self.injected_molecules)
+
+    @staticmethod
+    def _normalize_outlier_records(
+        outliers: Union[pl.DataFrame, Sequence[str]],
+    ) -> List[Dict[str, Any]]:
+        if isinstance(outliers, pl.DataFrame):
+            if outliers.is_empty():
+                return []
+            if "smiles" not in outliers.columns:
+                raise ValueError("Outlier dataframe must contain a `smiles` column.")
+
+            normalized_outliers = outliers.with_columns(
+                pl.col("smiles").cast(pl.Utf8, strict=False),
+                (
+                    pl.col("outlier_category").cast(pl.Utf8, strict=False)
+                    if "outlier_category" in outliers.columns
+                    else pl.lit(None).cast(pl.Utf8).alias("outlier_category")
+                ),
+            )
+            return normalized_outliers.to_dicts()
+
+        return [
+            {"smiles": str(smiles), "outlier_category": None}
+            for smiles in outliers
+        ]
 
     def _base_row_count(self) -> int:
         if self.df.is_empty() or "is_injected" not in self.df.columns:
@@ -764,6 +717,9 @@ class QM9Dataset:
         """
         Keeps the requested number of base QM9 molecules and preserves all injected rows.
         """
+        if self.subset_size is None:
+            return self.df
+
         if self.df.is_empty() or "is_injected" not in self.df.columns:
             self.df = self.df.head(self.subset_size)
             return self.df
@@ -787,31 +743,8 @@ class QM9Dataset:
         if self.df.is_empty():
             raise ValueError("Dataset is empty. Call `load()` before injecting outliers.")
 
-        if isinstance(outliers, pl.DataFrame):
-            if outliers.is_empty():
-                self.df = self._ensure_injection_columns(self.df)
-                return self.df
-            if "smiles" not in outliers.columns:
-                raise ValueError("Outlier dataframe must contain a `smiles` column.")
-            normalized_outliers = outliers.with_columns(
-                pl.col("smiles").cast(pl.Utf8, strict=False),
-                (
-                    pl.col("outlier_category").cast(pl.Utf8, strict=False)
-                    if "outlier_category" in outliers.columns
-                    else pl.lit(None).cast(pl.Utf8).alias("outlier_category")
-                ),
-            )
-            outlier_records = normalized_outliers.to_dicts()
-        else:
-            if not outliers:
-                self.df = self._ensure_injection_columns(self.df)
-                return self.df
-            outlier_records = [
-                {"smiles": str(smiles), "outlier_category": None}
-                for smiles in outliers
-            ]
-
         self.df = self._ensure_injection_columns(self.df)
+        outlier_records = self._normalize_outlier_records(outliers)
         if not outlier_records:
             return self.df
 
@@ -863,6 +796,19 @@ class QM9Dataset:
         Loads full QM9 cache (or processes it), then applies sampling.
         Requested descriptors are added after sampling.
         """
+        full_df = self._load_full_qm9_df(force_process=force_process)
+
+        if not self._requires_non_null_descriptor_rows():
+            return self._prepare_loaded_dataframe(full_df, self.subset_size)
+
+        if self.subset_size is None:
+            self._prepare_loaded_dataframe(full_df, target_size=None)
+            self._drop_rows_with_null_required_descriptors()
+            return self.df
+
+        return self._load_with_descriptor_filter(full_df)
+
+    def _load_full_qm9_df(self, force_process: bool = False) -> pl.DataFrame:
         if os.path.exists(self.file_path) and not force_process:
             logger.info(f"Loading cached full QM9 dataset from: {self.file_path}")
             try:
@@ -874,31 +820,31 @@ class QM9Dataset:
         else:
             full_df = self._process_raw_qm9()
 
-        needs_non_null_descriptor_filter = self._requires_non_null_descriptor_rows()
-        if not needs_non_null_descriptor_filter:
-            self.df = self._sample_qm9_df(full_df, self.subset_size)
-            self.df = self._ensure_injection_columns(self.df)
-            self._apply_configured_injections()
-            self._add_requested_descriptors()
-            return self.df
+        return full_df
 
+    def _prepare_loaded_dataframe(
+        self,
+        full_df: pl.DataFrame,
+        target_size: Optional[int],
+    ) -> pl.DataFrame:
+        self.df = self._sample_qm9_df(full_df, target_size)
+        self.df = self._ensure_injection_columns(self.df)
+        self._apply_configured_injections()
+        self._add_requested_descriptors()
+        return self.df
+
+    def _load_with_descriptor_filter(self, full_df: pl.DataFrame) -> pl.DataFrame:
         candidate_target = int(
             min(
                 full_df.height,
-                max(
-                    self.subset_size,
-                    np.ceil(self.subset_size * self.sampling_buffer),
-                ),
-            )
+                self.subset_size,
+                )
         ) if self.subset_size is not None else full_df.height
 
         attempt = 0
         while True:
             attempt += 1
-            self.df = self._sample_qm9_df(full_df, candidate_target)
-            self.df = self._ensure_injection_columns(self.df)
-            self._apply_configured_injections()
-            self._add_requested_descriptors()
+            self._prepare_loaded_dataframe(full_df, candidate_target)
             self._drop_rows_with_null_required_descriptors()
 
             base_count = self._base_row_count()
@@ -933,14 +879,11 @@ class QM9Dataset:
             )
 
     def _required_descriptor_columns(self) -> List[str]:
-        cols: List[str] = []
-        if self.add_soap_embedding_flag:
-            cols.append("soap_embedding")
-        if self.add_acsf_embedding_flag:
-            cols.append("acsf_embedding")
-        if self.add_mace_embedding_flag:
-            cols.append("mace_embedding")
-        return cols
+        return [
+            self.DESCRIPTORS_REQUIRING_VALID_ROWS[descriptor]
+            for descriptor in self.requested_descriptors
+            if descriptor in self.DESCRIPTORS_REQUIRING_VALID_ROWS
+        ]
 
     def _requires_non_null_descriptor_rows(self) -> bool:
         return len(self._required_descriptor_columns()) > 0
@@ -989,17 +932,7 @@ class QM9Dataset:
                 "Filtered out QM9 molecules during load because 3D embedding failed "
                 f"(dropped={dropped}, kept={full_df.height})."
             )
-        full_df = (
-            full_df
-            .with_columns(
-                pl.col("mol_id")
-                .str.replace("qm9_", "")
-                .cast(pl.Int64, strict=False)
-                .alias("_qm9_idx")
-            )
-            .sort("_qm9_idx")
-            .drop("_qm9_idx")
-        )
+        full_df = self._sort_by_qm9_id(full_df)
         full_df.write_parquet(self.file_path)
         logger.success(
             f"Saved full QM9 master parquet: rows={full_df.height}, path={self.file_path}"
@@ -1059,17 +992,7 @@ class QM9Dataset:
             else:
                 sampled_df = sampled_non_required
 
-        sampled_df = (
-            sampled_df
-            .with_columns(
-                pl.col("mol_id")
-                .str.replace("qm9_", "")
-                .cast(pl.Int64, strict=False)
-                .alias("_qm9_idx")
-            )
-            .sort("_qm9_idx")
-            .drop("_qm9_idx")
-        )
+        sampled_df = self._sort_by_qm9_id(sampled_df)
         logger.info(
             "QM9 sampling complete: "
             f"strategy={self.sampling_strategy}, requested_limit={target_size}, returned_rows={sampled_df.height}."
@@ -1131,13 +1054,26 @@ class QM9Dataset:
 
         chosen_indices: List[int] = []
         total_valid = len(valid_indices)
+        enforce_minimum = (
+            self.min_per_stratum > 0
+            and len(strata) * self.min_per_stratum <= target_size
+        )
         for indices in strata.values():
             proportion = len(indices) / total_valid
             take = int(np.round(target_size * proportion))
+            if enforce_minimum:
+                take = max(take, self.min_per_stratum)
             take = min(take, len(indices))
             if take > 0:
                 chosen = rng.choice(indices, size=take, replace=False)
                 chosen_indices.extend(chosen.tolist())
+
+        if len(chosen_indices) > target_size:
+            chosen_indices = rng.choice(
+                chosen_indices,
+                size=target_size,
+                replace=False,
+            ).tolist()
 
         remaining_slots = target_size - len(chosen_indices)
         if remaining_slots > 0:
@@ -1195,6 +1131,7 @@ class QM9Dataset:
         except Exception as e:
             logger.debug(f"Molecule embedding failed for SMILES '{smiles}': {e}")
             return None
+
     def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
         self._upsert_descriptor_column(
             "morgan_fingerprint",
@@ -1314,103 +1251,12 @@ class QM9Dataset:
             ),
         )
 
-    @staticmethod
-    def _series_to_feature_matrices(series: pl.Series) -> List[np.ndarray]:
-        matrices: List[np.ndarray] = []
-        for value in series.to_list():
-            if value is None:
-                matrices.append(np.empty((0, 0), dtype=np.float64))
-                continue
-
-            arr = np.asarray(value, dtype=np.float64)
-            if arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            elif arr.ndim > 2:
-                arr = arr.reshape(arr.shape[0], -1)
-            matrices.append(arr)
-        return matrices
-
-    def get_descriptor_matrices(
+    def get_distance_matrix(
         self,
-        descriptor: str,
-        **kwargs,
-    ) -> List[np.ndarray]:
-        """
-        Returns per-molecule descriptor matrices with shape (n_atoms, d) when supported.
-        If the cached matrix column is missing, the corresponding descriptor pair is
-        computed and attached to the dataframe first.
-        """
-        desc = self.DESCRIPTOR_ALIASES.get(descriptor.strip().lower())
-        if desc is None:
-            raise ValueError(f"Unknown descriptor '{descriptor}'.")
-
-        if self.df.is_empty():
-            raise ValueError("Dataset is empty. Call `load()` before requesting descriptor matrices.")
-
-        if desc == "soap":
-            if "soap_matrix" not in self.df.columns:
-                self.add_soap(**kwargs)
-            series = self.df["soap_matrix"]
-        elif desc == "acsf":
-            if "acsf_matrix" not in self.df.columns:
-                self.add_acsf(**kwargs)
-            series = self.df["acsf_matrix"]
-        elif desc == "mace":
-            if "mace_matrix" not in self.df.columns:
-                self.add_mace(**kwargs)
-            series = self.df["mace_matrix"]
-        else:
-            raise ValueError(
-                f"Descriptor '{descriptor}' does not have a matrix-form API. "
-                "Supported matrix descriptors: soap, acsf, mace."
-            )
-
-        return self._series_to_feature_matrices(series)
-
-    def add_all_descriptors(
-        self,
-        radius: int = 3,
-        fp_size: int = 2048,
-        model_name: str = "HUBioDataLab/SELFormer",
-        r_cut: float = 6.0,
-        n_max: int = 8,
-        l_max: int = 6,
-        sigma: float = 0.5,
-        coulomb_n_atoms_max: int | None = None,
-        coulomb_permutation: str = "sorted_l2",
-        include_chemprop: bool = True,
-        chemprop_model_path: str | None = None,
-        chemprop_batch_size: int = 64,
-    ) -> None:
-        """
-        Adds all available QM9 descriptor columns in one call.
-        Existing columns are skipped by each add_* method.
-        """
-        if self.df.is_empty():
-            raise ValueError("Dataset is empty. Call `load()` before adding descriptors.")
-
-        logger.info("Adding all descriptors to QM9 dataframe...")
-        self.add_morgan_fingerprints(radius=radius, fp_size=fp_size)
-        self.add_selfies_transformer(model_name=model_name)
-        self.add_selfies_onehot()
-        self.add_soap(r_cut=r_cut, n_max=n_max, l_max=l_max, sigma=sigma)
-        self.add_acsf(r_cut=r_cut)
-        self.add_mace()
-        self.add_coulomb_matrix(
-            n_atoms_max=coulomb_n_atoms_max,
-            permutation=coulomb_permutation
-        )
-
-        if include_chemprop:
-            self.add_chemprop(
-                model_path=chemprop_model_path,
-                batch_size=chemprop_batch_size
-            )
-
-        logger.success("Finished adding all requested descriptors.")
-    
-
-    def get_distance_matrix(self, descriptor: str = "morgan", dist_type: str = "jaccard", pca_components=None) -> np.ndarray:
+        descriptor: str = "morgan",
+        dist_type: str = "jaccard",
+        pca_components: Optional[int] = None,
+    ) -> np.ndarray:
         """
         Computes a distance matrix for a chosen descriptor.
         
@@ -1419,54 +1265,21 @@ class QM9Dataset:
                 to the requested number of dimensions before calculating
                 distances.
         """
-        descriptor = descriptor.lower()
-        aliases = {
-            "transformer": "selfies_transformer",
-            "onehot": "selfies_onehot",
-        }
-        if dist_type == 'tanimoto':
-            dist_type = 'jaccard'
-            
-        descriptor = aliases.get(descriptor, descriptor)
+        if self.df.is_empty():
+            raise ValueError("Dataset is empty. Call `load()` before requesting a distance matrix.")
 
-        def _series_for(desc: str) -> pl.Series:
-            if desc == "morgan":
-                self.add_morgan_fingerprints()
-                return self.df["morgan_fingerprint"]
-            if desc == "selfies_transformer":
-                self.add_selfies_transformer()
-                return self.df["selfies_transformer"]
-            if desc == "selfies_onehot":
-                self.add_selfies_onehot(flatten=True)
-                return self.df["selfies_onehot"]
-            if desc == "soap":
-                self.add_soap()
-                return self.df["soap_embedding"]
-            if desc == "acsf":
-                self.add_acsf()
-                return self.df["acsf_embedding"]
-            if desc == "mace":
-                self.add_mace()
-                return self.df["mace_embedding"]
-            if desc == "coulomb_matrix":
-                self.add_coulomb_matrix()
-                return self.df["coulomb_matrix"]
-            if desc == "chemprop":
-                self.add_chemprop()
-                return self.df["chemprop_embedding"]
-            raise ValueError(
-                f"Unknown descriptor: {desc}. "
-                "Expected one of: morgan, selfies_transformer, selfies_onehot, "
-                "soap, acsf, mace, coulomb_matrix, chemprop."
-            )
+        descriptor = self._canonical_descriptor(descriptor)
+        dist_type = str(dist_type).strip().lower()
+        dist_type = self.DISTANCE_METRIC_ALIASES.get(dist_type, dist_type)
 
         # Distance type warnings
-        if dist_type in {"jaccard", "hamming"} and descriptor not in {"morgan", "selfies_onehot"}:
+        if dist_type in {"jaccard", "hamming"} and descriptor not in {"morgan", "onehot"}:
             logger.warning(f"{dist_type.capitalize()} distance is usually for binary fingerprints. '{descriptor}' may not be binary.")
         if dist_type == "soap_kernel" and descriptor != "soap":
             logger.warning(f"SOAP kernel is designed for SOAP. '{descriptor}' may not be compatible.")
 
-        series = _series_for(descriptor)
+        column_name = self._ensure_descriptor(descriptor)
+        series = self.df[column_name]
         if pca_components is not None:
             if not isinstance(pca_components, int) or pca_components <= 0:
                 raise ValueError("pca_components must be a positive integer.")
@@ -1498,216 +1311,6 @@ class QM9Dataset:
             series,
             metric=dist_type,
         )
-
-    def run_stress_test(
-        self,
-        num_molecules: int = 10,
-        perturbations: int = 20,
-        include_base: bool = True,
-        max_bond_rattle : float = 0.05,
-        mol_ids: Optional[List[str]] = None,
-        rotated: bool = False
-    ) -> list:
-        """Runs the geometry stress test using the geometry engine."""
-        default_path = self.geometry_engine.save_path
-        target_path = (
-            os.path.join(self.root, "stress_test_rotated.xyz")
-            if rotated
-            else default_path
-        )
-
-        if os.path.exists(target_path) and mol_ids is None and not include_base and not max_bond_rattle > 0:
-            return self.geometry_engine.load_stress_test(
-                save_path=target_path,
-                mol_ids=mol_ids
-            )
-        
-        return self.geometry_engine.generate_stress_test(
-            self.df,
-            num_molecules=num_molecules,
-            mol_ids=mol_ids,
-            perturbations=perturbations,
-            include_base=include_base,
-            rotated=rotated,
-            save_path=target_path,
-            max_bond_rattle=max_bond_rattle
-        )
-
-    def get_molecules(
-            self,
-            invariant: bool = True,
-            output_filename: str = "qm9_subset.xyz",
-            subset_size: Optional[int] = None,
-            seed: Optional[int] = None,
-        ) -> List[Atoms]:
-            """
-            Export QM9 molecules to a single .xyz file.
-            Uses native coordinates and atomic numbers extracted directly from the QM9 dataset
-            instead of generating them from SMILES. Uses extxyz format so atom-level arrays
-            (mass, partial charge) are preserved.
-            """
-            if self.df.is_empty():
-                self.load()
-
-            target_size = subset_size if subset_size is not None else self.subset_size
-            if target_size <= 0:
-                raise ValueError("subset_size must be a positive integer.")
-
-            sample_df = self.df.head(min(target_size, self.df.height))
-            if sample_df.is_empty():
-                raise ValueError("No molecules available to export.")
-
-            if seed is None:
-                seed = self.embed_seed
-            elif seed != self.embed_seed:
-                logger.warning(
-                    f"get_molecules(seed={seed}) differs from dataset embed_seed={self.embed_seed}; "
-                    "this may change which molecules can be embedded if falling back to SMILES."
-                )
-
-            frames: List[Atoms] = []
-            failed_count = 0
-            failed_ids: List[str] = []
-
-            for row in sample_df.iter_rows(named=True):
-                mol_id = row["mol_id"]
-                smiles = row["smiles"]
-                canonical_smiles = row["canonical_smiles"]
-                formula = row["formula"]
-
-                try:
-                    positions = row.get("coordinates")
-                    atomic_numbers = row.get("atomic_numbers")
-
-                    # Core update: Extract directly from QM9 if available
-                    if positions is not None and atomic_numbers is not None:
-                        positions = np.array(positions, dtype=np.float64)
-                        atomic_numbers = np.array(atomic_numbers, dtype=np.int64)
-                        
-                        # Since we bypass RDKit embedding here, default charges to 0 
-                        # (QM9 uses mulliken, but it's not strictly mapped here)
-                        charges = np.zeros(len(atomic_numbers), dtype=np.float64)
-                    
-                    else:
-                        # Fallback to SMILES embedding if QM9 coords are missing (e.g., injected outliers)
-                        mol = self._embed_molecule(
-                            smiles=smiles,
-                            seed=seed,
-                            invariant=invariant,
-                        )
-                        if mol is None:
-                            raise ValueError("No QM9 coordinates available and 3D embedding failed.")
-
-                        conf = mol.GetConformer()
-                        atomic_numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int64)
-                        positions = conf.GetPositions()
-                        charges = np.array(
-                            [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()],
-                            dtype=np.float64,
-                        )
-
-                    # Initialize the ASE Atoms object
-                    atoms = Atoms(numbers=atomic_numbers, positions=positions)
-                    masses = atoms.get_masses()
-                    symbols = atoms.get_chemical_symbols()
-                    
-                    atoms.set_initial_charges(charges)
-                    # Keep explicit arrays for tools expecting named per-atom properties.
-                    atoms.arrays["partial_charge"] = charges
-                    atoms.arrays["mass"] = masses
-                    
-                    # Derive element counts and heavy atoms from the native array
-                    heavy_atom_count = sum(1 for z in atomic_numbers if z > 1)
-                    element_counts = {
-                        "C": symbols.count("C"),
-                        "N": symbols.count("N"),
-                        "O": symbols.count("O"),
-                        "F": symbols.count("F")
-                    }
-                    heavy_atom_denom = float(heavy_atom_count) if heavy_atom_count > 0 else 1.0
-
-                    atom_info = {
-                        "mol_id": mol_id,
-                        "smiles": smiles,
-                        "canonical_smiles": canonical_smiles,
-                        
-                        "scaffold": row.get("scaffold_smiles", ""),
-                        "formula": formula,
-                        
-                        # Read structural topology features dynamically mapped in _build_smiles_row()
-                        "structure_type": row.get("structure_class", "Unknown"),
-                        "functional_groups": row.get("functional_groups", ""),
-                        
-                        "heavy_atom_count": heavy_atom_count,
-                        "element_count_C": element_counts["C"],
-                        "element_count_N": element_counts["N"],
-                        "element_count_O": element_counts["O"],
-                        "element_count_F": element_counts["F"],
-                        "element_ratio_C": float(element_counts["C"] / heavy_atom_denom),
-                        "element_ratio_N": float(element_counts["N"] / heavy_atom_denom),
-                        "element_ratio_O": float(element_counts["O"] / heavy_atom_denom),
-                        "element_ratio_F": float(element_counts["F"] / heavy_atom_denom),
-                        "mu": float(row["mu"]) if row.get("mu") is not None else None,
-                        "gap": float(row["gap"]) if row.get("gap") is not None else None,
-                        "cv": float(row["cv"]) if row.get("cv") is not None else None,
-                        "u0": float(row["u0"]) if row.get("u0") is not None else None,
-                        "homo": float(row["homo"]) if row.get("homo") is not None else None,
-                        "lumo": float(row["lumo"]) if row.get("lumo") is not None else None,
-                        "num_atoms": int(len(atoms)),
-                        "total_mass": float(np.sum(masses)),
-                        "mean_partial_charge": float(np.mean(charges)),
-                        "branching_index": int(row.get("branching_index", 0)),
-                        "num_sp_carbons": int(row.get("num_sp_carbons", 0)),
-                        "num_sp2_carbons": int(row.get("num_sp2_carbons", 0)),
-                        "num_sp3_carbons": int(row.get("num_sp3_carbons", 0)),
-                        "main_chain_length": int(row.get("main_chain_length", 0)),
-                        "raw_token_count": int(row.get("raw_token_count", 0)),
-                        "avg_bond_length": float(row.get("avg_bond_length", 0.0)),
-                    }
-                    
-                    if "soap_embedding" in self.df.columns:
-                        atom_info["soap"] = row.get("soap_embedding")
-                    atoms.info.update(atom_info)
-                    frames.append(atoms)
-                    
-                except Exception as e:
-                    logger.debug(f"Skipping {mol_id}: {e}")
-                    failed_count += 1
-                    failed_ids.append(mol_id)
-
-            if not frames:
-                raise ValueError("Failed to generate geometries for all selected molecules.")
-
-            output_path = os.path.join(self.root, output_filename)
-            write(output_path, frames, format="extxyz")
-            logger.success(
-                f"Saved {len(frames)} molecules to {output_path} "
-                f"(failed: {failed_count}, requested: {target_size})."
-            )
-            
-            return frames
-    
-    def apply_scaling(self, columns, mode="fit_transform"):
-        """
-        Standardizes specific numeric columns.
-        Modes: 
-          'fit_transform' -> Use for Training data
-          'transform'     -> Use for Test/Validation data
-        """
-        if self.df.is_empty():
-            logger.error("No data to scale!")
-            return
-
-        if mode == "fit_transform":
-            logger.info(f"Fitting and transforming columns: {columns}")
-            scaled_values = self.scaler.fit_transform(self.df.select(columns).to_numpy())
-            self.is_scaled = True
-        else:
-            logger.info(f"Transforming columns using existing parameters: {columns}")
-            scaled_values = self.scaler.transform(self.df.select(columns).to_numpy())
-
-        scaled_df = pl.DataFrame(scaled_values, schema=columns)
-        self.df = self.df.with_columns([scaled_df[col] for col in columns])
     
 class MaterialsProject:
     DESCRIPTOR_ALIASES = {
