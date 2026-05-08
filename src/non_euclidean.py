@@ -728,126 +728,63 @@ def _pairwise_distance_matrix(
 class Wasserstein:
     """
     Computes the Earth Mover's Distance (Wasserstein-1) between molecules.
-    Treats each molecule as a distribution of atomic feature vectors.
+    Treats each molecule as a uniform distribution of atomic feature vectors.
     """
-
-    @staticmethod
-    def compute_feature_distance(feat_i: np.ndarray, feat_j: np.ndarray, metric: str = 'sqeuclidean') -> float:
-        """
-        Computes EMD between two matrices of shape (N_atoms, D_features).
-        """
-        # We NO LONGER transpose here. We assume inputs are safely (N_atoms, D_features)
-        pos_i = np.asarray(feat_i)
-        pos_j = np.asarray(feat_j)
-
-        # 1. Assign weights (Uniform: each atom is 1/N of the molecule's 'mass')
-        weights_i = np.ones(pos_i.shape[0]) / pos_i.shape[0]
-        weights_j = np.ones(pos_j.shape[0]) / pos_j.shape[0]
-
-        # 2. Compute the Cost Matrix (Distances between all atoms in A and B)
-        # M[a, b] is the cost to move atom 'a' to 'b' in feature space
-        M = ot.dist(pos_i, pos_j, metric=metric)
-
-        # 3. Solve the Optimal Transport problem
-        # We use emd2 to get the scalar distance value
-        distance = ot.emd2(weights_i, weights_j, M)
-        
-        return float(distance)
 
     @classmethod
     def distance_matrix(
         cls, 
-        frames: Optional[Sequence] = None,
-        df: Any = None,
-        feature_matrices: Optional[Sequence[np.ndarray]] = None,
-        feature_type: str = 'invariant',
+        df: Any,
         descriptor: str = 'soap',
         metric: str = 'sqeuclidean',
-        cache_dir: Optional[str] = None,
-        force_recalculate: bool = False,
     ) -> np.ndarray:
-        frames, df, descriptor = _normalize_distance_matrix_inputs(frames, df, descriptor)
-        mol_ids: Optional[List[str]] = None
-        resolved_cache_dir = cache_dir
-        cache_params: Optional[Dict[str, Any]] = None
-        if df is not None:
-            mol_ids = _mol_ids_from_df(df)
-            resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_df(df)
-            cache_params = {
-                "descriptor": descriptor,
-                "metric": metric,
-            }
-            cached = _load_cached_distance_matrix(
-                method_name="wasserstein",
-                mol_ids=mol_ids,
-                params=cache_params,
-                cache_dir=resolved_cache_dir,
-                force_recalculate=force_recalculate,
-            )
-            if cached is not None:
-                return cached
-        elif frames is not None:
-            mol_ids = _maybe_mol_ids_from_frames(frames)
-            if mol_ids is not None:
-                resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
-                cache_params = {
-                    "descriptor": feature_type,
-                    "metric": metric,
-                }
-                cached = _load_cached_distance_matrix(
-                    method_name="wasserstein",
-                    mol_ids=mol_ids,
-                    params=cache_params,
-                    cache_dir=resolved_cache_dir,
-                    force_recalculate=force_recalculate,
-                )
-                if cached is not None:
-                    return cached
+        """
+        Computes a symmetric pairwise Wasserstein distance matrix sequentially.
+        Optimized to minimize inner-loop Python overhead.
+        """
+        # 1. Extract raw feature matrices (N_atoms, D_features)
+        raw_matrices = _feature_matrices_from_df(df, descriptor)
         
-        # Step 1: Standardized feature extraction aligned with Riemann/Grassmann
-        if feature_matrices is not None:
-            # We assume these are already (N_atoms, D_features) 
-            raw_matrices = feature_matrices
-        elif df is not None:
-            raw_matrices = _feature_matrices_from_df(df, descriptor)
-            feature_type = descriptor
-        elif frames is not None:
-            if feature_type == 'invariant':
-                raw_matrices = _compute_feature_matrices(frames, normalized=True)
-                # Ensure they are (N_atoms, D_features)
-                raw_matrices = [x.T if x.shape[0] == 3 else x for x in raw_matrices]
-            elif feature_type == 'soap':
-                raw_matrices = _compute_soap_feature_matrices(frames)
-                # Ensure they are (N_atoms, D_features)
-                raw_matrices = [x.T for x in raw_matrices]
-            else:
-                raise ValueError(f"Unknown feature_type: {feature_type}")
-        else:
-            raise ValueError("Must provide either 'frames' or 'feature_matrices'.")
+        num_items = len(raw_matrices)
+        if num_items == 0:
+            return np.array([])
+            
+        dist_matrix = np.zeros((num_items, num_items))
+        logger.info(f"Computing Wasserstein distance matrix sequentially | Features: {descriptor} | Metric: {metric}")
 
-        n = len(raw_matrices)
-        _log_distance_dataset_from_ids("Wasserstein", mol_ids)
-        logger.info(f"Computing Wasserstein distance matrix | Features: {feature_type}")
-
-        # Step 2: Pairwise distance calculation
-        def pair_fn(i, j):
-            return cls.compute_feature_distance(raw_matrices[i], raw_matrices[j], metric=metric)
-
-        dist_matrix = _pairwise_distance_matrix(
-            n=n,
-            pair_fn=pair_fn,
-            desc=f"Wasserstein ({feature_type})",
-        )
-
-        if mol_ids is not None:
-            _save_cached_distance_matrix(
-                dist_matrix,
-                method_name="wasserstein",
-                mol_ids=mol_ids,
-                params=cache_params or {"descriptor": descriptor, "metric": metric},
-                cache_dir=resolved_cache_dir or _default_non_euclidean_cache_dir(),
-            )
+        # 2. PRE-OPTIMIZATION: Pre-compute the uniform mass weights for all molecules
+        # Weights: Each atom is 1/N of the molecule's total "mass"
+        # Pre-calculating this saves N^2 array allocations inside the loop.
+        weights = [np.ones(X.shape[0]) / X.shape[0] for X in raw_matrices]
         
+        # 3. Sequential nested loop calculation (Upper triangle only, mirrored to lower)
+        for i in tqdm(range(num_items), desc="Wasserstein distances", unit="row"):
+            X_i = np.asarray(raw_matrices[i])
+            w_i = weights[i]
+            
+            for j in range(i + 1, num_items):
+                X_j = np.asarray(raw_matrices[j])
+                w_j = weights[j]
+
+                try:
+                    # Compute the Cost Matrix (Distances between all atoms in A and B)
+                    # M[a, b] is the cost to move atom 'a' to 'b' in feature space
+                    M = ot.dist(X_i, X_j, metric=metric)
+
+                    # Solve the Optimal Transport problem directly using POT's C-backend
+                    d = float(ot.emd2(w_i, w_j, M))
+                    
+                    dist_matrix[i, j] = dist_matrix[j, i] = d
+                    
+                except Exception as e:
+                    logger.warning(f"Distance calculation failed for pair ({i}, {j}): {e}")
+                    dist_matrix[i, j] = dist_matrix[j, i] = np.nan
+
+        # 4. Fill failed calculations if any numerical instabilities occurred
+        if np.isnan(dist_matrix).any():
+            logger.warning("NaNs detected in distance matrix. Filling with maximum matrix distance.")
+            dist_matrix = np.nan_to_num(dist_matrix, nan=np.nanmax(dist_matrix))
+
         return dist_matrix
 
 class PersistentHomology:
