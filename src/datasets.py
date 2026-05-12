@@ -126,7 +126,9 @@ class QM9Dataset:
         required_mol_ids: Optional[List[str]] = None,
         embed_seed: int = 40,
         sampling_strategy: str = "stratified",
-        stratify_by: Optional[List[str]] = None,
+        stratify_by: Optional[List[str]] = ["num_atoms", "gap"],
+        stratify_bins: int = 9,         
+        binning_strategy: str = "quantile",    
         injected_molecules: Optional[Union[pl.DataFrame, Sequence[str]]] = None,
         descriptors: Optional[Sequence[str]] = None,
     ):
@@ -138,7 +140,8 @@ class QM9Dataset:
         self.embed_seed = embed_seed
         self.sampling_strategy = sampling_strategy
         self.stratify_by = list(stratify_by or self.DEFAULT_STRATIFY_BY)
-        self.stratify_bins = 10
+        self.stratify_bins = stratify_bins
+        self.binning_strategy = binning_strategy
         self.sampling_seed = 40
         self.min_per_stratum = 1
         self.injected_molecules = injected_molecules
@@ -995,7 +998,7 @@ class QM9Dataset:
         sampled_df = self._sort_by_qm9_id(sampled_df)
         logger.info(
             "QM9 sampling complete: "
-            f"strategy={self.sampling_strategy}, requested_limit={target_size}, returned_rows={sampled_df.height}."
+            f"strategy={self.sampling_strategy}, requested_limit={target_size}, returned_rows={sampled_df.height}, sampling on columns={self.stratify_by if self.sampling_strategy == 'stratified' else 'N/A'}."
         )
         return sampled_df
 
@@ -1043,7 +1046,16 @@ class QM9Dataset:
             if self.stratify_bins <= 1 or val_min == val_max:
                 binned[key] = np.zeros_like(valid_values, dtype=int)
             else:
-                edges = np.linspace(val_min, val_max, self.stratify_bins + 1)
+                if self.binning_strategy == "quantile":
+                    q_edges = np.linspace(0, 1, self.stratify_bins + 1)
+                    edges = np.quantile(valid_values, q_edges)
+                    edges = np.unique(edges) 
+                    if len(edges) < 2:
+                        binned[key] = np.zeros_like(valid_values, dtype=int)
+                        continue
+                else:
+                    edges = np.linspace(val_min, val_max, self.stratify_bins + 1)
+                
                 edges[-1] += 1e-9
                 binned[key] = np.digitize(valid_values, edges, right=False)
 
@@ -1268,7 +1280,11 @@ class QM9Dataset:
         if self.df.is_empty():
             raise ValueError("Dataset is empty. Call `load()` before requesting a distance matrix.")
 
-        descriptor = self._canonical_descriptor(descriptor)
+        if "matrix" in descriptor:
+            descriptor = descriptor
+        else:
+            descriptor = self._canonical_descriptor(descriptor)
+            
         dist_type = str(dist_type).strip().lower()
         dist_type = self.DISTANCE_METRIC_ALIASES.get(dist_type, dist_type)
 

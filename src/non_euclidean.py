@@ -1,6 +1,5 @@
 from typing import Dict, List, Sequence, Literal, Optional, Any
 import json
-from joblib import Parallel, delayed
 import os
 import re
 
@@ -16,10 +15,8 @@ from loguru import logger
 from pymatgen.core import Element
 from pyriemann.utils.distance import pairwise_distance
 from ripser import ripser
-from scipy.linalg import subspace_angles
 from sklearn.decomposition import PCA
 from tqdm import tqdm
-from itertools import combinations
 from sklearn.preprocessing import StandardScaler
 
 def plot_grassmann_scree(
@@ -1049,7 +1046,7 @@ class Riemann:
         raw_matrices = _feature_matrices_from_df(df, descriptor)
 
         # 2. PCA Reduction
-        n_pca = df['num_atoms'].min() - 2
+        n_pca = max(df['num_atoms'].min() - 2, 5)
         raw_matrices = cls.matrix_pca(n_pca, raw_matrices)
 
         # 3. Build SPD Matrices (Empirical Covariance)

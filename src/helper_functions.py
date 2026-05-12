@@ -433,6 +433,10 @@ def _project_distance_matrix(
     method = projection_method.strip().lower()
 
     if method == "pca":
+        # check shape it must not be a distance matrix
+        if dist_matrix.ndim == 2 and dist_matrix.shape[0] == dist_matrix.shape[1]:
+            raise ValueError("PCA projection requires a feature matrix, not a distance matrix.")
+        
         reducer = PCA(n_components=2, random_state=random_state)
         return reducer.fit_transform(dist_matrix)
 
