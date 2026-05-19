@@ -35,7 +35,7 @@ from ase import Atoms
 
 from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
 
-def get_isomers(df: pl.DataFrame) -> pl.DataFrame:
+def get_isomers(df: pl.DataFrame, pure_carbon: bool, n: int) -> pl.DataFrame:
     """
     Return up to ``n`` QM9 rows from the most frequent molecular formula group.
 
@@ -48,18 +48,37 @@ def get_isomers(df: pl.DataFrame) -> pl.DataFrame:
     if "formula" not in df.columns:
         raise ValueError("df must contain a 'formula' column.")
 
+    # 1. Aggregate and count the formulas
     formula_counts = (
         df
         .group_by("formula")
         .len()
-        .sort(["len", "formula"], descending=[True, False])
     )
+
+    # 2. Filter for hydrocarbons if pure_carbon is True
+    # QM9 formulas look like 'C4H10', 'C3H6O', 'C4H7NO2', etc.
+    # A hydrocarbon contains ONLY C and H (no O, N, F, etc.)
+    if pure_carbon:
+        formula_counts = formula_counts.filter(
+            pl.col("formula").str.contains(r"^C\d*(H\d*)?$")
+        )
+
     if formula_counts.is_empty():
+        logger.warning("No formulas matched the specified criteria.")
         return df.clear()
+
+    # 3. Sort to find the most frequent formula after filtering
+    formula_counts = formula_counts.sort(["len", "formula"], descending=[True, False])
 
     top_formula = formula_counts["formula"][0]
     top_count = int(formula_counts["len"][0])
-    isomer_df = df.filter(pl.col("formula") == top_formula)
+    
+    # 4. Filter original dataframe and limit to 'n' rows as per docstring
+    isomer_df = (
+        df
+        .filter(pl.col("formula") == top_formula)
+        .head(n)
+    )
 
     logger.info(
         "Selected most frequent QM9 isomer group: "
@@ -1189,7 +1208,9 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
         if dist_matrix.shape[1] != dist_matrix.shape[0]:
             reducer = UMAP(metric='euclidean', random_state=42)
         else:
-            reducer = UMAP(metric='precomputed', random_state=42)
+            n_neighbours = 5 if dist_matrix.shape[1] < 100 else 15
+            logger.info(f"Projecting using UMAP with n_neighbours = {n_neighbours}")
+            reducer = UMAP(n_neighbors=n_neighbours, metric='precomputed', random_state=42)
         coords = reducer.fit_transform(dist_matrix)
     elif reduction_method == 'PCA':
         pca = PCA(n_components=2, random_state=42)

@@ -16,6 +16,7 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem, BRICS, Descriptors, Fragments, rdMolDescriptors
+from rdkit.Chem import rdMolTransforms
 from rdkit.Chem.Scaffolds import rdScaffoldNetwork
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
