@@ -15,6 +15,7 @@ from loguru import logger
 from pymatgen.core import Element
 from pyriemann.utils.distance import pairwise_distance
 from ripser import ripser
+from sklearn.covariance import ledoit_wolf, oas
 from sklearn.decomposition import PCA
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
@@ -1034,30 +1035,36 @@ class Riemann:
     """
 
     @classmethod
-    def _get_spd_matrices(
+    def get_spd_matrices(
         cls,
         df: Any,
         descriptor: str = 'soap',
-        regularization: float = 1e-3,
-        n_pca: Optional[int] = 30
+        pca=True,
     ) -> np.ndarray:
         
         # 1. Obtain raw feature matrices directly from df
         raw_matrices = _feature_matrices_from_df(df, descriptor)
 
         # 2. PCA Reduction
-        n_pca = max(df['num_atoms'].min() - 2, 5)
-        raw_matrices = cls.matrix_pca(n_pca, raw_matrices)
+        if pca:
+            n_pca = df['num_atoms'].min() - 2
+            raw_matrices = cls.matrix_pca(n_pca, raw_matrices)
 
         # 3. Build SPD Matrices (Empirical Covariance)
         spd_matrices = []
         for X in raw_matrices:
             X = np.asarray(X)
-            # Compute covariance
-            C = (X.T @ X) / X.shape[0]
-            # Regularization to ensure strict positive-definiteness
-            C += np.eye(C.shape[0]) * regularization
+            C, _ = oas(X)
             spd_matrices.append(C)
+
+        for idx, C in enumerate(spd_matrices):
+            if not np.allclose(C, C.T, rtol=1e-5, atol=1e-8):
+                raise ValueError(f"Matrix at index {idx} failed symmetry validation")
+            
+            eigvals = np.linalg.eigvalsh(C)
+            min_eig = eigvals.min()
+            if min_eig <= 0:
+                raise ValueError(f"Matrix at index {idx} has eigenvalue lower than 0")
 
         # Pyriemann expects a 3D array of shape (N_matrices, n_channels, n_channels)
         return np.array(spd_matrices)
@@ -1092,7 +1099,6 @@ class Riemann:
         df: Any,
         descriptor: str = 'soap',
         distance_type: str = "affine-invariant",
-        regularization: float = 1e-3,
     ) -> np.ndarray:
         
         metric_map = {
@@ -1107,10 +1113,9 @@ class Riemann:
         logger.info(f"Computing Riemann distance matrix | Features: {descriptor} | Distance: {distance_type}")
 
         # 1. Build SPD matrices
-        spd_matrices = cls._get_spd_matrices(
+        spd_matrices = cls.get_spd_matrices(
             df=df,
             descriptor=descriptor,
-            regularization=regularization,
         )
         
         # 2. Compute Distances

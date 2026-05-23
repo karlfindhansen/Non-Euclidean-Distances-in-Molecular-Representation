@@ -221,7 +221,7 @@ class MolecularFeaturizer:
         return pl.Series(pooled_name, pooled_values), pl.Series(matrix_name, matrix_values)
 
     @staticmethod
-    def compute_morgan_fingerprints(smiles_series: pl.Series, radius: int = 3, fp_size: int = 2048) -> pl.Series:
+    def compute_morgan_fingerprints(smiles_series: pl.Series, radius: int = 2, fp_size: int = 2048) -> pl.Series:
         logger.info(f"Computing Morgan Fingerprints (Radius={radius}, Size={fp_size})...")
         gen = AllChem.GetMorganGenerator(radius=radius, fpSize=fp_size)
         
@@ -391,7 +391,8 @@ class MolecularFeaturizer:
                 pl.Series("soap_matrix", [None] * n_rows),
             )
 
-        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max}, normalize=True)...")
+        normalize = True
+        logger.info(f"Computing SOAP (rcut={r_cut}, nmax={n_max}, lmax={l_max}, normalize={normalize})...")
         pooled_engine = SOAP(
             species=species,
             periodic=False,
@@ -435,7 +436,7 @@ class MolecularFeaturizer:
                         pooled_engine.create(atoms),
                         output_mode="pooled",
                         reduce="mean",
-                        normalize=True,
+                        normalize=normalize,
                     )
                 )
                 matrix_values.append(
@@ -443,7 +444,7 @@ class MolecularFeaturizer:
                         matrix_engine.create(atoms),
                         output_mode="matrix",
                         reduce="mean",
-                        normalize=True,
+                        normalize=normalize,
                     )
                 )
             except Exception:

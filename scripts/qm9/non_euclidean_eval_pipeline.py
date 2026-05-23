@@ -709,7 +709,7 @@ def evaluate_non_euclidean_combinations(
                 precomputed_feature_matrices=feature_matrices
             )
         elif manifold.lower() == "riemann":
-            items = Riemann._get_spd_matrices(
+            items = Riemann.get_spd_matrices(
                 frames=None,
                 regularization=riemann_regularization,
                 precomputed_feature_matrices=feature_matrices

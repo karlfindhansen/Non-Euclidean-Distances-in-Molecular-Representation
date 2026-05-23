@@ -1145,7 +1145,7 @@ class QM9Dataset:
             logger.debug(f"Molecule embedding failed for SMILES '{smiles}': {e}")
             return None
 
-    def add_morgan_fingerprints(self, radius: int = 3, fp_size: int = 2048) -> None:
+    def add_morgan_fingerprints(self, radius: int = 2, fp_size: int = 2048) -> None:
         self._upsert_descriptor_column(
             "morgan_fingerprint",
             lambda frame: MolecularFeaturizer.compute_morgan_fingerprints(

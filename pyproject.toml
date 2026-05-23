@@ -20,6 +20,7 @@ dependencies = [
     "hdbscan>=0.8.42",
     "ipykernel>=7.1.0",
     "kmedoids>=0.5.4",
+    "lightgbm>=4.6.0",
     "lmdb>=1.7.5",
     "loguru>=0.7.3",
     "mace-torch>=0.3.15",
