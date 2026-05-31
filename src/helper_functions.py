@@ -1292,26 +1292,27 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
             "mol_id": "mol_id",
             "Formula": "formula",
             #"smiles": "canonical_smiles" if "canonical_smiles" in df.columns else "smiles",
-            #"sefiles": "selfies",
+            "selfies": "selfies",
             "num_atoms": "num_atoms",
             "structure_class": "structure_class",
             "functional_groups": "functional_groups",
             "hybridization_ratio": "sp_ratio_set",
             #"scaffold": "scaffold",
-            "outlier_type": "outlier_category",
-            "hdbscan_label": "hdbscan_label",
-            "lof_label": "lof_label",
-            "knn_label": "knn_label",
+            #"outlier_type": "outlier_category",
+            #"hdbscan_label": "hdbscan_label",
+            #"lof_label": "lof_label",
+            #"knn_label": "knn_label",
         }
         for prop_name, col_name in qm9_cols.items():
             if col_name in df.columns:
-                # FIX: Replace SMILES/SELFIES with their lengths directly
-                if prop_name in ["smiles", "sefiles"]:
-                    values = df[col_name].to_list()
+                if prop_name in ["smiles", "selfies"]:
+                    values = df[col_name].fill_null("N/A").to_list()
+                    properties[prop_name] = values
+
+                    # also store lengths
                     properties[prop_name + "_length"] = [
                         len(v) if isinstance(v, str) else 0 for v in values
                     ]
-                # FIX: Properly label non-outliers instead of crashing on 'None'
                 elif col_name == "outlier_category":
                     properties[prop_name] = df[col_name].fill_null("Native QM9").to_list()
                 # FIX: Safety net for any other numerical or categorical nulls
@@ -1319,8 +1320,6 @@ def create_chemiscope_viewer(df, dist_matrix, labels, reduction_method='t-SNE'):
                     properties[prop_name] = df[col_name].fill_null(float('nan')).to_list()
                 else:
                     properties[prop_name] = df[col_name].fill_null("N/A").to_list()
-
-
 
     settings = {
         "map": {

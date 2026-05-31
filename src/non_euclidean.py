@@ -17,6 +17,7 @@ from pyriemann.utils.distance import pairwise_distance
 from ripser import ripser
 from sklearn.covariance import ledoit_wolf, oas
 from sklearn.decomposition import PCA
+from scipy.spatial.distance import cdist
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 
@@ -785,149 +786,122 @@ class Wasserstein:
 
         return dist_matrix
 
+
 class PersistentHomology:
     """
-    Computes topological features (persistence diagrams) from 3D atomic point clouds 
-    and evaluates the structural similarities between different frames using 
-    Bottleneck or Sliced Wasserstein distances.
+    Computes topological features (persistence diagrams) either from physical 3D coordinates
+    or high-dimensional feature spaces (e.g., SOAP matrices treated as point clouds).
     """
 
-    @staticmethod
-    def _compute_ripser(distance_matrix: np.ndarray, max_dim: int) -> Dict[int, np.ndarray]:
-        """Calculates persistence diagrams up to max_dim from a precomputed distance matrix."""
-        # distance_matrix=True is strictly required so ripser doesn't treat the input as a point cloud
-        dgms = ripser(distance_matrix, maxdim=max_dim, distance_matrix=True)["dgms"]
-        
-        # Format output into a dictionary mapping homology dimension to its (birth, death) array
-        return {d: np.asarray(dgms[d]) for d in range(max_dim + 1)}
-
     @classmethod
-    def compute_persistence_diagrams(
-        cls, frames: Sequence[Atoms], max_homology_dim: int = 2
+    def _get_persistence_diagrams(
+        cls,
+        df: Any,
+        descriptor: str = 'soap',
+        max_homology_dim: int = 2
     ) -> List[Dict[int, np.ndarray]]:
-        """Generates persistence diagrams for a sequence of molecular frames."""
-        
-        logger.info(
-            f"Computing persistence diagrams for {len(frames)} frames "
-            f"(max_homology_dim={max_homology_dim})."
-        )
-        
+        """
+        Maps inputs to persistence diagrams. Dynamically switches between physical coordinate 
+        filtration or high-dimensional feature space filtration based on the descriptor parameter.
+        """
         diagrams = []
-
-        for frame in tqdm(frames, desc="Persistence diagrams", unit="frame"):
-            # Handle edge case of an empty simulation frame to prevent Ripser crashes
-            if len(frame) == 0:
-                diagrams.append({d: np.empty((0, 2)) for d in range(max_homology_dim + 1)})
-                continue
-            
-            # Use Minimum Image Convention (MIC) to ensure bonds across periodic 
-            # cell boundaries are calculated at their true shortest distance
-            dist_mat = frame.get_all_distances(mic=True)
-            diagrams.append(cls._compute_ripser(dist_mat, max_homology_dim))
- 
-        logger.success("Finished persistence diagram computation.")
-        return diagrams
-    
-    @staticmethod
-    def distance(
-        dgm1: Dict[int, np.ndarray],
-        dgm2: Dict[int, np.ndarray],
-        metric: str = "bottleneck",
-        dims: Sequence[int] = (0, 1, 2),
-        sw_projections: int = 50
-    ) -> float:
-        """
-        Computes the total topological distance between two diagrams across 
-        specified homology dimensions (e.g., 0=components, 1=loops, 2=voids).
-        """
-        metric_key = metric.lower()
-        if metric_key not in {"bottleneck", "b", "sliced-wasserstein", "sliced_wasserstein", "sw"}:
-            logger.error(f"Unknown persistence metric '{metric}'.")
-            raise ValueError(
-                "metric must be one of: ['bottleneck', 'b', 'sliced-wasserstein', 'sliced_wasserstein', 'sw']"
-            )
-
-        total_dist = 0.0
         
-        for d in dims:
-            # Safely fetch the diagrams for dimension `d`, defaulting to empty if missing
-            p1, p2 = dgm1.get(d, np.empty((0, 2))), dgm2.get(d, np.empty((0, 2)))
-
-            if len(p1) == 0 and len(p2) == 0:
-                continue
+        for row in df.iter_rows(named=True):
             
-            # Filter out features with infinite death times (essential classes) 
-            # since distance metrics require finite bounds to compute properly
-            if len(p1) > 0:
-                p1 = p1[np.isfinite(p1[:, 1])]
-            if len(p2) > 0:
-                p2 = p2[np.isfinite(p2[:, 1])]
-            
-            # Accumulate the calculated distance for this dimension
-            if metric_key in {"bottleneck", "b"}:
-                total_dist += persim.bottleneck(p1, p2)
-            else:
-                total_dist += persim.sliced_wasserstein(p1, p2, M=sw_projections)
+            # --- PATH A: Physical Cartesian Coordinate Space ---
+            if descriptor.lower() == 'coordinates':
+                nums = row["atomic_numbers"]
+                coords = np.array(row["coordinates"], dtype=np.float64)
                 
-        return float(total_dist)
+                if len(coords) == 0:
+                    diagrams.append({d: np.empty((0, 2)) for d in range(max_homology_dim + 1)})
+                    continue
+                    
+                frame = Atoms(numbers=nums, positions=coords)
+                dist_mat = frame.get_all_distances(mic=True)
+                
+            # --- PATH B: High-Dimensional Feature Space (e.g., SOAP) ---
+            else:
+                # Dynamically match column name syntax
+                col_name = "soap_matrix" if descriptor.lower() == "soap" else descriptor
+                X = np.asarray(row[col_name], dtype=np.float64)
+                
+                if len(X) == 0:
+                    diagrams.append({d: np.empty((0, 2)) for d in range(max_homology_dim + 1)})
+                    continue
+                    
+                # Compute distances between atom feature vectors within the single molecule
+                dist_mat = cdist(X, X, metric='euclidean')
+
+            # --- Extract Persistence Topology ---
+            raw_dgms = ripser(dist_mat, maxdim=max_homology_dim, distance_matrix=True)["dgms"]
+            
+            # Pre-filter infinite features for inner-loop speed
+            formatted_dgm = {}
+            for d in range(max_homology_dim + 1):
+                dgm_layer = np.asarray(raw_dgms[d])
+                if len(dgm_layer) > 0:
+                    dgm_layer = dgm_layer[np.isfinite(dgm_layer[:, 1])]
+                formatted_dgm[d] = dgm_layer
+                
+            diagrams.append(formatted_dgm)
+            
+        return diagrams
 
     @classmethod
     def distance_matrix(
         cls,
-        frames: Sequence[Atoms],
+        df: Any,
+        descriptor: str = 'soap',
         metric: str = "bottleneck",
         max_homology_dim: int = 2,
         homology_dims: Sequence[int] = (0, 1, 2),
-        cache_dir: Optional[str] = None,
-        force_recalculate: bool = False,
+        sw_projections: int = 50
     ) -> np.ndarray:
         """
-        Generates a symmetric pairwise distance matrix comparing the topological 
-        features of all molecular frames in the sequence.
+        Computes a symmetric pairwise persistent homology distance matrix.
+        Allows explicit selection of the underlying input representation via the 'descriptor' argument.
         """
-        mol_ids = _mol_ids_from_frames(frames)
-        resolved_cache_dir = cache_dir or _non_euclidean_cache_dir_for_frames(frames)
-        cache_params = {
-            "metric": metric,
-            "max_homology_dim": int(max_homology_dim),
-            "homology_dims": [int(d) for d in homology_dims],
-        }
-        cached = _load_cached_distance_matrix(
-            method_name="persistent_homology",
-            mol_ids=mol_ids,
-            params=cache_params,
-            cache_dir=resolved_cache_dir,
-            force_recalculate=force_recalculate,
-        )
-        if cached is not None:
-            return cached
+        metric_key = metric.lower()
+        valid_metrics = {"bottleneck", "b", "sliced-wasserstein", "sliced_wasserstein", "sw"}
+        if metric_key not in valid_metrics:
+            raise ValueError(f"Unknown metric: '{metric}'. Must be one of {valid_metrics}.")
 
-        _log_distance_dataset_from_ids("persistent homology", mol_ids)
-        logger.info(
-            f"Computing persistent homology distance matrix for {len(frames)} frames "
-            f"(metric='{metric}', max_homology_dim={max_homology_dim}, "
-            f"dims={tuple(homology_dims)})."
-        )
+        # Generate persistence representations based on requested input domain
+        dgms = cls._get_persistence_diagrams(df=df, descriptor=descriptor, max_homology_dim=max_homology_dim)
         
-        # Precompute all diagrams
-        dgms = cls.compute_persistence_diagrams(frames, max_homology_dim)
-        n = len(dgms)
-        dist_mat = _pairwise_distance_matrix(
-            n=n,
-            pair_fn=lambda i, j: cls.distance(dgms[i], dgms[j], metric=metric, dims=homology_dims),
-            desc="Persistence distances",
-        )
+        num_items = len(dgms)
+        dist_matrix = np.zeros((num_items, num_items))
+        
+        logger.info(f"Computing PH distance matrix | Domain: {descriptor} | Metric: {metric} | Max Dim: {max_homology_dim}")
+        
+        # Upper-triangular matrix computation loop
+        for i in tqdm(range(num_items), desc="Persistence distances", unit="row"):
+            dgm_i = dgms[i]
+            
+            for j in range(i + 1, num_items):
+                dgm_j = dgms[j]
+                total_dist = 0.0
+                
+                for d in homology_dims:
+                    p1 = dgm_i.get(d, np.empty((0, 2)))
+                    p2 = dgm_j.get(d, np.empty((0, 2)))
+                    
+                    if len(p1) == 0 and len(p2) == 0:
+                        continue
+                    
+                    if metric_key in {"bottleneck", "b"}:
+                        total_dist += persim.bottleneck(p1, p2)
+                    else:
+                        total_dist += persim.sliced_wasserstein(p1, p2, M=sw_projections)
+                
+                dist_matrix[i, j] = dist_matrix[j, i] = float(total_dist)
 
-        _save_cached_distance_matrix(
-            dist_mat,
-            method_name="persistent_homology",
-            mol_ids=mol_ids,
-            params=cache_params,
-            cache_dir=resolved_cache_dir,
-        )
+        if np.isnan(dist_matrix).any():
+            logger.warning("NaNs detected in distance matrix. Filling with maximum matrix distance.")
+            dist_matrix = np.nan_to_num(dist_matrix, nan=np.nanmax(dist_matrix))
 
-        logger.success("Finished persistent homology distance matrix computation.")
-        return dist_mat
+        return dist_matrix
 
 class Grassmann:
     """
@@ -941,14 +915,10 @@ class Grassmann:
         df: Any,
         descriptor: str = 'soap',
         k: int = 3, 
-        vector_side: str = "right"
     ) -> List[np.ndarray]:
         """
         Maps 3D atomic coordinates to an orthonormal basis in R^D (feature space) via SVD.
         """
-        vector_side = vector_side.strip().lower()
-        if vector_side not in {"left", "right"}:
-            raise ValueError("vector_side must be either 'left' or 'right'.")
 
         bases = []
         raw_matrices = _feature_matrices_from_df(df, descriptor)
@@ -957,8 +927,8 @@ class Grassmann:
             X = np.asarray(X, dtype=np.float64)
             
             # SVD on X (N x D): U is (N, M), S is (M,), Vh is (M, D)
-            u, _, vh = np.linalg.svd(X, full_matrices=False)
-            basis = u[:, :k] if vector_side == "left" else vh.T[:, :k]
+            _, _, vh = np.linalg.svd(X, full_matrices=False)
+            basis = vh.T[:, :k]
             bases.append(basis)
         
         return bases
@@ -970,7 +940,6 @@ class Grassmann:
         descriptor: str = 'soap',
         distance_type: str = "geodesic",
         k: int = 3, 
-        vector_side: str = "right",
     ) -> np.ndarray:
         """
         Computes a symmetric pairwise distance matrix on the Grassmann Manifold.
@@ -985,7 +954,6 @@ class Grassmann:
             df=df,
             descriptor=descriptor,
             k=k, 
-            vector_side=vector_side
         )
         
         num_items = len(bases)
@@ -1054,7 +1022,7 @@ class Riemann:
         spd_matrices = []
         for X in raw_matrices:
             X = np.asarray(X)
-            C, _ = oas(X)
+            C, _ = oas(X, assume_centered=False)
             spd_matrices.append(C)
 
         for idx, C in enumerate(spd_matrices):
@@ -1099,6 +1067,7 @@ class Riemann:
         df: Any,
         descriptor: str = 'soap',
         distance_type: str = "affine-invariant",
+        pca : bool = False,
     ) -> np.ndarray:
         
         metric_map = {
@@ -1116,12 +1085,13 @@ class Riemann:
         spd_matrices = cls.get_spd_matrices(
             df=df,
             descriptor=descriptor,
+            pca=pca,
         )
         
         # 2. Compute Distances
-        # This replaces the manual loops, generalized eigenvalue calculations, and joblib parallelization.
         logger.info(f"Computing {distance_type} distances...")
         dist_matrix = pairwise_distance(spd_matrices, metric=pyriemann_metric)
+        np.fill_diagonal(dist_matrix, 0)
 
         # Fallback for severe numerical instability
         if np.isnan(dist_matrix).any():
