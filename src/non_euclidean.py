@@ -1,7 +1,5 @@
-from typing import Dict, List, Sequence, Literal, Optional, Any
-import json
-import os
-import re
+from typing import Dict, List, Sequence, Optional, Any
+import warnings
 
 import numpy as np
 import ot
@@ -9,260 +7,15 @@ import persim
 import polars as pl
 
 from ase import Atoms
-from ase.data import covalent_radii
-from ase.neighborlist import neighbor_list
+from dscribe.kernels import REMatchKernel as DScribeREMatchKernel
 from loguru import logger
-from pymatgen.core import Element
 from pyriemann.utils.distance import pairwise_distance
 from ripser import ripser
-from sklearn.covariance import ledoit_wolf, oas
+from sklearn.covariance import oas
 from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import pairwise_kernels
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler
-
-def plot_grassmann_scree(
-    df: Any,
-    descriptor: str = 'soap',
-    k: Optional[int] = None,
-    cumulative_thresholds: tuple = (0.8, 0.9, 0.95),
-    show_individual: bool = False,
-    show: bool = True,
-    save_path: Optional[str] = None,
-    title: Optional[str] = None,
-    figsize: tuple = (9, 6),
-) -> Dict[str, Any]:
-    """
-    Plot a scree curve for choosing the Grassmann subspace dimension (k).
-    Moved outside the Grassmann distance calculation class to enforce separation of concerns.
-    """
-    import matplotlib.pyplot as plt
-
-    raw_matrices = _feature_matrices_from_df(df, descriptor)
-    if not raw_matrices:
-        raise ValueError("No feature matrices were provided.")
-
-    variance_ratios = []
-    singular_values = []
-    max_components = 0
-    
-    for idx, matrix in enumerate(raw_matrices):
-        X = np.asarray(matrix, dtype=np.float64)
-        if X.ndim == 0:
-            X = X.reshape(1, 1)
-        elif X.ndim == 1:
-            X = X.reshape(1, -1)
-        elif X.ndim > 2:
-            X = X.reshape(X.shape[0], -1)
-
-        if X.size == 0:
-            continue
-
-        _, s, _ = np.linalg.svd(X, full_matrices=False)
-        variances = s ** 2
-        total_variance = float(np.sum(variances))
-        
-        if total_variance <= 0:
-            continue
-
-        ratios = variances / total_variance
-        variance_ratios.append(ratios)
-        singular_values.append(s)
-        max_components = max(max_components, len(ratios))
-
-    if not variance_ratios:
-        raise ValueError("Could not compute variance ratios.")
-
-    plot_k = k or max_components
-    plot_k = min(plot_k, max_components)
-    
-    padded_ratios = np.zeros((len(variance_ratios), plot_k), dtype=np.float64)
-    for idx, ratios in enumerate(variance_ratios):
-        n = min(plot_k, len(ratios))
-        padded_ratios[idx, :n] = ratios[:n]
-
-    mean_variance_ratio = np.mean(padded_ratios, axis=0)
-    cumulative_variance_ratio = np.cumsum(mean_variance_ratio)
-    components = np.arange(1, plot_k + 1)
-
-    threshold_k: Dict[float, Optional[int]] = {}
-    for threshold in cumulative_thresholds:
-        reached = np.where(cumulative_variance_ratio >= threshold)[0]
-        threshold_k[threshold] = int(reached[0] + 1) if reached.size else None
-
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, ax1 = plt.subplots(figsize=figsize)
-    
-    ax1.bar(
-        components,
-        mean_variance_ratio,
-        width=0.75,
-        color="#4C78A8",
-        alpha=0.85,
-        label="Mean variance per vector",
-    )
-    ax1.set_xlabel("Number of Grassmann vectors (k)")
-    ax1.set_ylabel("Mean explained variance ratio")
-    
-    if plot_k <= 30:
-        ax1.set_xticks(components)
-    else:
-        tick_positions = np.unique(np.linspace(1, plot_k, num=10, dtype=int))
-        ax1.set_xticks(tick_positions)
-        
-    ax1.set_ylim(bottom=0)
-    ax2 = ax1.twinx()
-    
-    if show_individual:
-        for ratios in variance_ratios:
-            individual = np.zeros(plot_k, dtype=np.float64)
-            n = min(plot_k, len(ratios))
-            individual[:n] = ratios[:n]
-            ax2.plot(components, np.cumsum(individual), color="#9ecae9", alpha=0.25, linewidth=1)
-
-    ax2.plot(
-        components,
-        cumulative_variance_ratio,
-        color="#F58518",
-        marker="o",
-        linewidth=2,
-        label="Cumulative mean variance",
-    )
-    ax2.set_ylabel("Cumulative explained variance ratio")
-    ax2.set_ylim(0, min(1.05, max(1.0, float(cumulative_variance_ratio[-1]) * 1.05)))
-
-    for threshold, selected_k in threshold_k.items():
-        ax2.axhline(threshold, color="#666666", linestyle="--", linewidth=1, alpha=0.45)
-        if selected_k is not None:
-            ax2.axvline(selected_k, color="#666666", linestyle=":", linewidth=1, alpha=0.45)
-            ax2.text(
-                selected_k,
-                threshold,
-                f" k={selected_k} ({threshold:.0%})",
-                va="bottom",
-                ha="left",
-                fontsize=9,
-                color="#444444",
-            )
-
-    ax1.set_title(title or f"Grassmann Scree Plot ({len(variance_ratios)} structures)")
-    ax1.spines["top"].set_visible(False)
-    ax2.spines["top"].set_visible(False)
-    
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", frameon=True)
-    fig.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-        logger.info(f"Saved Grassmann scree plot to {save_path}")
-        
-    if show:
-        plt.show()
-
-    return {
-        "fig": fig,
-        "mean_variance_ratio": mean_variance_ratio,
-        "cumulative_variance_ratio": cumulative_variance_ratio,
-        "threshold_k": threshold_k,
-    }
-
-def _ensure_feature_matrix_d_by_n(
-    matrix: np.ndarray,
-    input_orientation: Literal["rowwise", "columnwise"] = "rowwise",
-) -> np.ndarray:
-    """
-    Normalize an input feature matrix to shape (D, N_samples_per_structure).
-    `rowwise` expects (N, D) and converts to (D, N).
-    `columnwise` expects (D, N) and preserves that convention.
-    """
-    arr = np.asarray(matrix, dtype=np.float64)
-    if arr.ndim == 0:
-        arr = arr.reshape(1, 1)
-    elif arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    elif arr.ndim > 2:
-        arr = arr.reshape(arr.shape[0], -1)
-
-    if arr.size == 0:
-        return arr.reshape(0, 0)
-
-    if input_orientation == "rowwise":
-        return arr.T
-    if input_orientation == "columnwise":
-        return arr
-
-    raise ValueError(f"Unknown input_orientation '{input_orientation}'.")
-
-
-def _ensure_feature_matrix_n_by_d(
-    matrix: np.ndarray,
-    input_orientation: Literal["rowwise", "columnwise"] = "rowwise",
-) -> np.ndarray:
-    """
-    Normalize an input feature matrix to shape (N_samples_per_structure, D).
-    `rowwise` expects (N, D) and preserves that convention.
-    `columnwise` expects (D, N) and converts to (N, D).
-    """
-    arr = np.asarray(matrix, dtype=np.float64)
-    if arr.ndim == 0:
-        arr = arr.reshape(1, 1)
-    elif arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    elif arr.ndim > 2:
-        arr = arr.reshape(arr.shape[0], -1)
-
-    if arr.size == 0:
-        return arr.reshape(0, 0)
-
-    if input_orientation == "rowwise":
-        return arr
-    if input_orientation == "columnwise":
-        return arr.T
-
-    raise ValueError(f"Unknown input_orientation '{input_orientation}'.")
-
-
-def _feature_input_orientation(feature_type: str) -> Literal["rowwise", "columnwise"]:
-    """
-    External invariant features are historically passed as (D, N).
-    All structure-level descriptor vectors such as SOAP/ACSF/MACE are treated as (N, D).
-    """
-    return "columnwise" if str(feature_type).lower() == "invariant" else "rowwise"
-
-
-def _coerce_external_feature_collection(
-    feature_matrices: Sequence[np.ndarray] | np.ndarray,
-) -> List[np.ndarray]:
-    """
-    Accept either:
-    - a sequence of per-structure feature matrices/vectors, or
-    - a single 2D (N_structures, D_features) descriptor matrix.
-    """
-    if isinstance(feature_matrices, np.ndarray):
-        arr = np.asarray(feature_matrices, dtype=np.float64)
-        if arr.ndim == 0:
-            return [arr.reshape(1, 1)]
-        if arr.ndim == 1:
-            return [arr.reshape(1, -1)]
-        if arr.ndim == 2:
-            return [row.reshape(1, -1) for row in arr]
-        if arr.ndim == 3:
-            return [arr[i] for i in range(arr.shape[0])]
-        raise ValueError(
-            "feature_matrices must be a 1D/2D/3D array or a sequence of per-structure matrices."
-        )
-
-    matrices = list(feature_matrices)
-    if not matrices:
-        return []
-
-    first = np.asarray(matrices[0])
-    if first.ndim <= 1:
-        return [np.asarray(matrix, dtype=np.float64).reshape(1, -1) for matrix in matrices]
-
-    return [np.asarray(matrix, dtype=np.float64) for matrix in matrices]
 
 
 def _descriptor_matrix_column(descriptor: str) -> str:
@@ -281,41 +34,6 @@ def _descriptor_matrix_column(descriptor: str) -> str:
             f"Unknown descriptor '{descriptor}'. Expected one of: soap, acsf, mace."
         )
     return column
-
-
-def _is_dataframe_like(value: Any) -> bool:
-    return isinstance(value, pl.DataFrame) or (
-        value is not None
-        and hasattr(value, "columns")
-        and hasattr(value, "__getitem__")
-    )
-
-
-def _normalize_distance_matrix_inputs(
-    frames: Any,
-    df: Any,
-    descriptor: str,
-) -> tuple[Any, Any, str]:
-    """
-    Allows notebook-friendly calls such as:
-        Grassmann.distance_matrix(df, descriptor="mace")
-        Grassmann.distance_matrix(df, "mace")
-
-    The second form arrives as `df="mace"` because `frames` is the first
-    positional parameter, so normalize it before any cache or feature handling.
-    """
-    if not _is_dataframe_like(frames):
-        return frames, df, descriptor
-
-    if isinstance(df, str):
-        descriptor = df
-    elif df is not None:
-        raise ValueError(
-            "When passing a dataframe as the first argument, the second positional "
-            "argument must be the descriptor string."
-        )
-
-    return None, frames, descriptor
 
 
 def _feature_matrices_from_df(
@@ -359,370 +77,161 @@ def _feature_matrices_from_df(
     return matrices
 
 
-def _id_column_from_df(df: Any) -> str:
-    if df is None:
-        raise ValueError("A dataframe must be provided.")
+class REMatch:
+    """
+    Computes DScribe REMatch kernel distances between atom-wise descriptor matrices.
+    """
 
-    if isinstance(df, pl.DataFrame):
-        columns = set(df.columns)
-    else:
-        columns = set(getattr(df, "columns", []))
+    @classmethod
+    def _clean_descriptor_matrices(
+        cls,
+        raw_matrices: Sequence[np.ndarray],
+        tol: float = 1e-3,
+        normalize: bool = True,
+    ) -> List[np.ndarray]:
+        cleaned: List[np.ndarray] = []
+        normalized_count = 0
 
-    if "mol_id" in columns:
-        return "mol_id"
-    if "material_id" in columns:
-        return "material_id"
+        for idx, matrix in enumerate(raw_matrices):
+            X = np.asarray(matrix, dtype=np.float64)
 
-    raise ValueError(
-        "Dataframe must contain either a 'mol_id' or 'material_id' column "
-        "for distance-matrix caching."
-    )
+            if X.ndim != 2:
+                raise ValueError(f"Descriptor matrix {idx} is not 2D: shape={X.shape}")
+            if X.size == 0:
+                raise ValueError(f"Descriptor matrix {idx} is empty.")
+            if not np.isfinite(X).all():
+                raise ValueError(f"Non-finite values in descriptor matrix {idx}.")
 
+            if normalize:
+                norms = np.linalg.norm(X, axis=1)
+                already_normalized = np.all(np.abs(norms - 1.0) < tol)
 
-def _mol_ids_from_df(df: Any) -> List[str]:
-    id_column = _id_column_from_df(df)
+                if already_normalized:
+                    X_norm = X
+                    normalized_count += 1
+                else:
+                    X_norm = X / (norms[:, None] + 1e-12)
+            else:
+                X_norm = X
 
-    if isinstance(df, pl.DataFrame):
-        return [str(mol_id) for mol_id in df[id_column].to_list()]
+            if not np.isfinite(X_norm).all():
+                raise ValueError(f"NaN/inf after normalization in descriptor matrix {idx}.")
 
-    try:
-        values = df[id_column].to_list()
-    except Exception as e:
-        raise ValueError(f"Could not extract '{id_column}' from dataframe-like input.") from e
-    return [str(mol_id) for mol_id in values]
+            cleaned.append(X_norm)
 
-
-def _mol_ids_from_frames(frames: Sequence[Atoms]) -> List[str]:
-    mol_ids: List[str] = []
-    for idx, frame in enumerate(frames):
-        mol_id = frame.info.get("mol_id", frame.info.get("material_id"))
-        if mol_id is None:
-            raise ValueError(
-                f"Frame at index {idx} is missing info['mol_id'] or info['material_id']; "
-                "this is required for persistent-homology caching."
+        if normalize and normalized_count == len(cleaned):
+            logger.info("All descriptor matrices are already normalized.")
+        elif normalize and normalized_count > 0:
+            logger.info(
+                f"{normalized_count}/{len(cleaned)} descriptor matrices were already normalized."
             )
-        mol_ids.append(str(mol_id))
-    return mol_ids
 
+        return cleaned
 
-def _maybe_mol_ids_from_frames(frames: Sequence[Atoms] | None) -> Optional[List[str]]:
-    if frames is None:
-        return None
+    @classmethod
+    def kernel_matrix(
+        cls,
+        df: Any,
+        descriptor: str = "soap",
+        metric: str = "linear",
+        alpha: float = 0.1,
+        tol: float = 1e-3,
+        normalize: bool = True,
+        threshold: Optional[float] = None,
+        gamma: Optional[float] = None,
+        degree: float = 3,
+        coef0: float = 1,
+        kernel_params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Computes the regularized REMatch transport kernel matrix directly.
 
-    mol_ids: List[str] = []
-    for frame in frames:
-        mol_id = frame.info.get("mol_id", frame.info.get("material_id"))
-        if mol_id is None:
+        Returns None if DScribe's REMatchKernel produces non-finite values.
+        """
+        raw_matrices = _feature_matrices_from_df(df, descriptor)
+        if not raw_matrices:
+            return np.array([])
+
+        cleaned = cls._clean_descriptor_matrices(
+            raw_matrices=raw_matrices,
+            tol=tol,
+            normalize=normalize,
+        )
+
+        kernel_kwargs = {
+            "metric": metric,
+            "alpha": alpha,
+            "gamma": gamma,
+            "degree": degree,
+            "coef0": coef0,
+            "kernel_params": kernel_params,
+        }
+        if threshold is not None:
+            kernel_kwargs["threshold"] = threshold
+
+        logger.info(
+            f"Computing REMatch regularized transport kernel | Features: {descriptor} | "
+            f"Metric: {metric} | alpha: {alpha}"
+        )
+
+        kernel = DScribeREMatchKernel(**kernel_kwargs)
+        K = kernel.create(cleaned)
+
+        # If DScribe outputs non-finite matrices, drop out early and return None
+        if not np.isfinite(K).all():
+            logger.warning("DScribe REMatch returned NaN/inf. Aborting calculation.")
             return None
-        mol_ids.append(str(mol_id))
-    return mol_ids
 
-
-def _default_non_euclidean_cache_dir(dataset: str = "QM9") -> str:
-    repo_root = os.path.dirname(os.path.dirname(__file__))
-    return os.path.join(repo_root, "data", dataset, "non_euclidean_cache")
-
-
-def _non_euclidean_cache_dir_for_df(df: Any) -> str:
-    id_column = _id_column_from_df(df)
-    dataset = "Materials Project" if id_column == "material_id" else "QM9"
-    return _default_non_euclidean_cache_dir(dataset)
-
-
-def _non_euclidean_cache_dir_for_frames(frames: Sequence[Atoms]) -> str:
-    has_material_ids = any(frame.info.get("material_id") is not None for frame in frames)
-    dataset = "Materials Project" if has_material_ids else "QM9"
-    return _default_non_euclidean_cache_dir(dataset)
-
-
-def _cache_key_payload(
-    method_name: str,
-    mol_ids: Sequence[str],
-    params: Dict[str, Any],
-) -> Dict[str, Any]:
-    return {
-        "method": method_name,
-        "mol_ids": list(mol_ids),
-        "params": params,
-    }
-
-
-def _sanitize_cache_token(value: Any) -> str:
-    token = str(value).strip().lower()
-    token = token.replace(" ", "-").replace("_", "-")
-    token = re.sub(r"[^a-z0-9.-]+", "-", token)
-    token = re.sub(r"-{2,}", "-", token).strip("-")
-    return token or "value"
-
-
-def _dataset_label_from_ids(mol_ids: Sequence[str]) -> str:
-    ids = [str(mol_id).strip().lower() for mol_id in mol_ids]
-    if any(mol_id.startswith("qm9_") for mol_id in ids):
-        return "QM9"
-    if any(
-        mol_id.startswith(("mp-", "mvc-", "material", "synthetic-"))
-        for mol_id in ids
-    ):
-        return "Materials Project"
-    return "Materials Project"
-
-
-def _log_distance_dataset_from_ids(method_name: str, mol_ids: Sequence[str] | None) -> None:
-    if mol_ids is None:
-        return
-    logger.info(
-        f"Using {_dataset_label_from_ids(mol_ids)} ids for {method_name} "
-        f"distance matrix (n={len(mol_ids)})."
-    )
-
-
-def _cache_file_stem(
-    method_name: str,
-    mol_ids: Sequence[str],
-    params: Dict[str, Any],
-) -> str:
-    descriptor = _sanitize_cache_token(params.get("descriptor", "unknown"))
-    dataset = _sanitize_cache_token(_dataset_label_from_ids(mol_ids))
-    stem_parts = [method_name, dataset, f"n{len(mol_ids)}", descriptor]
-
-    if method_name == "wasserstein":
-        stem_parts.append(_sanitize_cache_token(params.get("metric", "sqeuclidean")))
-    elif method_name == "grassmann":
-        stem_parts.append(f"k{int(params.get('k', 0))}")
-        stem_parts.append(_sanitize_cache_token(params.get("method", "svd")))
-        stem_parts.append(_sanitize_cache_token(params.get("vector_side", "left")))
-        stem_parts.append("norm" if bool(params.get("normalized", True)) else "raw")
-    elif method_name == "riemann":
-        stem_parts.append(_sanitize_cache_token(params.get("metric", "affine-invariant")))
-        n_pca = params.get("n_pca", None)
-        stem_parts.append("nopca" if n_pca is None else f"pca{int(n_pca)}")
-    elif method_name == "persistent_homology":
-        stem_parts.append(_sanitize_cache_token(params.get("metric", "bottleneck")))
-        stem_parts.append(f"maxdim{int(params.get('max_homology_dim', 2))}")
-        dims = params.get("homology_dims", ())
-        dims_token = "-".join(str(int(d)) for d in dims) if dims else "none"
-        stem_parts.append(f"dims{dims_token}")
-
-    return "_".join(stem_parts)
-
-
-def _cache_paths(cache_dir: str, stem: str, index: Optional[int] = None) -> tuple[str, str]:
-    suffix = "" if index is None else f"_{index}"
-    return (
-        os.path.join(cache_dir, f"{stem}{suffix}.npy"),
-        os.path.join(cache_dir, f"{stem}{suffix}.json"),
-    )
-
-
-def _load_cached_distance_matrix(
-    method_name: str,
-    mol_ids: Sequence[str],
-    params: Dict[str, Any],
-    cache_dir: str,
-    force_recalculate: bool = False,
-) -> Optional[np.ndarray]:
-    stem = _cache_file_stem(method_name, mol_ids, params)
-
-    if force_recalculate or not os.path.isdir(cache_dir):
-        return None
-
-    for filename in sorted(os.listdir(cache_dir)):
-        if not filename.startswith(stem) or not filename.endswith(".json"):
-            continue
-
-        meta_path = os.path.join(cache_dir, filename)
-        matrix_path = meta_path[:-5] + ".npy"
-        if not os.path.exists(matrix_path):
-            continue
-
-        try:
-            with open(meta_path, "r", encoding="utf-8") as handle:
-                metadata = json.load(handle)
-        except Exception as e:
-            logger.warning(f"Failed to read non-Euclidean cache metadata from {meta_path}: {e}")
-            continue
-
-        if metadata.get("mol_ids") != list(mol_ids):
-            continue
-        if metadata.get("params") != params:
-            continue
-
-        logger.info(f"Loading cached {method_name} distance matrix from {matrix_path}")
-        return np.load(matrix_path)
-
-    return None
-
-
-def _save_cached_distance_matrix(
-    matrix: np.ndarray,
-    method_name: str,
-    mol_ids: Sequence[str],
-    params: Dict[str, Any],
-    cache_dir: str,
-) -> None:
-    os.makedirs(cache_dir, exist_ok=True)
-    payload = _cache_key_payload(method_name, mol_ids, params)
-    stem = _cache_file_stem(method_name, mol_ids, params)
-
-    chosen_index: Optional[int] = None
-    for candidate in [None] + list(range(1, 10_000)):
-        matrix_path, meta_path = _cache_paths(cache_dir, stem, candidate)
-        if not (os.path.exists(matrix_path) and os.path.exists(meta_path)):
-            chosen_index = candidate
-            break
-
-        try:
-            with open(meta_path, "r", encoding="utf-8") as handle:
-                metadata = json.load(handle)
-        except Exception:
-            chosen_index = candidate
-            break
-
-        if metadata.get("mol_ids") == list(mol_ids) and metadata.get("params") == params:
-            chosen_index = candidate
-            break
-
-    matrix_path, meta_path = _cache_paths(cache_dir, stem, chosen_index)
-
-    np.save(matrix_path, matrix)
-    with open(meta_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-    logger.success(f"Saved cached {method_name} distance matrix to {matrix_path}")
-
-
-def _normalize_external_feature_matrices_d_by_n(
-    feature_matrices: Sequence[np.ndarray] | np.ndarray,
-    feature_type: str,
-) -> List[np.ndarray]:
-    input_orientation = _feature_input_orientation(feature_type)
-    return [
-        _ensure_feature_matrix_d_by_n(matrix, input_orientation=input_orientation)
-        for matrix in _coerce_external_feature_collection(feature_matrices)
-    ]
-
-
-def _normalize_external_feature_matrices_n_by_d(
-    feature_matrices: Sequence[np.ndarray] | np.ndarray,
-    feature_type: str,
-) -> List[np.ndarray]:
-    input_orientation = _feature_input_orientation(feature_type)
-    return [
-        _ensure_feature_matrix_n_by_d(matrix, input_orientation=input_orientation)
-        for matrix in _coerce_external_feature_collection(feature_matrices)
-    ]
-
-
-def _compute_invariant_feature_matrix(frame: Atoms, cutoff: float = 1.8) -> np.ndarray:
-    """
-    Maps a molecule to a D x N matrix of invariant physical features.
-    D is the fixed ambient dimension. N is the number of atoms.
-    """
-    features = []
-    # Center of mass acts as an invariant spatial anchor
-    com = frame.get_center_of_mass()
-
-    i_list, j_list, d_list = neighbor_list("ijd", frame, cutoff)
-
-    neighbors = {i: [] for i in range(len(frame))}
-    distances = {i: [] for i in range(len(frame))}
-
-    for i, j, d in zip(i_list, j_list, d_list):
-        neighbors[i].append(frame[j].number)
-        distances[i].append(d)
-
-    for i, atom in enumerate(frame):
-        z = atom.number
-        rad = covalent_radii[z]
-        el = Element.from_Z(z)
-        en = el.X if el.X else 0.0
-        mendeleev = el.mendeleev_no if el.mendeleev_no else 0
-        ion_en = el.ionization_energy if el.ionization_energy else 0.0
-
-        mass = atom.mass
-
-        # Geometric invariance: distance to center of mass
-        dist_to_com = np.linalg.norm(atom.position - com)
-
-        coord = len(set(neighbors[i]))
-
-        if coord > 0:
-            avg_neighbor_z = np.mean(neighbors[i])
-            avg_neighbor_dist = np.mean(distances[i])
-        else:
-            avg_neighbor_z = 0
-            avg_neighbor_dist = 0
-
-        feat_vector = [
-            coord,
-            mendeleev,
-            ion_en,
-        ]
-
-        features.append(feat_vector)
-    #logger.info(f"Computed invariant feature matrix consisting of coordination, mendeleev, and ionization energy for frame with {len(frame)} atoms.")
-    return np.array(features).T
-
-
-def _compute_feature_matrices(
-    frames: Sequence[Atoms],
-    normalized: bool = True,
-) -> List[np.ndarray]:
-    """
-    Builds invariant feature matrices for all frames.
-
-    If normalized=True, applies a global StandardScaler across all atoms
-    in the dataset (fit on the stacked per-atom features).
-    """
-    raw_matrices = [_compute_invariant_feature_matrix(f) for f in frames]
-
-    if not normalized:
-        return raw_matrices
-
-    if not raw_matrices:
-        return raw_matrices
-
-    stacked = np.vstack([m.T for m in raw_matrices if m.size > 0]) if raw_matrices else np.empty((0, 0))
-
-    if stacked.size == 0:
-        return raw_matrices
-
-    scaler = StandardScaler().fit(stacked)
-
-    scaled_matrices = []
-    for raw in raw_matrices:
-        if raw.size == 0:
-            scaled_matrices.append(raw)
-            continue
-        scaled_matrices.append(scaler.transform(raw.T).T)
-
-    return scaled_matrices
-
-def _compute_soap_feature_matrices(frames: Sequence[Atoms]) -> List[np.ndarray]:
-    """
-    Builds invariant soap feature matrices for all frames.
-    """
-    return [
-        _ensure_feature_matrix_d_by_n(frame.soap, input_orientation="rowwise")
-        for frame in frames
-    ]
-
-
-def _pairwise_distance_matrix(
-    n: int,
-    pair_fn,
-    desc: str
-) -> np.ndarray:
-    dist_matrix = np.zeros((n, n))
-    total_pairs = n * (n - 1) // 2
-
-    with tqdm(total=total_pairs, desc=desc, unit="pair") as pbar:
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = pair_fn(i, j)
-                dist_matrix[i, j] = dist_matrix[j, i] = d
-                pbar.update(1)
-
-    return dist_matrix
+        return K
+
+    @classmethod
+    def distance_matrix(
+        cls,
+        df: Any,
+        descriptor: str = "soap",
+        metric: str = "linear",
+        alpha: float = 0.1,
+        tol: float = 1e-3,
+        normalize: bool = True,
+        threshold: Optional[float] = None,
+        gamma: Optional[float] = None,
+        degree: float = 3,
+        coef0: float = 1,
+        kernel_params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Computes a REMatch kernel distance matrix from atom-wise descriptor matrices.
+
+        Uses DScribe's REMatchKernel and converts the resulting similarity kernel K
+        to distances via sqrt(K_ii + K_jj - 2 K_ij). Returns None if the kernel
+        computation fails or produces non-finite values.
+        """
+        K = cls.kernel_matrix(
+            df=df,
+            descriptor=descriptor,
+            metric=metric,
+            alpha=alpha,
+            tol=tol,
+            normalize=normalize,
+            threshold=threshold,
+            gamma=gamma,
+            degree=degree,
+            coef0=coef0,
+            kernel_params=kernel_params,
+        )
+
+        if K is None:
+            return None
+
+        diag = np.diag(K)
+        dist_sq = diag[:, None] + diag[None, :] - 2.0 * K
+        dist_sq = np.clip(dist_sq, 0.0, None)
+        dist_matrix = np.sqrt(dist_sq)
+
+        np.fill_diagonal(dist_matrix, 0.0)
+        dist_matrix = (dist_matrix + dist_matrix.T) / 2.0
+
+        return dist_matrix
 
 class Wasserstein:
     """
@@ -818,7 +327,8 @@ class PersistentHomology:
                     continue
                     
                 frame = Atoms(numbers=nums, positions=coords)
-                dist_mat = frame.get_all_distances(mic=True)
+                #is_material = any(row.get("material_id")) 
+                dist_mat = frame.get_all_distances(mic=False)
                 
             # --- PATH B: High-Dimensional Feature Space (e.g., SOAP) ---
             else:
@@ -840,8 +350,10 @@ class PersistentHomology:
             formatted_dgm = {}
             for d in range(max_homology_dim + 1):
                 dgm_layer = np.asarray(raw_dgms[d])
-                if len(dgm_layer) > 0:
-                    dgm_layer = dgm_layer[np.isfinite(dgm_layer[:, 1])]
+                if d == 0:
+                    finite_mask = np.isfinite(dgm_layer[:,1])
+                    dgm_layer = dgm_layer[finite_mask]
+
                 formatted_dgm[d] = dgm_layer
                 
             diagrams.append(formatted_dgm)
@@ -903,6 +415,13 @@ class PersistentHomology:
 
         return dist_matrix
 
+import numpy as np
+from typing import Any, List
+from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
+
 class Grassmann:
     """
     Handles molecular representation on Grassmann Manifolds G(k, D).
@@ -919,7 +438,6 @@ class Grassmann:
         """
         Maps 3D atomic coordinates to an orthonormal basis in R^D (feature space) via SVD.
         """
-
         bases = []
         raw_matrices = _feature_matrices_from_df(df, descriptor)
 
@@ -932,6 +450,74 @@ class Grassmann:
             bases.append(basis)
         
         return bases
+
+    @classmethod
+    def get_projection_features(
+        cls,
+        df: Any,
+        descriptor: str = 'soap',
+        k: int = 3,
+        vectorization_type: str = 'isometric'
+    ) -> np.ndarray:
+        """
+        Computes the orthogonal projector matrix P = U @ U.T for each molecule 
+        and maps them into a flat ambient feature matrix X_Grassmann.
+
+        Parameters:
+        -----------
+        df : Any
+            The input dataframe containing molecular structures.
+        descriptor : str
+            The atomic descriptor type (e.g., 'soap').
+        k : int
+            The subspace dimension.
+        vectorization_type : str
+            'flat': Flattens the full matrix to a vector of size D^2.
+            'isometric': Extracts the upper triangle and scales off-diagonals by sqrt(2)
+                         to perfectly preserve the Chordal distance metric isometry.
+
+        Returns:
+        --------
+        np.ndarray
+            A 2D feature matrix of shape (num_molecules, feature_dim).
+        """
+        bases = cls._get_uk_bases(df=df, descriptor=descriptor, k=k)
+        if not bases:
+            return np.array([[]])
+
+        num_items = len(bases)
+        D = bases[0].shape[0]  # Ambient descriptor feature dimension
+        
+        logger.info(f"Extracting Grassmann projection features | Method: {vectorization_type} | D: {D} | k: {k}")
+
+        if vectorization_type == 'flat':
+            feature_matrix = np.zeros((num_items, D * D))
+            for idx, U in enumerate(tqdm(bases, desc="Projector flat vectorization")):
+                P = U @ U.T
+                feature_matrix[idx] = P.ravel()
+                
+        elif vectorization_type == 'isometric':
+            tri_len = D * (D + 1) // 2
+            feature_matrix = np.zeros((num_items, tri_len))
+            
+            # Precompute upper triangular indices once
+            iu = np.triu_indices(D)
+            off_diagonal_mask = (iu[0] != iu[1])
+            
+            for idx, U in enumerate(tqdm(bases, desc="Projector isometric vectorization")):
+                P = U @ U.T
+                
+                # Extract the upper triangular vector
+                vec = P[iu]
+                
+                # Scale off-diagonal components to preserve Frobenius/Chordal distance metrics
+                vec[off_diagonal_mask] *= np.sqrt(2)
+                
+                feature_matrix[idx] = vec
+        else:
+            raise ValueError("Unknown vectorization_type. Choose either 'flat' or 'isometric'.")
+
+        return feature_matrix
 
     @classmethod
     def distance_matrix(
@@ -976,7 +562,7 @@ class Grassmann:
                 s = np.linalg.svd(core_matrix, compute_uv=False)
                 
                 # 3. Math: Singular values of U1^T U2 represent cos(theta).
-                # Clip to [0.0, 1.0] to prevent floating point errors (like 1.0000001) from crashing arccos
+                # Clip to [0.0, 1.0] to prevent floating point errors from crashing arccos
                 angles = np.arccos(np.clip(s, 0.0, 1.0))
                 
                 # 4. Inline Distance Calculation
@@ -1036,6 +622,82 @@ class Riemann:
 
         # Pyriemann expects a 3D array of shape (N_matrices, n_channels, n_channels)
         return np.array(spd_matrices)
+
+    @classmethod
+    def log_euclidean_vectorize(
+        cls,
+        spd_matrices: np.ndarray,
+        eig_floor: float = 1e-12,
+        warn_threshold: float = 1e-6,
+    ) -> np.ndarray:
+        """
+        Computes Log-Euclidean vectors from a tensor of SPD matrices.
+
+        Off-diagonal entries are weighted by sqrt(2) so Euclidean dot products
+        between the flattened upper triangles preserve the Frobenius inner
+        product of the symmetric matrix logarithms.
+        """
+        spd_matrices = np.asarray(spd_matrices, dtype=np.float64)
+        if spd_matrices.ndim != 3 or spd_matrices.shape[1] != spd_matrices.shape[2]:
+            raise ValueError(
+                "spd_matrices must have shape (n_molecules, d, d) with square matrices."
+            )
+
+        _, d, _ = spd_matrices.shape
+        triu_idx = np.triu_indices(d)
+        weight_matrix = np.where(np.eye(d, dtype=bool), 1.0, np.sqrt(2.0))
+
+        vectorized_dataset = []
+        min_eigenvalues = []
+
+        for idx, C in enumerate(spd_matrices):
+            if not np.allclose(C, C.T, rtol=1e-5, atol=1e-8):
+                raise ValueError(f"Matrix at index {idx} failed symmetry validation.")
+
+            eigenvalues, eigenvectors = np.linalg.eigh(C)
+            min_eigenvalues.append(float(eigenvalues.min()))
+
+            eigenvalues = np.clip(eigenvalues, a_min=eig_floor, a_max=None)
+            log_C = eigenvectors @ np.diag(np.log(eigenvalues)) @ eigenvectors.T
+            weighted_log_C = log_C * weight_matrix
+            vectorized_dataset.append(weighted_log_C[triu_idx])
+
+        global_min_eig = min(min_eigenvalues) if min_eigenvalues else np.nan
+        logger.info(
+            f"Smallest eigenvalue across SPD dataset: {global_min_eig:.6e}"
+        )
+        if global_min_eig < warn_threshold:
+            logger.warning(
+                "Extremely small eigenvalues detected. Verify OAS scaling or centering."
+            )
+        else:
+            logger.info("Minimum eigenvalue looks structurally stable.")
+
+        return np.asarray(vectorized_dataset, dtype=np.float64)
+
+    @classmethod
+    def vectorized_spd_matrices(
+        cls,
+        df: Any,
+        descriptor: str = 'soap',
+        pca: bool = True,
+        eig_floor: float = 1e-12,
+        warn_threshold: float = 1e-6,
+    ) -> np.ndarray:
+        """
+        Builds SPD covariance matrices from the dataframe and returns their
+        Log-Euclidean vectorized representation.
+        """
+        spd_matrices = cls.get_spd_matrices(
+            df=df,
+            descriptor=descriptor,
+            pca=pca,
+        )
+        return cls.log_euclidean_vectorize(
+            spd_matrices,
+            eig_floor=eig_floor,
+            warn_threshold=warn_threshold,
+        )
 
     @classmethod
     def matrix_pca(cls, n_pca, raw_matrices):
