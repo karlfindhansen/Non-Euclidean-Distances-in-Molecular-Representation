@@ -17,6 +17,7 @@ from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem, BRICS, Descriptors, Fragments, rdMolDescriptors
 from rdkit.Chem import rdMolTransforms
+from rdkit.Geometry import Point3D
 from rdkit.Chem.Scaffolds import rdScaffoldNetwork
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem.rdMolDescriptors import CalcMolFormula
@@ -73,6 +74,7 @@ class QM9Dataset:
         "scaffold_smiles",
         "coordinates",
         "atomic_numbers",
+        "pbf_score",
     }
     DESCRIPTOR_ALIASES = {
         "morgan": "morgan",
@@ -581,6 +583,7 @@ class QM9Dataset:
             "fr_ketone": int(Fragments.fr_ketone(mol)),
             "fr_ether": int(Fragments.fr_ether(mol)),
             "fr_nitro": int(Fragments.fr_nitro(mol)),
+            "pbf_score": None,
         }
 
         if extra_fields:
@@ -594,30 +597,56 @@ class QM9Dataset:
         return row
 
     def _build_qm9_row(self, i: int, data) -> Optional[Dict[str, Any]]:
-        smiles = getattr(data, "smiles", None)
-        
-        mol_dict = self._build_smiles_row(
-            smiles=smiles,
-            mol_id=f"qm9_{i}",
-            is_injected=0,
-            outlier_category=None,
-        )
-        if mol_dict is None:
-            return None
+            
+            smiles = getattr(data, "smiles", None)
+            
+            mol_dict = self._build_smiles_row(
+                smiles=smiles,
+                mol_id=f"qm9_{i}",
+                is_injected=0,
+                outlier_category=None,
+            )
+            if mol_dict is None:
+                return None
 
-        coordinates = getattr(data, "pos", None)
-        atomic_numbers = getattr(data, "z", None)
-        if coordinates is not None:
-            mol_dict["coordinates"] = np.asarray(coordinates, dtype=np.float64).tolist()
-        else:
-            mol_dict["coordinates"] = None
-        if atomic_numbers is not None:
-            mol_dict["atomic_numbers"] = np.asarray(atomic_numbers, dtype=np.int64).tolist()
-        else:
-            mol_dict["atomic_numbers"] = None
+            coordinates = getattr(data, "pos", None)
+            atomic_numbers = getattr(data, "z", None)
+            
+            if coordinates is not None:
+                coords_np = np.asarray(coordinates, dtype=np.float64)
+                mol_dict["coordinates"] = coords_np.tolist()
+            else:
+                coords_np = None
+                mol_dict["coordinates"] = None
+                
+            if atomic_numbers is not None:
+                atoms_np = np.asarray(atomic_numbers, dtype=np.int64)
+                mol_dict["atomic_numbers"] = atoms_np.tolist()
+            else:
+                atoms_np = None
+                mol_dict["atomic_numbers"] = None
 
-        mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
-        return mol_dict
+            if coords_np is not None and atoms_np is not None and len(coords_np) == len(atoms_np):
+                try:
+                    mol = Chem.RWMol()
+                    for z in atoms_np:
+                        mol.AddAtom(Chem.Atom(int(z)))
+                    
+                    conf = Chem.Conformer(len(atoms_np))
+                    for idx, coord in enumerate(coords_np):
+                        conf.SetAtomPosition(idx, Point3D(float(coord[0]), float(coord[1]), float(coord[2])))
+                    mol.AddConformer(conf)
+                    
+                    mol_dict["pbf_score"] = float(rdMolDescriptors.CalcPBF(mol))
+                except Exception:
+                    logger.warning("pbf score not calculated")
+                    mol_dict["pbf_score"] = None
+            else:
+                logger.warning("pbf score not calculated")
+                mol_dict["pbf_score"] = None
+
+            mol_dict.update(dict(zip(self.QM9_TARGETS, data.y.tolist()[0])))
+            return mol_dict
 
     @staticmethod
     def _ensure_injection_columns(df: pl.DataFrame) -> pl.DataFrame:

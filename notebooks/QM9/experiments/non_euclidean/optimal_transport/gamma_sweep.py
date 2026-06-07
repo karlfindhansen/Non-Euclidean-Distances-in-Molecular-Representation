@@ -26,7 +26,7 @@ from rdkit.Chem import AllChem
 from scipy.spatial.distance import cdist
 
 from src.datasets import QM9Dataset
-from src.non_euclidean import REMatch, Wasserstein 
+from src.optimal_transport import REMatch, Wasserstein 
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(REPO_ROOT) not in sys.path:
