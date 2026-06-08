@@ -5,9 +5,9 @@ from pathlib import Path
 import sys
 import time
 import pickle
+import hashlib
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
-
 import numpy as np
 import polars as pl
 from loguru import logger
@@ -26,8 +26,9 @@ from src.non_euclidean import (  # noqa: E402
     PersistentHomology,
     Riemann,
 )
-
 from src.optimal_transport import Wasserstein, REMatch # noqa: E402
+
+warnings.filterwarnings("ignore", message="Singular matrix in solving dual problem")
 
 ArrayPair = Tuple[np.ndarray, np.ndarray]
 KernelBuilder = Callable[[pl.DataFrame, pl.DataFrame, Optional[float]], ArrayPair]
@@ -49,7 +50,6 @@ class MethodSpec:
         self.enabled = enabled
         self.notes = notes
 
-# --- Data Cleaning and Polars Utilities ---
 
 def _as_polars(df: Any) -> pl.DataFrame:
     if isinstance(df, pl.DataFrame):
@@ -112,19 +112,45 @@ def _median_beta_from_distances(D: np.ndarray, squared: bool = False) -> float:
     median_val = np.median(values)
     return 1.0 / float(median_val ** 2) if squared and median_val > 0 else 1.0 / float(median_val)
 
-# --- Memory-Safe Builders (Leakage-Free) ---
+# --- Memory & Disk-Safe Builders ---
+
+ArrayPair = Tuple[np.ndarray, np.ndarray]
+KernelBuilder = Callable[[pl.DataFrame, pl.DataFrame, Optional[float]], ArrayPair]
+
+class MethodSpec:
+    def __init__(
+        self,
+        name: str,
+        kind: str,
+        builder: KernelBuilder,
+        beta_grid: Optional[Sequence[float]] = None,
+        enabled: bool = True,
+        notes: str = ""
+    ):
+        self.name = name
+        self.kind = kind
+        self.builder = builder
+        self.beta_grid = beta_grid
+        self.enabled = enabled
+        self.notes = notes
 
 def _build_distance_kernel(
-    train_df: pl.DataFrame, test_df: pl.DataFrame, beta: Optional[float],
-    distance_matrix_fn: Callable[[pl.DataFrame], np.ndarray], kernel_type: str = "laplacian"
+    train_df: pl.DataFrame, 
+    test_df: pl.DataFrame, 
+    beta: Optional[float], 
+    distance_matrix_fn: Callable[[pl.DataFrame], np.ndarray],
+    kernel_type: str = "laplacian"
 ) -> ArrayPair:
+    n_train = train_df.height
+    # Vertically stack dataframes to build a unified distance matrix
     full_df = pl.concat([train_df, test_df], how="vertical")
+    
+    # Compute full distance matrix
     D_full = np.asarray(distance_matrix_fn(full_df), dtype=np.float64)
     
-    n_train = train_df.height
+    # Extract blocks using standard slicing
     D_train = _sanitize_distance_matrix(D_full[:n_train, :n_train])
     D_test = _sanitize_distance_matrix(D_full[n_train:, :n_train])
-    del D_full  # RAM safety for large N
     
     is_squared = (kernel_type.lower() == "rbf")
     beta_val = _median_beta_from_distances(D_train, squared=is_squared) if beta is None else float(beta)
@@ -132,6 +158,23 @@ def _build_distance_kernel(
     if is_squared:
         return _rbf_kernel_from_distance(D_train, beta_val), _rbf_kernel_from_distance(D_test, beta_val)
     return _laplacian_kernel_from_distance(D_train, beta_val), _laplacian_kernel_from_distance(D_test, beta_val)
+
+def _build_direct_kernel(
+    train_df: pl.DataFrame, 
+    test_df: pl.DataFrame, 
+    kernel_matrix_fn: Callable[[pl.DataFrame], np.ndarray]
+) -> ArrayPair:
+    n_train = train_df.height
+    full_df = pl.concat([train_df, test_df], how="vertical")
+    
+    # Compute full precomputed kernel matrix
+    K_full = np.asarray(kernel_matrix_fn(full_df), dtype=np.float64)
+    
+    # Extract blocks directly without applying exp(-beta * D)
+    K_train = K_full[:n_train, :n_train]
+    K_test = K_full[n_train:, :n_train]
+    
+    return K_train, K_test
 
 def _build_projection_kernel(
     train_df: pl.DataFrame, test_df: pl.DataFrame, beta: Optional[float],
@@ -167,12 +210,11 @@ def _build_vector_kernel(
         return _rbf_kernel_from_distance(D_train, beta_val), _rbf_kernel_from_distance(D_test, beta_val)
     return _laplacian_kernel_from_distance(D_train, beta_val), _laplacian_kernel_from_distance(D_test, beta_val)
 
-# --- Linear (Dot Product) Builders for Geometric Ablation ---
+# --- Linear (Dot Product) Builders ---
 
 def _build_linear_kernel(
     train_df: pl.DataFrame, test_df: pl.DataFrame, beta: Optional[float], column: str
 ) -> ArrayPair:
-    """Builds a pure linear dot-product kernel: K = X @ X^T. Beta is ignored."""
     X_train = _pooled_descriptor_matrix(train_df, column=column)
     X_test = _pooled_descriptor_matrix(test_df, column=column)
     
@@ -184,7 +226,6 @@ def _build_projection_linear_kernel(
     train_df: pl.DataFrame, test_df: pl.DataFrame, beta: Optional[float],
     projection_fn: Callable[[pl.DataFrame], np.ndarray]
 ) -> ArrayPair:
-    """Builds a pure linear dot-product kernel for manifold projections. Beta is ignored."""
     X_train = projection_fn(train_df)
     X_test = projection_fn(test_df)
     
@@ -252,7 +293,6 @@ def get_regression_methods(
             notes="Direct Chordal distance matrix. Should mathematically match projection_laplacian."
         ),
         
-        # --- Non-Linear Baselines (RBF / Laplacian) ---
         MethodSpec(
             name=f"{descriptor}_avg_laplacian",
             kind="vector",
@@ -270,12 +310,11 @@ def get_regression_methods(
                 tr, te, b, lambda df: Riemann.vectorized_spd_matrices(df, descriptor=descriptor, pca=False), "laplacian"
             ),
         ),
-        
         MethodSpec(
             name=f"{descriptor}_rematch_direct",
             kind="kernel",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: REMatch.kernel_matrix(df=df, descriptor=descriptor, alpha=rematch_alpha), "laplacian"
+            builder=lambda tr, te, b: _build_direct_kernel(
+                tr, te, b, lambda df: REMatch.kernel_matrix(df=df, descriptor=descriptor, alpha=rematch_alpha)
             ),
             beta_grid=[None], 
             notes="REMatch Entropic OT Kernel"
@@ -284,9 +323,7 @@ def get_regression_methods(
             name=f"{descriptor}_wasserstein_w1",
             kind="distance",
             builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, 
-                lambda df: Wasserstein.distance_matrix(df, descriptor=descriptor, metric="euclidean"), 
-                "laplacian"
+                tr, te, b, lambda df: Wasserstein.distance_matrix(df, descriptor=descriptor, metric="euclidean"), "laplacian"
             ),
             notes="Earth Mover's Distance (W1) with standard Euclidean ground cost."
         ),
@@ -294,9 +331,7 @@ def get_regression_methods(
             name=f"{descriptor}_wasserstein_w2",
             kind="distance",
             builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, 
-                lambda df: np.sqrt(Wasserstein.distance_matrix(df, descriptor=descriptor, metric="sqeuclidean")), 
-                "laplacian"
+                tr, te, b, lambda df: np.sqrt(Wasserstein.distance_matrix(df, descriptor=descriptor, metric="sqeuclidean")), "laplacian"
             ),
             notes="Wasserstein-2 (W2) distance requiring sqrt of the sqeuclidean EMD cost."
         ),
@@ -314,16 +349,7 @@ def get_regression_methods(
                 tr, te, b, lambda df: Riemann.distance_matrix(df=df, descriptor=descriptor, distance_type="affine-invariant", pca=False), "laplacian"
             ),
         ),
-        MethodSpec(
-            name=f"{descriptor}_wasserstein_w1",
-            kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: Wasserstein.distance_matrix(df, descriptor=descriptor, metric="euclidean"), "laplacian"
-            ),
-        ),
     ]
-
-# --- Evaluation Core ---
 
 def _cv_score_precomputed_krr(K_train: np.ndarray, y_train: np.ndarray, alpha: float, cv: int, random_state: int) -> float:
     splitter = KFold(n_splits=cv, shuffle=True, random_state=random_state)
@@ -340,25 +366,21 @@ def _cv_score_precomputed_krr(K_train: np.ndarray, y_train: np.ndarray, alpha: f
 def _fit_one_method(
     method: MethodSpec, train_df: pl.DataFrame, test_df: pl.DataFrame,
     y_train: np.ndarray, y_test: np.ndarray, alpha_grid: Sequence[float],
-    beta_grid: Optional[Sequence[float]], cv: int, random_state: int
+    cv: int, random_state: int
 ) -> Dict[str, Any]:
     
     logger.info(f"Evaluating regression method: {method.name}")
     method_started = time.perf_counter()
     candidate_betas = list(method.beta_grid) if method.beta_grid is not None else [None]
     
-    kernel_cache: Dict[Any, ArrayPair] = {}
     best: Optional[Dict[str, Any]] = None
 
     for beta in candidate_betas:
         try:
-            if beta not in kernel_cache:
-                K_train, K_test = method.builder(train_df, test_df, beta)
-                K_train = np.asarray(K_train, dtype=np.float64)
-                K_train = (K_train + K_train.T) / 2.0  # Symmetrize
-                kernel_cache[beta] = (K_train, np.asarray(K_test, dtype=np.float64))
-            
-            K_train, K_test = kernel_cache[beta]
+            K_train, K_test = method.builder(train_df, test_df, beta)
+            K_train = np.asarray(K_train, dtype=np.float64)
+            K_train = (K_train + K_train.T) / 2.0
+            K_test = np.asarray(K_test, dtype=np.float64)
 
             for alpha in alpha_grid:
                 cv_mse = _cv_score_precomputed_krr(K_train, y_train, float(alpha), cv, random_state)
@@ -416,7 +438,9 @@ def compare_non_euclidean_regression(
 
     for spec in specs:
         try:
-            res = _fit_one_method(spec, train_df, test_df, y_train, y_test, alpha_grid, None, cv, random_state)
+            res = _fit_one_method(
+                spec, train_df, test_df, y_train, y_test, alpha_grid, cv, random_state
+            )
             fitted[spec.name] = res.pop("model")
             predictions[spec.name] = res.pop("y_test_pred")
             rows.append({"status": "ok", **res})
@@ -436,28 +460,72 @@ def compare_non_euclidean_regression(
 if __name__ == '__main__':
     from src.datasets import QM9Dataset
 
-    n = 100
+    n = 15
     qm9 = QM9Dataset(limit=n, descriptors=["soap", "mace"])
     df = qm9.load()
     
     output_dir = "results/qm9/regression"
     os.makedirs(output_dir, exist_ok=True)
     
-    for target in ["gap", "mu", "cv"]:
+    USE_SAVED_MATRICES = True
+    CACHE_DIR_PATH = ".cache/distance_matrices"
+    
+    #SEEDS = [42, 123, 456, 789, 1024, 2048, 4096, 8192, 16384, 32768]
+    SEEDS = [42, 123, 456, 789, 1024]
+    all_targets = ["gap", "mu", "cv", "u0", "A", "B", "C"]
+    target_g = ["gap", "mu"]
+    lim = f"n_{n}"
+    path = os.path.join(output_dir, lim)
+    os.makedirs(path, exist_ok=True)
+
+    for target in target_g:
         logger.info(f"=== Starting benchmark for target: {target.upper()} ===")
         for desc in ["soap", "mace"]:
+            summary_path = os.path.join(path, f"results_summary_{target}_{desc}.csv")
+            if os.path.exists(summary_path):
+                logger.info(f" -> Summary already exists at {summary_path}, skipping...")
+                continue
             logger.info(f"--- Evaluating descriptor: {desc.upper()} ---")
             
-            comparison = compare_non_euclidean_regression(df, descriptor=desc, target_col=target)
+            all_results = []
+            all_artifacts = {}
             
-            comparison["results"].write_csv(os.path.join(output_dir, f"results_{target}_{desc}_{n}.csv"))
+            for seed in SEEDS:
+                logger.info(f"--- Running Seed: {seed} ---")
+                
+                comparison = compare_non_euclidean_regression(
+                    df, descriptor=desc, target_col=target,
+                    random_state=seed
+                )
+                
+                res_df = comparison["results"].with_columns(pl.lit(seed).alias("seed"))
+                all_results.append(res_df)
+                
+                all_artifacts[seed] = {
+                    "models": comparison["models"],
+                    "predictions": comparison["predictions"],
+                    "y_test": comparison["y_test"],
+                    "train_indices": comparison["train_indices"],
+                    "test_indices": comparison["test_indices"]
+                }
             
-            artifacts = {
-                "models": comparison["models"],
-                "predictions": comparison["predictions"],
-                "y_test": comparison["y_test"],
-                "train_indices": comparison["train_indices"],
-                "test_indices": comparison["test_indices"]
-            }
-            with open(os.path.join(output_dir, f"artifacts_{target}_{desc}_{n}.pkl"), "wb") as f:
-                pickle.dump(artifacts, f)
+            # Combine the results from all 10 seeds
+            full_results_df = pl.concat(all_results)
+            
+            # Filter out any runs that failed before calculating aggregations
+            ok_runs = full_results_df.filter(pl.col("status") == "ok")
+            
+            # Calculate Mean and Standard Deviation for metrics across seeds
+            summary_df = ok_runs.group_by(["method", "kind"]).agg([
+                pl.col("test_rmse").mean().alias("test_rmse_mean"),
+                pl.col("test_rmse").std().alias("test_rmse_std"),
+                pl.col("test_mae").mean().alias("test_mae_mean"),
+                pl.col("test_mae").std().alias("test_mae_std"),
+                pl.col("test_r2").mean().alias("test_r2_mean"),
+                pl.col("test_r2").std().alias("test_r2_std"),
+                pl.col("total_seconds").mean().alias("time_mean_sec")
+            ]).sort("test_rmse_mean", nulls_last=True)
+            
+            # Save both raw logs (for deep debugging) and summary stats (for papers/reporting)
+            full_results_df.write_csv(os.path.join(path, f"results_raw_{target}_{desc}.csv"))
+            summary_df.write_csv(os.path.join(path, f"results_summary_{target}_{desc}.csv"))

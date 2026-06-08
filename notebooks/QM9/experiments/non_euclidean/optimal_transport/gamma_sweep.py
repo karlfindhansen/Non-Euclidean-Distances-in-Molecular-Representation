@@ -14,6 +14,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+import warnings
+from loguru import logger
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
 
@@ -32,7 +34,33 @@ REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-GAMMA_GRID = np.logspace(start=-4, stop=2, num=100)
+GAMMA_GRID = np.logspace(start=-3, stop=2, num=100)
+
+def sinkhorn_plan(X: np.ndarray, Y: np.ndarray, gamma: float) -> tuple[np.ndarray, np.ndarray, bool]:
+    a = np.ones(X.shape[0], dtype=np.float64) / X.shape[0]
+    b = np.ones(Y.shape[0], dtype=np.float64) / Y.shape[0]
+    cost = cdist(X, Y, metric="euclidean")
+    
+    converged = True
+    # Catch the UserWarning issued by POT when it fails to converge
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")  # Force tracking on every loop execution
+        plan = ot.sinkhorn(
+            a,
+            b,
+            cost,
+            reg=gamma,
+            method="sinkhorn_log",
+            numItermax=50_000,
+            stopThr=1e-12,
+        )
+        # Check if the non-convergence warning was raised
+        for warning in w:
+            if "Sinkhorn did not converge" in str(warning.message):
+                converged = False
+                break
+                
+    return np.asarray(plan, dtype=np.float64), cost, converged
 
 @dataclass(frozen=True)
 class IsomerPair:
@@ -127,23 +155,14 @@ def clean_descriptor_matrix(matrix: Iterable[Iterable[float]]) -> np.ndarray:
 
 
 def average_soap_distance(X: np.ndarray, Y: np.ndarray) -> float:
-    return float(np.linalg.norm(X.mean(axis=0) - Y.mean(axis=0)))
-
-
-def sinkhorn_plan(X: np.ndarray, Y: np.ndarray, gamma: float) -> tuple[np.ndarray, np.ndarray]:
-    a = np.ones(X.shape[0], dtype=np.float64) / X.shape[0]
-    b = np.ones(Y.shape[0], dtype=np.float64) / Y.shape[0]
-    cost = cdist(X, Y, metric="euclidean")
-    plan = ot.sinkhorn(
-        a,
-        b,
-        cost,
-        reg=gamma,
-        method="sinkhorn_log",
-        numItermax=50_000,
-        stopThr=1e-12,
-    )
-    return np.asarray(plan, dtype=np.float64), cost
+    mean_x = X.mean(axis=0)
+    mean_y = Y.mean(axis=0)
+    
+    norm_x = mean_x / (np.linalg.norm(mean_x) + 1e-12)
+    norm_y = mean_y / (np.linalg.norm(mean_y) + 1e-12)
+    
+    cosine_similarity = np.dot(norm_x, norm_y)
+    return float(np.sqrt(max(2.0 * (1.0 - cosine_similarity), 0.0)))
 
 
 def pct_entries_carrying_mass(plan: np.ndarray, mass_fraction: float = 0.95) -> float:
@@ -156,7 +175,14 @@ def compute_gamma_sweep(df_pair: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, 
     matrices = [clean_descriptor_matrix(matrix) for matrix in df_pair["soap_matrix"].to_list()]
     X, Y = matrices
 
-    wasserstein_distance = float(Wasserstein.distance_matrix(df_pair, descriptor="soap", metric="euclidean")[0, 1])
+    K_linear = np.dot(X, Y.T)
+    a = np.ones(X.shape[0]) / X.shape[0]
+    b = np.ones(Y.shape[0]) / Y.shape[0]
+    
+    cost_matrix_squared = np.clip(2.0 - 2.0 * K_linear, 0.0, None)
+    
+    wasserstein_w2_squared = float(ot.emd2(a, b, cost_matrix_squared))
+    wasserstein_distance = np.sqrt(max(wasserstein_w2_squared, 0.0))
     average_distance = average_soap_distance(X, Y)
 
     rows = []
@@ -164,25 +190,45 @@ def compute_gamma_sweep(df_pair: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, 
     costs: dict[str, np.ndarray] = {}
 
     for gamma in GAMMA_GRID:
-        rematch_distance = float(REMatch.distance_matrix(df_pair, descriptor="soap", alpha=float(gamma))[0, 1])
-        plan, cost = sinkhorn_plan(X, Y, float(gamma))
+        rematch_dist_matrix = REMatch.distance_matrix(df_pair, descriptor="soap", alpha=float(gamma), metric="linear")
+        plan, cost, converged = sinkhorn_plan(X, Y, float(gamma))
 
         key = f"gamma_{gamma:g}"
         plans[key] = plan
         costs[key] = cost
+
+        if not isinstance(rematch_dist_matrix, np.ndarray):
+            rematch_distance = np.nan
+            abs_rematch_minus_w2 = np.nan
+            abs_rematch_minus_average_soap = np.nan
+        else:
+            rematch_distance = float(rematch_dist_matrix[0, 1])
+            abs_rematch_minus_w2 = abs(rematch_distance - wasserstein_distance)
+            abs_rematch_minus_average_soap = abs(rematch_distance - average_distance)
+
+        # Only evaluate the transport plan properties if it successfully converged
+        if converged:
+            pct_mass = pct_entries_carrying_mass(plan)
+            transport_cost = float(np.sum(plan * cost))
+            entropy = float(-np.sum(plan[plan > 0] * np.log(plan[plan > 0])))
+        else:
+            pct_mass = np.nan
+            transport_cost = np.nan
+            entropy = np.nan
 
         rows.append(
             {
                 "gamma": float(gamma),
                 "log10_gamma": float(np.log10(gamma)),
                 "rematch_distance": rematch_distance,
-                "wasserstein_w1_distance": wasserstein_distance,
+                "wasserstein_w2_distance": wasserstein_distance,
                 "average_soap_distance": average_distance,
-                "abs_rematch_minus_w1": abs(rematch_distance - wasserstein_distance),
-                "abs_rematch_minus_average_soap": abs(rematch_distance - average_distance),
-                "pct_entries_for_95pct_mass": pct_entries_carrying_mass(plan),
-                "transport_cost_from_plan": float(np.sum(plan * cost)),
-                "plan_entropy": float(-np.sum(plan[plan > 0] * np.log(plan[plan > 0]))),
+                "abs_rematch_minus_w2": abs_rematch_minus_w2,
+                "abs_rematch_minus_average_soap": abs_rematch_minus_average_soap,
+                "pct_entries_for_95pct_mass": pct_mass,
+                "transport_cost_from_plan": transport_cost,
+                "plan_entropy": entropy,
+                "sinkhorn_converged": converged,
             }
         )
 
@@ -209,12 +255,8 @@ def plot_results(results: pl.DataFrame, output_path: Path) -> None:
         }
     )
 
-    gamma = results["gamma"].to_numpy()
-
     # Create the figure with a modern, constrained layout engine
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.0), layout="constrained", dpi=300)
-
-    # Cohesive, high-contrast editorial color palette
     colors = ["#344e41", "#a3b18a", "#bc6c25"]
     grid_color = "#e2e8f0"
 
@@ -222,12 +264,13 @@ def plot_results(results: pl.DataFrame, output_path: Path) -> None:
     # SUBPLOT 1: TRANSPORT PLAN FLATTENING
     # =========================================================================
     ax0 = axes[0]
-    y0 = results["pct_entries_for_95pct_mass"].to_numpy()
-
-    # Utilizing a professional white-faced thick border marker style
+    
+    # Strictly filter out rows where Sinkhorn did not converge
+    sub0_df = results.filter(pl.col("pct_entries_for_95pct_mass").is_not_nan())
+    
     ax0.plot(
-        gamma,
-        y0,
+        sub0_df["gamma"].to_numpy(),
+        sub0_df["pct_entries_for_95pct_mass"].to_numpy(),
         color=colors[0],
         marker="o",
         markersize=6,
@@ -255,24 +298,25 @@ def plot_results(results: pl.DataFrame, output_path: Path) -> None:
     # SUBPLOT 2: ENDPOINT DIVERGENCE
     # =========================================================================
     ax1 = axes[1]
-    y1_w1 = results["abs_rematch_minus_w1"].to_numpy()
-    y1_soap = results["abs_rematch_minus_average_soap"].to_numpy()
+    
+    sub1_w2 = results.filter(pl.col("abs_rematch_minus_w2").is_not_nan())
+    sub1_soap = results.filter(pl.col("abs_rematch_minus_average_soap").is_not_nan())
 
     ax1.plot(
-        gamma,
-        y1_w1,
+        sub1_w2["gamma"].to_numpy(),
+        sub1_w2["abs_rematch_minus_w2"].to_numpy(),
         color=colors[1],
         marker="o",
         markersize=6,
         markerfacecolor="white",
         markeredgewidth=1.5,
         linewidth=2.0,
-        label="|REMatch - exact W1|",
+        label="|REMatch - exact W2|",
         zorder=3,
     )
     ax1.plot(
-        gamma,
-        y1_soap,
+        sub1_soap["gamma"].to_numpy(),
+        sub1_soap["abs_rematch_minus_average_soap"].to_numpy(),
         color=colors[2],
         marker="s",
         markersize=6,
@@ -310,23 +354,27 @@ def plot_results(results: pl.DataFrame, output_path: Path) -> None:
         fontweight="bold",
         y=1.02,
     )
+    logger.info(f"Saving gamma sweep diagnostic plot to: {output_path}")
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-
 def main() -> None:
-    args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    seed = 42
+    min_formula_count = 100
+    top_formula_scan = 50
+    max_candidates_per_formula = 100
+    output_dir = REPO_ROOT / "results/qm9/gamma_sweep"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    qm9 = QM9Dataset(root=str(REPO_ROOT / "data/QM9"), limit=args.limit)
+    qm9 = QM9Dataset(limit=25_000, descriptors=["SOAP"])
     df = qm9.load()
 
     pair = choose_isomer_pair(
         df,
-        seed=args.seed,
-        min_formula_count=args.min_formula_count,
-        top_formula_scan=args.top_formula_scan,
-        max_candidates_per_formula=args.max_candidates_per_formula,
+        seed=seed,
+        min_formula_count=min_formula_count,
+        top_formula_scan=top_formula_scan,
+        max_candidates_per_formula=max_candidates_per_formula,
     )
 
     qm9.df = pair.df
@@ -335,13 +383,15 @@ def main() -> None:
 
     results, matrices = compute_gamma_sweep(df_pair)
 
-    figure_path = args.output_dir / "gamma_continuum_sweep.png"
-    csv_path = args.output_dir / "gamma_continuum_sweep.csv"
-    pair_path = args.output_dir / "selected_isomer_pair.csv"
-    matrix_path = args.output_dir / "gamma_transport_plans.npz"
+    figure_path = output_dir / "gamma_continuum_sweep.png"
+    csv_path = output_dir / "gamma_continuum_sweep.csv"
+    pair_path = output_dir / "selected_isomer_pair.csv"
+    matrix_path = output_dir / "gamma_transport_plans.npz"
 
     plot_results(results, figure_path)
     results.write_csv(csv_path)
+    #run_glitch_investigation(df_pair, args.output_dir)
+
     df_pair.select(["mol_id", "formula", "canonical_smiles", "scaffold_smiles", "num_atoms"]).write_csv(pair_path)
     np.savez_compressed(matrix_path, **matrices)
 

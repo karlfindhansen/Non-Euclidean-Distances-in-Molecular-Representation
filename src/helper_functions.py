@@ -33,7 +33,8 @@ from rdkit.Chem import AllChem
 from umap import UMAP
 from ase import Atoms
 
-from src.non_euclidean import Grassmann, Riemann, Wasserstein, PersistentHomology
+from src.non_euclidean import Grassmann, Riemann, PersistentHomology
+from src.optimal_transport import Wasserstein
 
 def get_isomers(df: pl.DataFrame, pure_carbon: bool, n: int) -> pl.DataFrame:
     """

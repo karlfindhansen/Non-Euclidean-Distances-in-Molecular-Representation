@@ -280,7 +280,7 @@ class Grassmann:
             iu = np.triu_indices(D)
             off_diagonal_mask = (iu[0] != iu[1])
             
-            for idx, U in enumerate(tqdm(bases, desc="Projector isometric vectorization")):
+            for idx, U in enumerate(bases):
                 P = U @ U.T
                 
                 # Extract the upper triangular vector
