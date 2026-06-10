@@ -1,18 +1,19 @@
 import math
+import os
 import numpy as np
 import polars as pl
 import seaborn as sns
 import matplotlib.pyplot as plt
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, List
 
 from scipy.spatial.distance import pdist, squareform
-from scipy.stats import pearsonr
 from sklearn.metrics import silhouette_score
 from umap import UMAP
 
 # Assuming rdkit, REMatch, Wasserstein, Grassmann, and Riemann are imported globally
 from rdkit import Chem
-from src.non_euclidean import REMatch, Wasserstein, Grassmann, Riemann
+from src.non_euclidean import Grassmann, Riemann, PersistentHomology
+from src.optimal_transport import REMatch, Wasserstein
 
 
 def categorize_pure_carbocycle(smiles: str) -> str:
@@ -44,39 +45,41 @@ def categorize_pure_carbocycle(smiles: str) -> str:
         return "Mixed/Other"
 
 
-def optimize_rematch_alpha(df: pl.DataFrame, d_w1: np.ndarray) -> float:
+def optimize_rematch_alpha(df: pl.DataFrame, label_col: str = "ring_category") -> float:
     """
-    Scans a logarithmic grid of alpha values to maximize topological correlation 
-    with the exact W1 distance matrix baseline.
+    Scans a logarithmic grid of alpha values to find the hyperparameter that
+    maximizes the silhouette separation score of the classes in the ambient distance space.
     """
-    print("\n[+] Initiating REMatch alpha parameter optimization...")
+    print("\n[+] Initiating REMatch alpha optimization for maximum class separation...")
     rematch = REMatch()
     
-    n_samples = d_w1.shape[0]
-    triu_idx = np.triu_indices(n_samples, k=1)
-    flat_w1 = d_w1[triu_idx]
+    raw_labels = df.get_column(label_col).to_numpy()
+    conditions = [raw_labels == "3-ring", raw_labels == "6-ring", raw_labels == "Acyclic"]
+    choices = ["Strained", "Relaxed", "Acyclic"]
+    legend_labels = np.select(conditions, choices, default="Other")
     
     alpha_grid = np.logspace(-3.5, 1, num=50)
     
     best_alpha = 0.1
-    best_corr = -1.0
+    best_silhouette = -1.0
     
     for alpha in alpha_grid:
         d_test = rematch.distance_matrix(df, alpha=alpha)
-        
         if d_test is None:
             continue
             
-        flat_test = d_test[triu_idx]
-        corr, _ = pearsonr(flat_test, flat_w1)
-        
-        print(f" -> Testing alpha = {alpha:.6f} | Pearson Alignment with W1: {corr:.4f}")
-        
-        if corr > best_corr:
-            best_corr = corr
-            best_alpha = alpha
+        try:
+            current_sil = silhouette_score(d_test, legend_labels, metric="precomputed")
+            print(f" -> Testing alpha = {alpha:.6f} | Ambient Silhouette Score: {current_sil:.4f}")
             
-    print(f"[+] Optimization Complete. Best Alpha: {best_alpha:.6f} (Pearson r = {best_corr:.4f})")
+            if current_sil > best_silhouette:
+                best_silhouette = current_sil
+                best_alpha = alpha
+        except ValueError:
+            continue
+            
+    print("[+] Optimization Complete.")
+    print(f"    Best Alpha: {best_alpha:.6f} (Max Ambient Silhouette: {best_silhouette:.4f})")
     return float(best_alpha)
 
 
@@ -84,7 +87,6 @@ def calculate_spatial_metrics(dist_matrix: np.ndarray, legend_labels: np.ndarray
     """Helper to compute clustering metrics given a precomputed distance matrix across N classes."""
     sil = silhouette_score(dist_matrix, legend_labels, metric="precomputed")
     
-    # Calculate generalized Mean Intra-Class Distance
     intra_dists = []
     for cls in unique_classes:
         idx = np.where(legend_labels == cls)[0]
@@ -94,7 +96,6 @@ def calculate_spatial_metrics(dist_matrix: np.ndarray, legend_labels: np.ndarray
             intra_dists.append(np.mean(sub_matrix[triu_idx]))
     mean_intra = np.mean(intra_dists) if intra_dists else 0.0
 
-    # Calculate generalized Mean Inter-Class Distance
     inter_dists = []
     for i in range(len(unique_classes)):
         for j in range(i + 1, len(unique_classes)):
@@ -120,77 +121,112 @@ def run_strain_topology_comparison(
     label_col: str = "ring_category"
 ) -> None:
     """
-    Computes topological summary properties (pre- and post-UMAP) and generates a dynamic side-by-side UMAP plot.
+    Computes topological summaries, saves standalone figures, and groups core 
+    visual benchmarks into three distinct narrative-driven 1x3 composite figures.
+    All outputs are saved to results/qm9/strain.
     """
+    output_dir = "results/qm9/strain"
+    os.makedirs(output_dir, exist_ok=True)
+
     raw_labels = df.get_column(label_col).to_numpy()
-    
-    # Map raw RDKit categories to clean legend labels
-    conditions = [
-        raw_labels == "3-ring", 
-        raw_labels == "6-ring", 
-        raw_labels == "Acyclic"
-    ]
-    choices = [
-        "Strained (3-Membered)", 
-        "Relaxed (6-Membered)", 
-        "Acyclic (No Rings)"
-    ]
+    conditions = [raw_labels == "3-ring", raw_labels == "6-ring", raw_labels == "Acyclic"]
+    choices = ["Strained (3-Membered)", "Relaxed (6-Membered)", "Acyclic (No Rings)"]
     legend_labels = np.select(conditions, choices, default="Other")
     unique_classes = np.unique(legend_labels)
 
     pre_umap_metrics = {}
     post_umap_metrics = {}
+    umap_coordinates_cache = {}
 
-    # Dynamic Grid Layout (max 4 columns per row)
-    n_plots = len(matrices)
-    cols = 4
-    rows = 2
-    
     plt.style.use("seaborn-v0_8-whitegrid")
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5.5 * rows), dpi=300)
-    
-    if isinstance(axes, np.ndarray):
-        axes = axes.flatten()
-    else:
-        axes = [axes]
-        
-    # Updated Palette to include Acyclic
     palette = {
         "Strained (3-Membered)": "#cc5e53", 
         "Relaxed (6-Membered)": "#568bbd",
         "Acyclic (No Rings)": "#8ebd77"
     }
 
-    # Process each matrix: compute pre-metrics, project UMAP, compute post-metrics, and plot
-    for ax, (name, dist_matrix) in zip(axes, matrices.items()):
-        # 1. Pre-UMAP (Ambient Space) Metrics
+    # 1. Pipeline execution: Compute metrics, run UMAP, and export separate panels
+    for name, dist_matrix in matrices.items():
         pre_umap_metrics[name] = calculate_spatial_metrics(dist_matrix, legend_labels, unique_classes)
         
-        # 2. Compute UMAP projection
         print(f"Computing UMAP projection from precomputed {name} matrix...")
         reducer = UMAP(n_neighbors=5, metric="precomputed", random_state=42)
         umap_coords = reducer.fit_transform(dist_matrix)
+        umap_coordinates_cache[name] = umap_coords
         
-        # 3. Post-UMAP (Embedded Space) Metrics
         d_umap = squareform(pdist(umap_coords, metric="euclidean"))
         post_umap_metrics[name] = calculate_spatial_metrics(d_umap, legend_labels, unique_classes)
 
-        # 4. Plotting
+        # Generate and Save Individual Subplot Figure
+        fig_ind, ax_ind = plt.subplots(figsize=(6, 5), dpi=300)
         sns.scatterplot(
             x=umap_coords[:, 0], y=umap_coords[:, 1],
-            hue=legend_labels, palette=palette, s=90, alpha=0.85,
-            edgecolors="#2d3436", linewidths=0.8, ax=ax, zorder=10,
+            hue=legend_labels, palette=palette, s=85, alpha=0.85,
+            edgecolors="#2d3436", linewidths=0.6, ax=ax_ind, zorder=10,
         )
+        ax_ind.set_title(name, fontsize=12, fontweight="bold", pad=12)
+        ax_ind.set_xlabel("UMAP 1", fontsize=10, fontweight="medium")
+        ax_ind.set_ylabel("UMAP 2", fontsize=10, fontweight="medium")
+        ax_ind.grid(True, linestyle=":", alpha=0.6)
+        ax_ind.legend(title="Topology Mapping", frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="best")
+        sns.despine(ax=ax_ind)
+        plt.tight_layout()
+        
+        safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(",", "").replace("$", "").replace("\\", "")
+        fig_ind.savefig(os.path.join(output_dir, f"sub_{safe_name}.png"), dpi=300, bbox_inches="tight")
+        plt.close(fig_ind)
 
-        ax.set_title(name, fontsize=11, fontweight="bold", pad=15)
-        ax.set_xlabel("UMAP Dimension 1", fontsize=10, fontweight="medium")
-        ax.set_ylabel("UMAP Dimension 2", fontsize=10, fontweight="medium")
-        ax.grid(True, linestyle=":", alpha=0.6)
-        if ax.get_legend() is not None:
-            ax.get_legend().remove()
-        sns.despine(ax=ax)
+    # Helper function to plot a structured thematic group row
+    def plot_thematic_group(group_keys: List[str], filename: str, figure_title: str):
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=300)
+        
+        for idx, key in enumerate(group_keys):
+            ax = axes[idx]
+            # Match localized dynamic naming assignments from dictionary keys safely
+            actual_key = next((k for k in matrices.keys() if k.startswith(key)), None)
+            
+            if actual_key is None:
+                ax.axis('off')
+                continue
+                
+            coords = umap_coordinates_cache[actual_key]
+            sns.scatterplot(
+                x=coords[:, 0], y=coords[:, 1],
+                hue=legend_labels, palette=palette, s=75, alpha=0.85,
+                edgecolors="#2d3436", linewidths=0.6, ax=ax, zorder=10,
+            )
+            ax.set_title(actual_key, fontsize=11, fontweight="bold", pad=12)
+            ax.set_xlabel("UMAP 1", fontsize=9, fontweight="medium")
+            ax.set_ylabel("UMAP 2", fontsize=9, fontweight="medium")
+            ax.grid(True, linestyle=":", alpha=0.6)
+            if ax.get_legend() is not None:
+                ax.get_legend().remove()
+            sns.despine(ax=ax)
+            
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles, labels, title="Topology Mapping", title_fontsize=10, fontsize=9,
+            loc="lower center", bbox_to_anchor=(0.5, -0.05), ncol=3,
+            frameon=True, facecolor="white", edgecolor="#e2e8f0",
+        )
+        fig.suptitle(figure_title, fontsize=13, fontweight="bold", y=1.02)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches="tight")
+        plt.close(fig)
 
-    # Output Evaluation Summaries
+    # 2. Render Figure 18a: Flattening vs. Transport Topologies
+    group_a = ["Averaged SOAP (Euclidean)", "Wasserstein ($W_2$)", "REMatch (Optimized"]
+    plot_thematic_group(group_a, "fig18a_transport_topologies.png", "Figure 18a: Limits of Flattening vs. Distribution Spaces")
+
+    # 3. Render Figure 18b: Covariance Mapping on Curved Manifolds
+    group_b = ["Riemann (Log-Euclidean)", "Riemann (Affine-Invariant)", "Grassmann (Geodesic"]
+    plot_thematic_group(group_b, "fig18b_curved_manifolds.png", "Figure 18b: Statistical Covariance Spaces and Curved Subspaces")
+
+    # 4. Render Figure 18c: Topological Persistence vs. Feature Smoothing
+    group_c = ["PH (Coords, Bottleneck)", "PH (Coords, Sliced", "PH (SOAP, Sliced"]
+    plot_thematic_group(group_c, "fig18c_persistent_homology.png", "Figure 18c: Topological Persistence Over Atomic Complexes vs. Smoothed Field Space")
+
+    # 5. Output Evaluation Summaries to Terminal
     print("\n" + "="*115)
     print(" PRE-UMAP METRICS (True Ambient Space Distances)")
     print("="*115)
@@ -207,24 +243,7 @@ def run_strain_topology_comparison(
     for name, m in post_umap_metrics.items():
         print(f"{name:<35} | {m['Intra-Class']:<15.4f} | {m['Inter-Class']:<15.4f} | {m['Sep-Ratio']:<13.4f} | {m['Silhouette']:<12.4f}")
     print("="*115 + "\n")
-
-    # Hide any unused subplots in the grid
-    for i in range(n_plots, len(axes)):
-        axes[i].set_visible(False)
-
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(
-        handles, labels, title="Topology Mapping", title_fontsize=11, fontsize=10,
-        loc="lower center", bbox_to_anchor=(0.5, -0.05 if rows > 1 else -0.15), ncol=3,
-        frameon=True, facecolor="white", edgecolor="#e2e8f0",
-    )
-
-    plt.tight_layout()
-    fig.subplots_adjust(bottom=0.15 if rows > 1 else 0.2) 
-    output_filename = "transport_strain_comparison.png"
-    print(f"Saved high-res comparison plot to {output_filename}")
-    plt.savefig(output_filename, dpi=300, bbox_inches="tight")
-    plt.show()
+    print(f"[+] Successfully exported grouped composite grids and standalone panels to: {output_dir}")
 
 
 def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
@@ -232,7 +251,6 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     Executes structural cleaning, unifies balance allocations across matching
     chemical formulas, optimizes the entropic framework, and generates benchmarks.
     """
-    # Step A: Perform RDKit classification
     print("Categorizing structures and enforcing pure carbocycles using RDKit...")
     df_classified = df_base.with_columns(
         pl.col("smiles")
@@ -244,7 +262,6 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     df_6_rings_all = df_classified.filter(pl.col("ring_category") == "6-ring")
     df_acyclic_all = df_classified.filter(pl.col("ring_category") == "Acyclic")
 
-    # Step B: Identify overlapping formula matches across ALL THREE topologies
     counts_3 = df_3_rings_all.group_by("formula").len().rename({"len": "count_3"})
     counts_6 = df_6_rings_all.group_by("formula").len().rename({"len": "count_6"})
     counts_0 = df_acyclic_all.group_by("formula").len().rename({"len": "count_0"})
@@ -262,7 +279,6 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     if formula_overlap.height == 0:
         raise ValueError("No overlapping pure carbocycle formulas found across all three topologies. Increase QM9 limit.")
 
-    # Step C: Extract best formula matches and balance allocations
     best_row = formula_overlap.row(0, named=True)
     best_formula = best_row["formula"]
     max_size = min(best_row["max_balanced_size"], 100)
@@ -276,7 +292,6 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     
     df_experiment = pl.concat([df_3_sampled, df_6_sampled, df_0_sampled])
 
-    # Step D: Compute Base Reference Spaces
     print("Computing Euclidean and Wasserstein distance spaces...")
     X_averaged = np.vstack(df_experiment["soap_embedding"].to_list())
     d_euclidean = squareform(pdist(X_averaged, metric="euclidean"))
@@ -285,10 +300,8 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     d_w1 = wasserstein.distance_matrix(df_experiment, metric='euclidean')
     d_w2 = wasserstein.distance_matrix(df_experiment, metric='sqeuclidean')
 
-    # Step E: Optimize REMatch alpha
-    optimized_alpha = optimize_rematch_alpha(df=df_experiment, d_w1=d_w1)
+    optimized_alpha = optimize_rematch_alpha(df=df_experiment, label_col="ring_category")
 
-    # Step F: Generate Non-Euclidean Distance Matrices
     print("\nComputing REMatch, Riemann, and Grassmann distance spaces...")
     rematch = REMatch()
     d_rematch_high = rematch.distance_matrix(df_experiment, alpha=10.0)
@@ -299,39 +312,40 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
         return
 
     riemann = Riemann()
+    d_riemann_log = riemann.distance_matrix(df_experiment, "soap", distance_type="log-euclidean")
+    d_riemann_airm = riemann.distance_matrix(df_experiment, "soap", distance_type="affine-invariant")
+    
+    d_grassmann_geodesic = Grassmann().distance_matrix(df_experiment, "soap", distance_type="geodesic", k=grassmann_k)
+    d_grassmann_chordal = Grassmann().distance_matrix(df_experiment, "soap", distance_type="chordal", k=grassmann_k)
 
-    d_riemann_log = riemann.distance_matrix(
-        df_experiment,
-        "soap",
-        distance_type="log-euclidean"
-    )
+    print("Computing Persistent Homology distance spaces (Bottleneck and Sliced Wasserstein)...")
+    d_ph_coords_bn = PersistentHomology.distance_matrix(df_experiment, descriptor='coordinates', metric='bottleneck')
+    d_ph_coords_sw = PersistentHomology.distance_matrix(df_experiment, descriptor='coordinates', metric='sliced_wasserstein')
+    d_ph_soap_bn = PersistentHomology.distance_matrix(df_experiment, descriptor='soap', metric='bottleneck')
+    d_ph_soap_sw = PersistentHomology.distance_matrix(df_experiment, descriptor='soap', metric='sliced_wasserstein')
 
-    d_riemann_airm = riemann.distance_matrix(
-        df_experiment,
-        "soap",
-        distance_type="affine-invariant"
-    )
-    d_grassmann = Grassmann().distance_matrix(df_experiment, "soap", distance_type="geodesic", k=grassmann_k)
-
-    # Step G: Consolidate matrices into a dictionary for clean passing
     matrices = {
         "Averaged SOAP (Euclidean)": d_euclidean,
         "Wasserstein ($W_1$)": d_w1,
         "Wasserstein ($W_2$)": d_w2,
         "REMatch (High $\\alpha = 10.0$)": d_rematch_high,
-
         f"REMatch (Optimized $\\alpha = {optimized_alpha:.4f}$)": d_rematch_opt,
         "Riemann (Log-Euclidean)": d_riemann_log,
         "Riemann (Affine-Invariant)": d_riemann_airm,
-        f"Grassmann (k={grassmann_k})": d_grassmann,
+        f"Grassmann (Geodesic, k={grassmann_k})": d_grassmann_geodesic,
+        f"Grassmann (Chordal, k={grassmann_k})": d_grassmann_chordal,
+        "PH (Coords, Bottleneck)": d_ph_coords_bn,
+        "PH (Coords, Sliced Wasserstein)": d_ph_coords_sw,
+        "PH (SOAP, Bottleneck)": d_ph_soap_bn,
+        "PH (SOAP, Sliced Wasserstein)": d_ph_soap_sw
     }
 
-    # Step H: Trigger evaluation summary and plotting
     run_strain_topology_comparison(
         df=df_experiment, 
         matrices=matrices, 
         label_col="ring_category"
     )
+
 
 if __name__ == "__main__":
     from src.datasets import QM9Dataset

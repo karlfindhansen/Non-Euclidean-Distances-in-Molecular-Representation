@@ -10,7 +10,8 @@ from pyriemann.utils.distance import pairwise_distance
 from ripser import ripser
 from sklearn.covariance import oas
 from sklearn.decomposition import PCA
-from scipy.spatial.distance import cdist
+from scipy.spatial.distance import cdist, squareform
+from itertools import combinations
 from tqdm import tqdm
 
 
@@ -103,12 +104,10 @@ class PersistentHomology:
                     continue
                     
                 frame = Atoms(numbers=nums, positions=coords)
-                #is_material = any(row.get("material_id")) 
                 dist_mat = frame.get_all_distances(mic=False)
                 
             # --- PATH B: High-Dimensional Feature Space (e.g., SOAP) ---
             else:
-                # Dynamically match column name syntax
                 col_name = "soap_matrix" if descriptor.lower() == "soap" else descriptor
                 X = np.asarray(row[col_name], dtype=np.float64)
                 
@@ -116,7 +115,6 @@ class PersistentHomology:
                     diagrams.append({d: np.empty((0, 2)) for d in range(max_homology_dim + 1)})
                     continue
                     
-                # Compute distances between atom feature vectors within the single molecule
                 dist_mat = cdist(X, X, metric='euclidean')
 
             # --- Extract Persistence Topology ---
@@ -155,48 +153,60 @@ class PersistentHomology:
         if metric_key not in valid_metrics:
             raise ValueError(f"Unknown metric: '{metric}'. Must be one of {valid_metrics}.")
 
-        # Generate persistence representations based on requested input domain
+        # Generate persistence representations
         dgms = cls._get_persistence_diagrams(df=df, descriptor=descriptor, max_homology_dim=max_homology_dim)
-        
         num_items = len(dgms)
-        dist_matrix = np.zeros((num_items, num_items))
         
+        if num_items <= 1:
+            return np.zeros((num_items, num_items))
+
         logger.info(f"Computing PH distance matrix | Domain: {descriptor} | Metric: {metric} | Max Dim: {max_homology_dim}")
+
+        # 1. Hoist invariant conditional
+        is_bottleneck = metric_key in {"bottleneck", "b"}
+
+        # 2. Pre-extract dimensional arrays to avoid N^2 dictionary lookups
+        empty_dgm = np.empty((0, 2))
+        extracted_dgms = [
+            [dgm.get(d, empty_dgm) for d in homology_dims] 
+            for dgm in dgms
+        ]
+
+        # 3. Setup condensed distance array
+        num_pairs = (num_items * (num_items - 1)) // 2
+        condensed_distances = np.zeros(num_pairs, dtype=np.float64)
+        num_dims = len(homology_dims)
+
+        # 4. Streamlined O(N^2) loop over combinations
+        pair_generator = combinations(range(num_items), 2)
         
-        # Upper-triangular matrix computation loop
-        for i in tqdm(range(num_items), desc="Persistence distances", unit="row"):
-            dgm_i = dgms[i]
+        for idx, (i, j) in tqdm(enumerate(pair_generator), total=num_pairs, desc="Persistence distances", unit="pair"):
+            total_dist = 0.0
+            dgm_i = extracted_dgms[i]
+            dgm_j = extracted_dgms[j]
             
-            for j in range(i + 1, num_items):
-                dgm_j = dgms[j]
-                total_dist = 0.0
+            for d_idx in range(num_dims):
+                p1 = dgm_i[d_idx]
+                p2 = dgm_j[d_idx]
                 
-                for d in homology_dims:
-                    p1 = dgm_i.get(d, np.empty((0, 2)))
-                    p2 = dgm_j.get(d, np.empty((0, 2)))
-                    
-                    if len(p1) == 0 and len(p2) == 0:
-                        continue
-                    
-                    if metric_key in {"bottleneck", "b"}:
-                        total_dist += persim.bottleneck(p1, p2)
-                    else:
-                        total_dist += persim.sliced_wasserstein(p1, p2, M=sw_projections)
+                if len(p1) == 0 and len(p2) == 0:
+                    continue
                 
-                dist_matrix[i, j] = dist_matrix[j, i] = float(total_dist)
+                if is_bottleneck:
+                    total_dist += persim.bottleneck(p1, p2)
+                else:
+                    total_dist += persim.sliced_wasserstein(p1, p2, M=sw_projections)
+            
+            condensed_distances[idx] = total_dist
+
+        # 5. Delegate symmetric matrix assembly to SciPy
+        dist_matrix = squareform(condensed_distances)
 
         if np.isnan(dist_matrix).any():
             logger.warning("NaNs detected in distance matrix. Filling with maximum matrix distance.")
             dist_matrix = np.nan_to_num(dist_matrix, nan=np.nanmax(dist_matrix))
 
         return dist_matrix
-
-import numpy as np
-from typing import Any, List
-from tqdm import tqdm
-import logging
-
-logger = logging.getLogger(__name__)
 
 class Grassmann:
     """

@@ -16,7 +16,7 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from rdkit import Chem
 from rdkit import RDLogger
 from rdkit.Chem import AllChem, BRICS, Descriptors, Fragments, rdMolDescriptors
-from rdkit.Chem import rdMolTransforms
+from rdkit.Chem import rdMolTransforms, rdDetermineBonds
 from rdkit.Geometry import Point3D
 from rdkit.Chem.Scaffolds import rdScaffoldNetwork
 from rdkit.Chem.Scaffolds import MurckoScaffold
@@ -75,6 +75,7 @@ class QM9Dataset:
         "coordinates",
         "atomic_numbers",
         "pbf_score",
+        "geometric_strain"
     }
     DESCRIPTOR_ALIASES = {
         "morgan": "morgan",
@@ -194,6 +195,93 @@ class QM9Dataset:
             )
 
         return normalized
+
+    @staticmethod
+    def _append_geometric_strain(df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Computes the Geometric Valence Angle Strain Index post-load.
+        Guarantees structural shape handling and safe RDKit property execution.
+        """
+        required = {"atomic_numbers", "coordinates"}
+        missing = required - set(df.columns)
+        if missing:
+            # If injected molecules lack 3D coords, safely return with a null column
+            logger.warning(f"DataFrame is missing {missing}. Populating geometric_strain with None.")
+            return df.with_columns(pl.lit(None).cast(pl.Float64).alias("geometric_strain"))
+
+        atoms_series = df["atomic_numbers"].to_list()
+        coords_series = df["coordinates"].to_list()
+        
+        ideal_angles = {
+            Chem.HybridizationType.SP3: 109.47,
+            Chem.HybridizationType.SP2: 120.0,
+            Chem.HybridizationType.SP: 180.0
+        }
+        
+        strain_scores = []
+        failed_count = 0
+
+        logger.info(f"Computing geometric valence angle strain for {len(df)} rows...")
+        
+        for atoms, coords in tqdm(zip(atoms_series, coords_series), total=len(df), desc="Calculating Strain"):
+            if atoms is None or coords is None or len(atoms) == 0:
+                strain_scores.append(None)
+                continue
+                
+            try:
+                coords_np = np.array(coords, dtype=np.float64).reshape(-1, 3)
+                if len(atoms) != coords_np.shape[0]:
+                    strain_scores.append(None)
+                    continue
+
+                mol = Chem.RWMol()
+                for z in atoms:
+                    mol.AddAtom(Chem.Atom(int(z)))
+                
+                conf = Chem.Conformer(len(atoms))
+                for idx in range(len(atoms)):
+                    pos = coords_np[idx]
+                    conf.SetAtomPosition(idx, Point3D(pos[0], pos[1], pos[2]))
+                mol.AddConformer(conf)
+                
+                rdDetermineBonds.DetermineBonds(mol, charge=0)
+                mol.UpdatePropertyCache(strict=False)
+                
+                total_deviation = 0.0
+                angle_count = 0
+                
+                for j in range(mol.GetNumAtoms()):
+                    atom_j = mol.GetAtomWithIdx(j)
+                    hybrid = atom_j.GetHybridization()
+                    ideal = ideal_angles.get(hybrid, 109.47)
+                    
+                    neighbors = [bond.GetOtherAtomIdx(j) for bond in atom_j.GetBonds()]
+                    n_neighbors = len(neighbors)
+                    if n_neighbors < 2:
+                        continue
+                        
+                    for idx_a in range(n_neighbors):
+                        for idx_b in range(idx_a + 1, n_neighbors):
+                            at_i = neighbors[idx_a]
+                            at_k = neighbors[idx_b]
+                            
+                            angle = rdMolTransforms.GetAngleDeg(conf, at_i, j, at_k)
+                            total_deviation += (angle - ideal) ** 2
+                            angle_count += 1
+                            
+                score = float(total_deviation / angle_count) if angle_count > 0 else 0.0
+                strain_scores.append(score)
+                
+            except Exception:
+                failed_count += 1
+                strain_scores.append(None)
+
+        if failed_count > 0:
+            logger.warning(
+                f"Failed to resolve stable configurations for {failed_count} molecules "
+                f"({(failed_count / len(df)) * 100:.2f}% of dataset). Column populated with None."
+            )
+        return df.with_columns(pl.Series("geometric_strain", strain_scores, dtype=pl.Float64))
 
     def _add_requested_descriptors(self) -> bool:
         """Adds descriptor columns requested at init-time; returns True if dataframe schema changed."""
@@ -966,6 +1054,7 @@ class QM9Dataset:
                 f"(dropped={dropped}, kept={full_df.height})."
             )
         full_df = self._sort_by_qm9_id(full_df)
+        full_df = self._append_geometric_strain(full_df)
         full_df.write_parquet(self.file_path)
         logger.success(
             f"Saved full QM9 master parquet: rows={full_df.height}, path={self.file_path}"
@@ -1152,20 +1241,15 @@ class QM9Dataset:
                 order = Chem.CanonicalRankAtoms(mol)
                 mol = Chem.RenumberAtoms(mol, list(order))
 
-            # Primary Attempt: Embed the molecule in 3D space using ETKDG
             params = AllChem.ETKDG()
             params.randomSeed = seed
             
             if AllChem.EmbedMolecule(mol, params) == -1:
-                # Fallback 1: Use random coordinates to jumpstart the algorithm
                 params.useRandomCoords = True
                 if AllChem.EmbedMolecule(mol, params) == -1:
-                    # Fallback 2: Disable chemical rules (crucial for highly strained QM9 rings)
                     params.useBasicKnowledge = False
                     params.useExpTorsionAnglePrefs = False
                     if AllChem.EmbedMolecule(mol, params) == -1:
-                        # If it STILL fails, it's truly un-embeddable
-                        #logger.warning(f"Failed to embed molecule {smiles}")
                         return None
 
             return mol

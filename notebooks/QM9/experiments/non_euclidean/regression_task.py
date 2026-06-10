@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 import sys
 import time
-import pickle
 import hashlib
+import json
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import warnings
 import numpy as np
@@ -32,6 +32,96 @@ warnings.filterwarnings("ignore", message="Singular matrix in solving dual probl
 
 ArrayPair = Tuple[np.ndarray, np.ndarray]
 KernelBuilder = Callable[[pl.DataFrame, pl.DataFrame, Optional[float]], ArrayPair]
+
+class DistanceMatrixCache:
+    def __init__(self, cache_dir: str = ".cache/distance_matrices"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_mol_ids_key(self, df: pl.DataFrame) -> str:
+        """Generate a hash key from the mol_ids in the dataframe."""
+        if "mol_id" not in df.columns:
+            return "unknown"
+        mol_ids = sorted(df["mol_id"].to_list())
+        mol_ids_str = "_".join(str(mid) for mid in mol_ids)
+        return hashlib.sha256(mol_ids_str.encode()).hexdigest()[:16]
+
+    def _get_cache_key(self, seed: int, df: pl.DataFrame, method_name: str) -> Tuple[str, Path]:
+        """Generate cache key and path for a specific seed, dataframe, and method."""
+        mol_ids_key = self._get_mol_ids_key(df)
+        cache_key = f"seed_{seed}_molids_{mol_ids_key}_{method_name}"
+        cache_path = self.cache_dir / f"{cache_key}.npz"
+        return cache_key, cache_path
+
+    def get_metadata_path(self, seed: int, df: pl.DataFrame, method_name: str) -> Path:
+        """Get the metadata file path (stores mol_ids for validation)."""
+        _, cache_path = self._get_cache_key(seed, df, method_name)
+        return cache_path.with_suffix(".json")
+
+    def save(self, D_full: np.ndarray, seed: int, df: pl.DataFrame, method_name: str) -> Path:
+        """Save distance matrix to cache."""
+        _, cache_path = self._get_cache_key(seed, df, method_name)
+        
+        np.savez_compressed(cache_path, D_full=D_full)
+        
+        metadata_path = self.get_metadata_path(seed, df, method_name)
+        metadata = {
+            "seed": seed,
+            "method": method_name,
+            "mol_ids": df["mol_id"].to_list() if "mol_id" in df.columns else [],
+            "n_samples": df.height,
+            "cached_at": time.time()
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+        
+        logger.info(f"Cached distance matrix to {cache_path}")
+        return cache_path
+
+    def load(self, seed: int, df: pl.DataFrame, method_name: str) -> Optional[np.ndarray]:
+        """Load distance matrix from cache if it exists and is valid."""
+        _, cache_path = self._get_cache_key(seed, df, method_name)
+        metadata_path = self.get_metadata_path(seed, df, method_name)
+        
+        if not cache_path.exists() or not metadata_path.exists():
+            return None
+        
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+            
+            current_mol_ids = sorted(df["mol_id"].to_list()) if "mol_id" in df.columns else []
+            cached_mol_ids = sorted(metadata.get("mol_ids", []))
+            
+            if current_mol_ids != cached_mol_ids:
+                logger.warning(
+                    f"Mol IDs mismatch for seed={seed}, method={method_name}. "
+                    f"Recalculating distance matrix."
+                )
+                return None
+            
+            if metadata.get("n_samples") != df.height:
+                logger.warning(
+                    f"Sample count mismatch for seed={seed}, method={method_name}. "
+                    f"Recalculating distance matrix."
+                )
+                return None
+            
+            loaded_data = np.load(cache_path)
+            D_full = loaded_data["D_full"]
+            logger.info(f"Loaded cached distance matrix from {cache_path}")
+            return D_full
+        except Exception as e:
+            logger.warning(f"Failed to load cache from {cache_path}: {e}")
+            return None
+
+    def clear(self):
+        """Clear all cached files."""
+        import shutil
+        if self.cache_dir.exists():
+            shutil.rmtree(self.cache_dir)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Cleared cache directory {self.cache_dir}")
 
 class MethodSpec:
     def __init__(
@@ -114,41 +204,28 @@ def _median_beta_from_distances(D: np.ndarray, squared: bool = False) -> float:
 
 # --- Memory & Disk-Safe Builders ---
 
-ArrayPair = Tuple[np.ndarray, np.ndarray]
-KernelBuilder = Callable[[pl.DataFrame, pl.DataFrame, Optional[float]], ArrayPair]
-
-class MethodSpec:
-    def __init__(
-        self,
-        name: str,
-        kind: str,
-        builder: KernelBuilder,
-        beta_grid: Optional[Sequence[float]] = None,
-        enabled: bool = True,
-        notes: str = ""
-    ):
-        self.name = name
-        self.kind = kind
-        self.builder = builder
-        self.beta_grid = beta_grid
-        self.enabled = enabled
-        self.notes = notes
-
 def _build_distance_kernel(
     train_df: pl.DataFrame, 
     test_df: pl.DataFrame, 
     beta: Optional[float], 
     distance_matrix_fn: Callable[[pl.DataFrame], np.ndarray],
-    kernel_type: str = "laplacian"
+    kernel_type: str = "laplacian",
+    seed: Optional[int] = None,
+    cache: Optional[DistanceMatrixCache] = None,
+    method_name: Optional[str] = None,
 ) -> ArrayPair:
     n_train = train_df.height
-    # Vertically stack dataframes to build a unified distance matrix
     full_df = pl.concat([train_df, test_df], how="vertical")
     
-    # Compute full distance matrix
-    D_full = np.asarray(distance_matrix_fn(full_df), dtype=np.float64)
+    D_full = None
+    if seed is not None and cache is not None and method_name is not None:
+        D_full = cache.load(seed, full_df, method_name)
     
-    # Extract blocks using standard slicing
+    if D_full is None:
+        D_full = np.asarray(distance_matrix_fn(full_df), dtype=np.float64)
+        if seed is not None and cache is not None and method_name is not None:
+            cache.save(D_full, seed, full_df, method_name)
+    
     D_train = _sanitize_distance_matrix(D_full[:n_train, :n_train])
     D_test = _sanitize_distance_matrix(D_full[n_train:, :n_train])
     
@@ -159,20 +236,48 @@ def _build_distance_kernel(
         return _rbf_kernel_from_distance(D_train, beta_val), _rbf_kernel_from_distance(D_test, beta_val)
     return _laplacian_kernel_from_distance(D_train, beta_val), _laplacian_kernel_from_distance(D_test, beta_val)
 
+def _sanitize_kernel_matrix(K: np.ndarray) -> np.ndarray:
+    """Sanitize kernel matrix for numerical stability."""
+    K = np.asarray(K, dtype=np.float64)
+    if K.size == 0:
+        return K
+    
+    finite = np.isfinite(K)
+    if not finite.all():
+        logger.warning(f"Kernel matrix contains {(~finite).sum()} non-finite values")
+        replacement = np.nanmax(K[finite]) if finite.any() else 1.0
+        K = np.nan_to_num(K, nan=replacement, posinf=replacement, neginf=replacement)
+    
+    if K.ndim == 2 and K.shape[0] == K.shape[1]:
+        K = (K + K.T) / 2.0
+    
+    K = np.maximum(K, 1e-10)
+    return K
+
 def _build_direct_kernel(
     train_df: pl.DataFrame, 
     test_df: pl.DataFrame, 
-    kernel_matrix_fn: Callable[[pl.DataFrame], np.ndarray]
+    kernel_matrix_fn: Callable[[pl.DataFrame], np.ndarray],
+    seed: Optional[int] = None,
+    cache: Optional[DistanceMatrixCache] = None,
+    method_name: Optional[str] = None,
 ) -> ArrayPair:
     n_train = train_df.height
     full_df = pl.concat([train_df, test_df], how="vertical")
     
-    # Compute full precomputed kernel matrix
-    K_full = np.asarray(kernel_matrix_fn(full_df), dtype=np.float64)
+    K_full = None
+    if seed is not None and cache is not None and method_name is not None:
+        K_full = cache.load(seed, full_df, method_name)
     
-    # Extract blocks directly without applying exp(-beta * D)
-    K_train = K_full[:n_train, :n_train]
-    K_test = K_full[n_train:, :n_train]
+    if K_full is None:
+        K_full = np.asarray(kernel_matrix_fn(full_df), dtype=np.float64)
+        K_full = _sanitize_kernel_matrix(K_full)
+        
+        if seed is not None and cache is not None and method_name is not None:
+            cache.save(K_full, seed, full_df, method_name)
+    
+    K_train = _sanitize_kernel_matrix(K_full[:n_train, :n_train])
+    K_test = _sanitize_kernel_matrix(K_full[n_train:, :n_train])
     
     return K_train, K_test
 
@@ -262,8 +367,8 @@ def get_regression_methods(
         MethodSpec(
             name=f"{descriptor}_riemann_logeuclidean_dist_laplacian",
             kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: Riemann.distance_matrix(df=df, descriptor=descriptor, distance_type="log-euclidean", pca=False), "laplacian"
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: Riemann.distance_matrix(df=df, descriptor=descriptor, distance_type="log-euclidean", pca=False), "laplacian", **kw
             ),
             notes="Direct Log-Euclidean distance matrix. Should mathematically match tangent_laplacian."
         ),
@@ -287,8 +392,8 @@ def get_regression_methods(
         MethodSpec(
             name=f"{descriptor}_grassmann_chordal_dist_laplacian",
             kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: Grassmann.distance_matrix(df=df, descriptor=descriptor, k=grassmann_k, distance_type="chordal"), "laplacian"
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: Grassmann.distance_matrix(df=df, descriptor=descriptor, k=grassmann_k, distance_type="chordal"), "laplacian", **kw
             ),
             notes="Direct Chordal distance matrix. Should mathematically match projection_laplacian."
         ),
@@ -313,8 +418,10 @@ def get_regression_methods(
         MethodSpec(
             name=f"{descriptor}_rematch_direct",
             kind="kernel",
-            builder=lambda tr, te, b: _build_direct_kernel(
-                tr, te, b, lambda df: REMatch.kernel_matrix(df=df, descriptor=descriptor, alpha=rematch_alpha)
+            builder=lambda tr, te, b, **kw: _build_direct_kernel(
+                tr, te, 
+                kernel_matrix_fn=lambda df: REMatch.kernel_matrix(df=df, descriptor=descriptor, alpha=rematch_alpha),
+                **kw
             ),
             beta_grid=[None], 
             notes="REMatch Entropic OT Kernel"
@@ -322,32 +429,66 @@ def get_regression_methods(
         MethodSpec(
             name=f"{descriptor}_wasserstein_w1",
             kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: Wasserstein.distance_matrix(df, descriptor=descriptor, metric="euclidean"), "laplacian"
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: Wasserstein.distance_matrix(df, descriptor=descriptor, metric="euclidean"), "laplacian", **kw
             ),
             notes="Earth Mover's Distance (W1) with standard Euclidean ground cost."
         ),
         MethodSpec(
             name=f"{descriptor}_wasserstein_w2",
             kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: np.sqrt(Wasserstein.distance_matrix(df, descriptor=descriptor, metric="sqeuclidean")), "laplacian"
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: np.sqrt(Wasserstein.distance_matrix(df, descriptor=descriptor, metric="sqeuclidean")), "laplacian", **kw
             ),
             notes="Wasserstein-2 (W2) distance requiring sqrt of the sqeuclidean EMD cost."
         ),
         MethodSpec(
             name=f"{descriptor}_grassmann_geodesic",
             kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: Grassmann.distance_matrix(df=df, descriptor=descriptor, k=grassmann_k, distance_type="geodesic"), "laplacian"
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: Grassmann.distance_matrix(df=df, descriptor=descriptor, k=grassmann_k, distance_type="geodesic"), "laplacian", **kw
             ),
         ),
         MethodSpec(
             name=f"{descriptor}_riemann_affine_invariant",
             kind="distance",
-            builder=lambda tr, te, b: _build_distance_kernel(
-                tr, te, b, lambda df: Riemann.distance_matrix(df=df, descriptor=descriptor, distance_type="affine-invariant", pca=False), "laplacian"
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: Riemann.distance_matrix(df=df, descriptor=descriptor, distance_type="affine-invariant", pca=False), "laplacian", **kw
             ),
+        ),
+
+        # --- Persistent Homology (Topological Space Elements) ---
+        MethodSpec(
+            name=f"{descriptor}_ph_coordinates_bottleneck",
+            kind="distance",
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: PersistentHomology.distance_matrix(df=df, descriptor="coordinates", metric="bottleneck"), "laplacian", **kw
+            ),
+            notes="Persistent Homology over raw Cartesian coordinates using Bottleneck metric."
+        ),
+        MethodSpec(
+            name=f"{descriptor}_ph_coordinates_sliced_wasserstein",
+            kind="distance",
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: PersistentHomology.distance_matrix(df=df, descriptor="coordinates", metric="sliced-wasserstein"), "laplacian", **kw
+            ),
+            notes="Persistent Homology over raw Cartesian coordinates using Sliced-Wasserstein metric."
+        ),
+        MethodSpec(
+            name=f"{descriptor}_ph_descriptor_space_bottleneck",
+            kind="distance",
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: PersistentHomology.distance_matrix(df=df, descriptor=descriptor, metric="bottleneck"), "laplacian", **kw
+            ),
+            notes="Persistent Homology over unpooled descriptor space matrix distributions using Bottleneck metric."
+        ),
+        MethodSpec(
+            name=f"{descriptor}_ph_descriptor_space_sliced_wasserstein",
+            kind="distance",
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b, lambda df: PersistentHomology.distance_matrix(df=df, descriptor=descriptor, metric="sliced-wasserstein"), "laplacian", **kw
+            ),
+            notes="Persistent Homology over unpooled descriptor space matrix distributions using Sliced-Wasserstein metric."
         ),
     ]
 
@@ -366,7 +507,9 @@ def _cv_score_precomputed_krr(K_train: np.ndarray, y_train: np.ndarray, alpha: f
 def _fit_one_method(
     method: MethodSpec, train_df: pl.DataFrame, test_df: pl.DataFrame,
     y_train: np.ndarray, y_test: np.ndarray, alpha_grid: Sequence[float],
-    cv: int, random_state: int
+    cv: int, random_state: int,
+    seed: Optional[int] = None,
+    cache: Optional[DistanceMatrixCache] = None,
 ) -> Dict[str, Any]:
     
     logger.info(f"Evaluating regression method: {method.name}")
@@ -377,7 +520,10 @@ def _fit_one_method(
 
     for beta in candidate_betas:
         try:
-            K_train, K_test = method.builder(train_df, test_df, beta)
+            if method.kind in ("distance", "kernel"):
+                K_train, K_test = method.builder(train_df, test_df, beta, seed=seed, cache=cache, method_name=method.name)
+            else:
+                K_train, K_test = method.builder(train_df, test_df, beta)
             K_train = np.asarray(K_train, dtype=np.float64)
             K_train = (K_train + K_train.T) / 2.0
             K_test = np.asarray(K_test, dtype=np.float64)
@@ -390,6 +536,7 @@ def _fit_one_method(
                         "cv_mse": cv_mse, "K_train": K_train, "K_test": K_test
                     }
         except Exception as e:
+            logger.error(f"Error computing kernel for '{method.name}' with beta={beta}: {e}")
             warnings.warn(f"Skipping beta={beta} for '{method.name}': {e}")
             continue
 
@@ -421,6 +568,7 @@ def compare_non_euclidean_regression(
     df: Any, descriptor: str, target_col: str,
     alpha_grid: Sequence[float] = (0.1, 0.5, 1.0, 5.0, 10.0, 50.0),
     test_size: float = 0.2, cv: int = 5, random_state: int = 40,
+    cache: Optional[DistanceMatrixCache] = None,
 ) -> Dict[str, Any]:
     
     cleaned = _clean_regression_df(df, target_col, descriptor)
@@ -439,7 +587,8 @@ def compare_non_euclidean_regression(
     for spec in specs:
         try:
             res = _fit_one_method(
-                spec, train_df, test_df, y_train, y_test, alpha_grid, cv, random_state
+                spec, train_df, test_df, y_train, y_test, alpha_grid, cv, random_state,
+                seed=random_state, cache=cache
             )
             fitted[spec.name] = res.pop("model")
             predictions[spec.name] = res.pop("y_test_pred")
@@ -460,33 +609,38 @@ def compare_non_euclidean_regression(
 if __name__ == '__main__':
     from src.datasets import QM9Dataset
 
-    n = 15
-    qm9 = QM9Dataset(limit=n, descriptors=["soap", "mace"])
+    n = 2000
+    descriptores = ["soap"]
+    qm9 = QM9Dataset(limit=n, descriptors=descriptores)
     df = qm9.load()
-    
+    df = df.filter((pl.col("geometric_strain") >= 0) & (pl.col("geometric_strain").is_finite()))
+    n = df.height
+
     output_dir = "results/qm9/regression"
     os.makedirs(output_dir, exist_ok=True)
     
     USE_SAVED_MATRICES = True
     CACHE_DIR_PATH = ".cache/distance_matrices"
     
-    #SEEDS = [42, 123, 456, 789, 1024, 2048, 4096, 8192, 16384, 32768]
-    SEEDS = [42, 123, 456, 789, 1024]
-    all_targets = ["gap", "mu", "cv", "u0", "A", "B", "C"]
-    target_g = ["gap", "mu"]
+    SEEDS = [42, 123, 456]
+    all_targets = ["gap", "mu", "cv", "geometric_strain", "u0", "A", "B", "C"]
+    target_g = ["geometric_strain", "gap", "mu"]
     lim = f"n_{n}"
     path = os.path.join(output_dir, lim)
     os.makedirs(path, exist_ok=True)
 
+    logger.info(f"Starting regression benchmarks on QM9 with {n} samples. Results will be saved to {path}.")
+
     for target in target_g:
         logger.info(f"=== Starting benchmark for target: {target.upper()} ===")
-        for desc in ["soap", "mace"]:
+        for desc in descriptores:
             summary_path = os.path.join(path, f"results_summary_{target}_{desc}.csv")
             if os.path.exists(summary_path):
                 logger.info(f" -> Summary already exists at {summary_path}, skipping...")
                 continue
             logger.info(f"--- Evaluating descriptor: {desc.upper()} ---")
             
+            cache = DistanceMatrixCache(CACHE_DIR_PATH) if USE_SAVED_MATRICES else None
             all_results = []
             all_artifacts = {}
             
@@ -495,7 +649,7 @@ if __name__ == '__main__':
                 
                 comparison = compare_non_euclidean_regression(
                     df, descriptor=desc, target_col=target,
-                    random_state=seed
+                    random_state=seed, cache=cache
                 )
                 
                 res_df = comparison["results"].with_columns(pl.lit(seed).alias("seed"))
@@ -509,13 +663,9 @@ if __name__ == '__main__':
                     "test_indices": comparison["test_indices"]
                 }
             
-            # Combine the results from all 10 seeds
             full_results_df = pl.concat(all_results)
-            
-            # Filter out any runs that failed before calculating aggregations
             ok_runs = full_results_df.filter(pl.col("status") == "ok")
             
-            # Calculate Mean and Standard Deviation for metrics across seeds
             summary_df = ok_runs.group_by(["method", "kind"]).agg([
                 pl.col("test_rmse").mean().alias("test_rmse_mean"),
                 pl.col("test_rmse").std().alias("test_rmse_std"),
@@ -526,6 +676,5 @@ if __name__ == '__main__':
                 pl.col("total_seconds").mean().alias("time_mean_sec")
             ]).sort("test_rmse_mean", nulls_last=True)
             
-            # Save both raw logs (for deep debugging) and summary stats (for papers/reporting)
             full_results_df.write_csv(os.path.join(path, f"results_raw_{target}_{desc}.csv"))
             summary_df.write_csv(os.path.join(path, f"results_summary_{target}_{desc}.csv"))
