@@ -281,7 +281,8 @@ class QM9Dataset:
                 f"Failed to resolve stable configurations for {failed_count} molecules "
                 f"({(failed_count / len(df)) * 100:.2f}% of dataset). Column populated with None."
             )
-        return df.with_columns(pl.Series("geometric_strain", strain_scores, dtype=pl.Float64))
+        df = df.with_columns(pl.Series("geometric_strain", strain_scores, dtype=pl.Float64))
+        return df.filter((pl.col("geometric_strain") >= 0) & (pl.col("geometric_strain").is_finite()) & (pl.col("geometric_strain").is_not_nan()))
 
     def _add_requested_descriptors(self) -> bool:
         """Adds descriptor columns requested at init-time; returns True if dataframe schema changed."""

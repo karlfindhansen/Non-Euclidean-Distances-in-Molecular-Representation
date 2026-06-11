@@ -205,6 +205,7 @@ dependencies = [
     { name = "rdkit" },
     { name = "ripser" },
     { name = "scikit-bio" },
+    { name = "scikit-posthocs" },
     { name = "seaborn" },
     { name = "selfies" },
     { name = "torch" },
@@ -255,6 +256,7 @@ requires-dist = [
     { name = "rdkit", specifier = "==2025.9.4" },
     { name = "ripser", specifier = ">=0.6.14" },
     { name = "scikit-bio", specifier = ">=0.7.2" },
+    { name = "scikit-posthocs", specifier = ">=0.14.0" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "selfies", specifier = ">=2.2.0" },
     { name = "torch", specifier = ">=2.6.0" },
@@ -2302,6 +2304,10 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8d/4a/e6dde6fde7feef1b9bed1e0387b2492115fda39b4057f070c442498ae4ed/kmedoids-0.5.4-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:aca6446893b8d88a64996eee9c684de19c93048d4c86aed2b18a6c6c8ef5af0e", size = 500607, upload-time = "2025-11-04T11:00:58.638Z" },
     { url = "https://files.pythonhosted.org/packages/e9/fa/4e148647a1e56a8ce97d3c3e90eff6aa99bccc922f596d4c139f86ed05b7/kmedoids-0.5.4-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:f1ba92ed4b0ce620c81dfc976fcb75bdce391b03e8e1068c072862bf88e600fd", size = 553475, upload-time = "2025-11-04T11:01:00.073Z" },
     { url = "https://files.pythonhosted.org/packages/27/e6/c3c808550851ce62bfdb6802a5835dcbf54fe9e4976469d51eab1f065da9/kmedoids-0.5.4-cp314-none-win_amd64.whl", hash = "sha256:f057f398747439b3bf5e17326ad905484d874d3c9a4838163c70ae789517c85a", size = 390008, upload-time = "2025-11-04T11:01:01.798Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/9a/a645fb15d5d8305ddcf38ebd32c09a64fce593fafe7954050ce1f4454ddf/kmedoids-0.5.4-cp315-cp315-manylinux_2_28_aarch64.whl", hash = "sha256:5abf094fea854401d4ca5c34284b5bc164ec6fb2a259082e7b55e1befe81e8a1", size = 423665, upload-time = "2026-05-22T12:47:54.993Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/ee/a48e4146edd4ec77363ec3433d3cad2191e565bb1556215de0bed10c1995/kmedoids-0.5.4-cp315-cp315-manylinux_2_28_x86_64.whl", hash = "sha256:44684600660cc7a70204459dff6e6cff48fbff1ce8c9d0fb2ec297c5a0d7245c", size = 457303, upload-time = "2026-05-22T12:47:56.771Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/e4/717cec906f77cc9156d825b1eea32947e1c6a35b6fecf67c1f3b1897e6a9/kmedoids-0.5.4-cp315-cp315-musllinux_1_2_aarch64.whl", hash = "sha256:61b9a38a5f1386aa01c6d750a88959d2bd7d04bf86685ba6a147fc4924f1ee26", size = 489625, upload-time = "2026-05-22T12:47:58.427Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/81/a95332cb4c08fae2591a8db20e42cf3f46e55987e55387e28d1742f68dbf/kmedoids-0.5.4-cp315-cp315-musllinux_1_2_x86_64.whl", hash = "sha256:a43bf223fb1e528bdc302fc9bfe3d402ca0de5073b958833d6ae54bd5ceedf1d", size = 532704, upload-time = "2026-05-22T12:48:00.081Z" },
 ]
 
 [[package]]
@@ -4887,6 +4893,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/57/51f2384575bdec454f4fe4e7a919d696c9ebce914590abf3e52d47607ab8/scikit_learn-1.8.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:15fc3b5d19cc2be65404786857f2e13c70c83dd4782676dd6814e3b89dc8f5b9", size = 8922467, upload-time = "2025-12-10T07:08:47.408Z" },
     { url = "https://files.pythonhosted.org/packages/35/4d/748c9e2872637a57981a04adc038dacaa16ba8ca887b23e34953f0b3f742/scikit_learn-1.8.0-cp314-cp314t-win_amd64.whl", hash = "sha256:00d6f1d66fbcf4eba6e356e1420d33cc06c70a45bb1363cd6f6a8e4ebbbdece2", size = 8774395, upload-time = "2025-12-10T07:08:49.337Z" },
     { url = "https://files.pythonhosted.org/packages/60/22/d7b2ebe4704a5e50790ba089d5c2ae308ab6bb852719e6c3bd4f04c3a363/scikit_learn-1.8.0-cp314-cp314t-win_arm64.whl", hash = "sha256:f28dd15c6bb0b66ba09728cf09fd8736c304be29409bd8445a080c1280619e8c", size = 8002647, upload-time = "2025-12-10T07:08:51.601Z" },
+]
+
+[[package]]
+name = "scikit-posthocs"
+version = "0.14.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scipy" },
+    { name = "seaborn" },
+    { name = "statsmodels" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/88/1a1758a6b68079cc58dd38b291cd194a29f9018a0eb5397342c5156009e5/scikit_posthocs-0.14.0.tar.gz", hash = "sha256:3b9f9273fc9037ee967d11b6a15aef1c6c0ed33a1936ff8879d6f5fb0a181227", size = 40554, upload-time = "2026-05-26T13:01:40.73Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/75/50/975860099ee9f1288f030374386d110c54d58cd1dc71df023135aa79633d/scikit_posthocs-0.14.0-py3-none-any.whl", hash = "sha256:9e2ecd5828cb783c42c1923e223eab202f529b03ab97de587647ab30f6e88333", size = 36836, upload-time = "2026-05-26T13:01:39.23Z" },
 ]
 
 [[package]]
