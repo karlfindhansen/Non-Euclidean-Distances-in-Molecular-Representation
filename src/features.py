@@ -697,7 +697,6 @@ class MolecularFeaturizer:
             reduce="mean",
         )
 
-
     @staticmethod
     def compute_chemprop_embeddings(
         smiles_series: pl.Series,

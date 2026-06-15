@@ -462,6 +462,37 @@ class Riemann:
         return np.asarray(vectorized_dataset, dtype=np.float64)
 
     @classmethod
+    def euclidean_vectorize(cls, spd_matrices: np.ndarray) -> np.ndarray:
+        """
+        Flat (Frobenius) vectorization of SPD matrices WITHOUT the matrix logarithm.
+
+        Curvature-ablation control for `log_euclidean_vectorize`. Uses the IDENTICAL
+        sqrt(2) off-diagonal scaling, so the ONLY difference from the Log-Euclidean
+        tangent vector is the log map itself. The Euclidean dot product of these
+        vectors equals the Frobenius inner product <C_i, C_j>_F.
+        """
+        spd_matrices = np.asarray(spd_matrices, dtype=np.float64)
+        if spd_matrices.ndim != 3 or spd_matrices.shape[1] != spd_matrices.shape[2]:
+            raise ValueError("spd_matrices must have shape (n_molecules, d, d).")
+
+        _, d, _ = spd_matrices.shape
+        triu_idx = np.triu_indices(d)                       # includes diagonal (same as log version)
+        weight_matrix = np.where(np.eye(d, dtype=bool), 1.0, np.sqrt(2.0))
+
+        out = []
+        for idx, C in enumerate(spd_matrices):
+            if not np.allclose(C, C.T, rtol=1e-5, atol=1e-8):
+                raise ValueError(f"Matrix at index {idx} failed symmetry validation.")
+            out.append((C * weight_matrix)[triu_idx])      # NO eigendecomposition, NO log
+        return np.asarray(out, dtype=np.float64)
+
+    @classmethod
+    def flat_vectorized_spd_matrices(cls, df, descriptor='soap', pca=True) -> np.ndarray:
+        """Same OAS covariance as `vectorized_spd_matrices`, flat-vectorized (no log)."""
+        spd_matrices = cls.get_spd_matrices(df=df, descriptor=descriptor, pca=pca)
+        return cls.euclidean_vectorize(spd_matrices)
+
+    @classmethod
     def vectorized_spd_matrices(
         cls,
         df: Any,
@@ -484,6 +515,30 @@ class Riemann:
             eig_floor=eig_floor,
             warn_threshold=warn_threshold,
         )
+    
+    @classmethod
+    def diagonal_logeuclidean_vectorize(cls, spd_matrices, eig_floor=1e-12):
+        """Diagonal block of the Log-Euclidean tangent: diag(log C), D-dim.
+        Exactly the full tangent with off-diagonal coordinates removed -> isolates
+        the contribution of cross-channel covariance."""
+        out = []
+        for C in np.asarray(spd_matrices, dtype=np.float64):
+            w, Q = np.linalg.eigh(C)
+            log_C = Q @ np.diag(np.log(np.clip(w, eig_floor, None))) @ Q.T
+            out.append(np.diag(log_C))
+        return np.asarray(out, dtype=np.float64)
+
+    @classmethod
+    def diagonal_logeuclidean(cls, df, descriptor='soap', pca=False, eig_floor=1e-12):
+        spd = cls.get_spd_matrices(df=df, descriptor=descriptor, pca=pca)
+        return cls.diagonal_logeuclidean_vectorize(spd, eig_floor=eig_floor)
+
+    @classmethod
+    def scalar_logeuclidean(cls, df, descriptor='soap', pca=False, eig_floor=1e-12):
+        """tr(log C)/D = mean log-variance, 1-dim. If this matches diagonal/full,
+        the SPD representation has collapsed to a single scalar."""
+        diag = cls.diagonal_logeuclidean(df, descriptor=descriptor, pca=pca, eig_floor=eig_floor)
+        return diag.mean(axis=1, keepdims=True)
 
     @classmethod
     def matrix_pca(cls, n_pca, raw_matrices):
@@ -508,6 +563,22 @@ class Riemann:
             raw_matrices = reduced_matrices
 
         return raw_matrices
+    
+    @classmethod
+    def shrinkage_diagnostics(cls, df, descriptor='soap', pca=False):
+        raw = _feature_matrices_from_df(df, descriptor)
+        if pca:
+            raw = cls.matrix_pca(df['num_atoms'].min() - 2, raw)
+        rows = []
+        for X, n in zip(raw, df['num_atoms'].to_list()):
+            X = np.asarray(X, dtype=np.float64)
+            C, rho = oas(X, assume_centered=False)            # rho == OAS shrinkage intensity
+            D = C.shape[0]; nu = np.trace(C) / D
+            off = C - np.diag(np.diag(C))
+            rows.append({"num_atoms": int(X.shape[0]), "n_heavy": int(n),
+                        "oas_rho": float(rho), "D": int(D),
+                        "offdiag_energy_frac": float(np.sum(off**2) / np.sum(C**2))})
+        return pl.DataFrame(rows)
 
     @classmethod
     def distance_matrix(

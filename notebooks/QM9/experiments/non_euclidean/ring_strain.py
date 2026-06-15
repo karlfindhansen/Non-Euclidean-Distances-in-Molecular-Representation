@@ -123,6 +123,7 @@ def run_strain_topology_comparison(
     """
     Computes topological summaries, saves standalone figures, and groups core 
     visual benchmarks into three distinct narrative-driven 1x3 composite figures.
+    Runs UMAP across 5 distinct random states to generate statistical error bars.
     All outputs are saved to results/qm9/strain.
     """
     output_dir = "results/qm9/strain"
@@ -135,8 +136,12 @@ def run_strain_topology_comparison(
     unique_classes = np.unique(legend_labels)
 
     pre_umap_metrics = {}
-    post_umap_metrics = {}
+    # Track runs across multiple seeds to compute mean and std
+    post_umap_runs = {name: [] for name in matrices.keys()}
     umap_coordinates_cache = {}
+
+    # Define 5 random states for statistical validation
+    umap_seeds = [42, 13, 108, 2026, 888]
 
     plt.style.use("seaborn-v0_8-whitegrid")
     palette = {
@@ -145,44 +150,52 @@ def run_strain_topology_comparison(
         "Acyclic (No Rings)": "#8ebd77"
     }
 
-    # 1. Pipeline execution: Compute metrics, run UMAP, and export separate panels
+    # 1. Pipeline execution: Compute ambient metrics, loop seeds, run UMAP, and export panels
     for name, dist_matrix in matrices.items():
+        # Ambient space is deterministic, calculate once
         pre_umap_metrics[name] = calculate_spatial_metrics(dist_matrix, legend_labels, unique_classes)
         
-        print(f"Computing UMAP projection from precomputed {name} matrix...")
-        reducer = UMAP(n_neighbors=5, metric="precomputed", random_state=42)
-        umap_coords = reducer.fit_transform(dist_matrix)
-        umap_coordinates_cache[name] = umap_coords
-        
-        d_umap = squareform(pdist(umap_coords, metric="euclidean"))
-        post_umap_metrics[name] = calculate_spatial_metrics(d_umap, legend_labels, unique_classes)
+        print(f"\n[+] Processing framework: {name}")
+        for idx, seed in enumerate(umap_seeds):
+            print(f"    -> Running UMAP with random_state={seed}... ", end="", flush=True)
+            reducer = UMAP(n_neighbors=5, metric="precomputed", random_state=seed)
+            umap_coords = reducer.fit_transform(dist_matrix)
+            
+            # Compute 2D Euclidean spatial metrics for this run
+            d_umap = squareform(pdist(umap_coords, metric="euclidean"))
+            run_metrics = calculate_spatial_metrics(d_umap, legend_labels, unique_classes)
+            post_umap_runs[name].append(run_metrics)
+            print("Done.")
 
-        # Generate and Save Individual Subplot Figure
-        fig_ind, ax_ind = plt.subplots(figsize=(6, 5), dpi=300)
-        sns.scatterplot(
-            x=umap_coords[:, 0], y=umap_coords[:, 1],
-            hue=legend_labels, palette=palette, s=85, alpha=0.85,
-            edgecolors="#2d3436", linewidths=0.6, ax=ax_ind, zorder=10,
-        )
-        ax_ind.set_title(name, fontsize=12, fontweight="bold", pad=12)
-        ax_ind.set_xlabel("UMAP 1", fontsize=10, fontweight="medium")
-        ax_ind.set_ylabel("UMAP 2", fontsize=10, fontweight="medium")
-        ax_ind.grid(True, linestyle=":", alpha=0.6)
-        ax_ind.legend(title="Topology Mapping", frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="best")
-        sns.despine(ax=ax_ind)
-        plt.tight_layout()
-        
-        safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(",", "").replace("$", "").replace("\\", "")
-        fig_ind.savefig(os.path.join(output_dir, f"sub_{safe_name}.png"), dpi=300, bbox_inches="tight")
-        plt.close(fig_ind)
+            # Use the first seed as the baseline for visualization output
+            if seed == umap_seeds[0]:
+                umap_coordinates_cache[name] = umap_coords
+                
+                # Generate and Save Individual Subplot Figure
+                fig_ind, ax_ind = plt.subplots(figsize=(6, 5), dpi=300)
+                sns.scatterplot(
+                    x=umap_coords[:, 0], y=umap_coords[:, 1],
+                    hue=legend_labels, palette=palette, s=85, alpha=0.85,
+                    edgecolors="#2d3436", linewidths=0.6, ax=ax_ind, zorder=10,
+                )
+                ax_ind.set_title(name, fontsize=12, fontweight="bold", pad=12)
+                ax_ind.set_xlabel("UMAP 1", fontsize=10, fontweight="medium")
+                ax_ind.set_ylabel("UMAP 2", fontsize=10, fontweight="medium")
+                ax_ind.grid(True, linestyle=":", alpha=0.6)
+                ax_ind.legend(title="Topology Mapping", frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="best")
+                sns.despine(ax=ax_ind)
+                plt.tight_layout()
+                
+                safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(",", "").replace("$", "").replace("\\", "")
+                fig_ind.savefig(os.path.join(output_dir, f"sub_{safe_name}.png"), dpi=300, bbox_inches="tight")
+                plt.close(fig_ind)
 
-    # Helper function to plot a structured thematic group row
+    # Helper function to plot a structured thematic group row using baseline coordinates
     def plot_thematic_group(group_keys: List[str], filename: str, figure_title: str):
         fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=300)
         
         for idx, key in enumerate(group_keys):
             ax = axes[idx]
-            # Match localized dynamic naming assignments from dictionary keys safely
             actual_key = next((k for k in matrices.keys() if k.startswith(key)), None)
             
             if actual_key is None:
@@ -214,35 +227,49 @@ def run_strain_topology_comparison(
         fig.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
-    # 2. Render Figure 18a: Flattening vs. Transport Topologies
+    # 2. Render 1x3 composite figures using the cached baseline mappings
     group_a = ["Averaged SOAP (Euclidean)", "Wasserstein ($W_2$)", "REMatch (Optimized"]
     plot_thematic_group(group_a, "fig18a_transport_topologies.png", "Figure 18a: Limits of Flattening vs. Distribution Spaces")
 
-    # 3. Render Figure 18b: Covariance Mapping on Curved Manifolds
     group_b = ["Riemann (Log-Euclidean)", "Riemann (Affine-Invariant)", "Grassmann (Geodesic"]
     plot_thematic_group(group_b, "fig18b_curved_manifolds.png", "Figure 18b: Statistical Covariance Spaces and Curved Subspaces")
 
-    # 4. Render Figure 18c: Topological Persistence vs. Feature Smoothing
     group_c = ["PH (Coords, Bottleneck)", "PH (Coords, Sliced", "PH (SOAP, Sliced"]
     plot_thematic_group(group_c, "fig18c_persistent_homology.png", "Figure 18c: Topological Persistence Over Atomic Complexes vs. Smoothed Field Space")
 
-    # 5. Output Evaluation Summaries to Terminal
-    print("\n" + "="*115)
+    # 3. Output Evaluation Summaries to Terminal
+    print("\n" + "="*125)
     print(" PRE-UMAP METRICS (True Ambient Space Distances)")
-    print("="*115)
+    print("="*125)
     print(f"{'Framework / Metric':<35} | {'Intra-Class (↓)':<15} | {'Inter-Class (↑)':<15} | {'Sep Ratio (↓)':<13} | {'Silhouette (↑)':<12}")
-    print("-" * 115)
+    print("-" * 125)
     for name, m in pre_umap_metrics.items():
         print(f"{name:<35} | {m['Intra-Class']:<15.4f} | {m['Inter-Class']:<15.4f} | {m['Sep-Ratio']:<13.4f} | {m['Silhouette']:<12.4f}")
     
-    print("\n" + "="*115)
-    print(" POST-UMAP METRICS (Distorted 2D Embedding Distances - USE WITH CAUTION)")
-    print("="*115)
-    print(f"{'Framework / Metric':<35} | {'Intra-Class (↓)':<15} | {'Inter-Class (↑)':<15} | {'Sep Ratio (↓)':<13} | {'Silhouette (↑)':<12}")
-    print("-" * 115)
-    for name, m in post_umap_metrics.items():
-        print(f"{name:<35} | {m['Intra-Class']:<15.4f} | {m['Inter-Class']:<15.4f} | {m['Sep-Ratio']:<13.4f} | {m['Silhouette']:<12.4f}")
-    print("="*115 + "\n")
+    print("\n" + "="*145)
+    print(" POST-UMAP METRICS (Statistical Aggregation across 5 Random States: mean ± std)")
+    print("="*145)
+    print(f"{'Framework / Metric':<35} | {'Intra-Class (↓)':<22} | {'Inter-Class (↑)':<22} | {'Sep Ratio (↓)':<20} | {'Silhouette (↑)':<20}")
+    print("-" * 145)
+    
+    for name in matrices.keys():
+        runs = post_umap_runs[name]
+        
+        # Unpack accumulated metrics lists
+        sil_vals = [r["Silhouette"] for r in runs]
+        intra_vals = [r["Intra-Class"] for r in runs]
+        inter_vals = [r["Inter-Class"] for r in runs]
+        sep_vals = [r["Sep-Ratio"] for r in runs]
+        
+        # Format strings as mean ± standard deviation
+        intra_str = f"{np.mean(intra_vals):.4f} ± {np.std(intra_vals):.4f}"
+        inter_str = f"{np.mean(inter_vals):.4f} ± {np.std(inter_vals):.4f}"
+        sep_str = f"{np.mean(sep_vals):.4f} ± {np.std(sep_vals):.4f}"
+        sil_str = f"{np.mean(sil_vals):.4f} ± {np.std(sil_vals):.4f}"
+        
+        print(f"{name:<35} | {intra_str:<22} | {inter_str:<22} | {sep_str:<20} | {sil_str:<20}")
+        
+    print("="*145 + "\n")
     print(f"[+] Successfully exported grouped composite grids and standalone panels to: {output_dir}")
 
 

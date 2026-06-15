@@ -215,15 +215,19 @@ def get_reference_methods(
     """
     2D reference baselines.  These use 1D embedding vectors (not per-atom matrices)
     and the chemically standard distance metrics for each representation.
+
+    NOTE: each block uses a distinct column variable (morgan_col / chemprop_col).
+    Do NOT reuse one `col` name across blocks — the builder lambdas capture it by
+    reference, so a reassigned `col` silently routes every method to the last value.
     """
     methods: List[MethodSpec] = []
 
     if has_morgan:
-        col = "morgan_fingerprint"
+        morgan_col = "morgan_fingerprint"
         methods.append(MethodSpec(
             name="morgan_tanimoto_direct",
             kind="kernel",
-            builder=lambda tr, te, _b, **_: _build_tanimoto_direct(tr, te, col),
+            builder=lambda tr, te, _b, **_: _build_tanimoto_direct(tr, te, morgan_col),
             beta_grid=[None],
             notes="Morgan r=2 fingerprints with Tanimoto kernel (precomputed). "
                   "Chemically canonical; equivalent to KRR on Tanimoto similarity.",
@@ -231,47 +235,47 @@ def get_reference_methods(
         methods.append(MethodSpec(
             name="morgan_tanimoto_laplacian",
             kind="vector",
-            builder=lambda tr, te, b: _build_tanimoto_laplacian(tr, te, b, col),
+            builder=lambda tr, te, b: _build_tanimoto_laplacian(tr, te, b, morgan_col),
             notes="Morgan fingerprints + Tanimoto distance → Laplacian kernel.",
         ))
         methods.append(MethodSpec(
             name="morgan_euclidean_laplacian",
             kind="vector",
-            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=col, kernel_type="laplacian"),
+            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=morgan_col, kernel_type="laplacian"),
             notes="Morgan fingerprints + Euclidean distance → Laplacian kernel (Tanimoto ablation).",
         ))
         methods.append(MethodSpec(
             name="morgan_linear",
             kind="vector",
-            builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=col),
+            builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=morgan_col),
             beta_grid=[None],
             notes="Morgan fingerprints + linear (dot-product) kernel.",
         ))
 
     if has_chemprop:
-        col = "chemprop_embedding"
+        chemprop_col = "chemprop_embedding"
         methods.append(MethodSpec(
             name="chemprop_cosine_laplacian",
             kind="vector",
-            builder=lambda tr, te, b: _build_cosine_laplacian(tr, te, b, col),
+            builder=lambda tr, te, b: _build_cosine_laplacian(tr, te, b, chemprop_col),
             notes="ChemProp GNN embedding + Cosine distance → Laplacian kernel.",
         ))
         methods.append(MethodSpec(
             name="chemprop_cosine_rbf",
             kind="vector",
-            builder=lambda tr, te, b: _build_cosine_rbf(tr, te, b, col),
+            builder=lambda tr, te, b: _build_cosine_rbf(tr, te, b, chemprop_col),
             notes="ChemProp GNN embedding + Cosine distance → RBF kernel.",
         ))
         methods.append(MethodSpec(
             name="chemprop_euclidean_laplacian",
             kind="vector",
-            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=col, kernel_type="laplacian"),
+            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=chemprop_col, kernel_type="laplacian"),
             notes="ChemProp GNN embedding + Euclidean distance → Laplacian (Cosine ablation).",
         ))
         methods.append(MethodSpec(
             name="chemprop_linear",
             kind="vector",
-            builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=col),
+            builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=chemprop_col),
             beta_grid=[None],
             notes="ChemProp GNN embedding + linear (dot-product) kernel.",
         ))
@@ -599,7 +603,7 @@ def main() -> None:
                         help="Target columns to loop over (electronic / geometric / directional).")
     parser.add_argument("--seeds", nargs="+", type=int, default=None,
                         help="Explicit list of split seeds. Overrides --n-seeds.")
-    parser.add_argument("--n-seeds", type=int, default=5,
+    parser.add_argument("--n-seeds", type=int, default=3,
                         help="Number of seeds to take from the default pool (if --seeds unset).")
     parser.add_argument("--sample-size", type=int, default=2000,
                         help="QM9 stratified sample size.")
@@ -652,7 +656,7 @@ def main() -> None:
 
     logger.info(f"Loading QM9 stratified sample (limit={SAMPLE_SIZE}, all descriptors)...")
     qm9 = QM9Dataset(limit=SAMPLE_SIZE, descriptors=ALL_DESCRIPTORS)
-    subset = qm9.load(force_process=True)
+    subset = qm9.load(force_process=False)
     logger.info(f"Loaded {subset.height} molecules.")
 
     # ── Validate target columns ────────────────────────────────────────────
@@ -778,6 +782,21 @@ def main() -> None:
                         logger.info(f"      {r['method']:<50s}  test_rmse={r.get('test_rmse', '?'):.4f}")
                     else:
                         logger.warning(f"      {r['method']:<50s}  FAILED: {r.get('error')}")
+
+        if not args.smoke:
+            seed_dir = os.path.join(OUT_DIR, "seeds")
+            os.makedirs(seed_dir, exist_ok=True)
+            seed_rows = [
+                r for rows in rows_by_target.values()
+                for r in rows if r.get("seed") == seed
+            ]
+            pl.DataFrame(seed_rows).write_csv(
+                os.path.join(seed_dir, f"raw_seed_{seed}.csv")
+            )
+            logger.info(
+                f"  [checkpoint] seed {seed}: wrote {len(seed_rows)} rows "
+                f"→ seeds/raw_seed_{seed}.csv"
+            )
 
     wall_total = time.perf_counter() - wall_start
     logger.info(f"\nWall time for run: {wall_total:.1f} s ({wall_total/60:.1f} min)")

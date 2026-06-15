@@ -188,6 +188,23 @@ def _laplacian_kernel_from_distance(D: np.ndarray, beta: float) -> np.ndarray:
     K = np.exp(-float(beta) * D)
     return np.nan_to_num(K, nan=0.0, posinf=1.0, neginf=0.0)
 
+_RBF_LS_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)   # x median-heuristic length-scale, inner-CV tuned
+
+def _build_vector_rbf_tuned(train_df, test_df, mult, column):
+    X_tr = _pooled_descriptor_matrix(train_df, column=column)
+    X_te = _pooled_descriptor_matrix(test_df, column=column)
+    D_tr = _sanitize_distance_matrix(cdist(X_tr, X_tr, metric="euclidean"))
+    D_te = _sanitize_distance_matrix(cdist(X_te, X_tr, metric="euclidean"))
+    beta = _median_beta_from_distances(D_tr, squared=True) * (1.0 if mult is None else float(mult))
+    return _rbf_kernel_from_distance(D_tr, beta), _rbf_kernel_from_distance(D_te, beta)
+
+def _build_projection_rbf_tuned(train_df, test_df, mult, projection_fn):
+    X_tr, X_te = projection_fn(train_df), projection_fn(test_df)
+    D_tr = _sanitize_distance_matrix(cdist(X_tr, X_tr, metric="euclidean"))
+    D_te = _sanitize_distance_matrix(cdist(X_te, X_tr, metric="euclidean"))
+    beta = _median_beta_from_distances(D_tr, squared=True) * (1.0 if mult is None else float(mult))
+    return _rbf_kernel_from_distance(D_tr, beta), _rbf_kernel_from_distance(D_te, beta)
+
 def _rbf_kernel_from_distance(D: np.ndarray, beta: float) -> np.ndarray:
     D = _sanitize_distance_matrix(D)
     K = np.exp(-float(beta) * (D ** 2))
@@ -356,6 +373,18 @@ def get_regression_methods(
             notes=f"Averaged {descriptor.upper()} descriptor with pure Linear dot-product kernel.",
         ),
         MethodSpec(
+            name=f"{descriptor}_covariance_flat_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_linear_kernel(
+                tr, te, b,
+                lambda df: Riemann.flat_vectorized_spd_matrices(df, descriptor=descriptor, pca=False)
+            ),
+            beta_grid=[None],
+            notes="CONTROL: flat (Frobenius) vectorization of the SAME OAS covariance as "
+                "riemann_tangent_linear, WITHOUT the matrix log. Isolates second-moment from "
+                "curvature. R2(tangent_linear) - R2(this) = pure curvature gain.",
+        ),
+        MethodSpec(
             name=f"{descriptor}_riemann_tangent_linear",
             kind="vector",
             builder=lambda tr, te, b: _build_projection_linear_kernel(
@@ -371,6 +400,52 @@ def get_regression_methods(
                 tr, te, b, lambda df: Riemann.distance_matrix(df=df, descriptor=descriptor, distance_type="log-euclidean", pca=False), "laplacian", **kw
             ),
             notes="Direct Log-Euclidean distance matrix. Should mathematically match tangent_laplacian."
+        ),
+        MethodSpec(
+            name=f"{descriptor}_covariance_euclidean_dist_laplacian",
+            kind="distance",
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b,
+                lambda df: Riemann.distance_matrix(
+                    df=df, descriptor=descriptor, distance_type="euclidean", pca=False),
+                "laplacian", **kw
+            ),
+            notes="CONTROL: flat Frobenius distance on the SAME OAS covariance ('euclid'). "
+                "Curvature ablation vs riemann_logeuclidean_dist_laplacian; gives a kernelised "
+                "(non-linear) cross-check of the linear ladder.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_scalar_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_linear_kernel(
+                tr, te, b, lambda df: Riemann.scalar_logeuclidean(df, descriptor=descriptor, pca=False)),
+            beta_grid=[None],
+            notes="ABLATION (flaw 3): single scalar tr(log C)/D. Collapse floor for the SPD rep.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_scalar_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: Riemann.scalar_logeuclidean(df, descriptor=descriptor, pca=False)),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="Scalar collapse floor under tuned RBF.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_diagonal_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: Riemann.diagonal_logeuclidean(df, descriptor=descriptor, pca=False)),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="Diagonal block under tuned RBF.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_diagonal_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_linear_kernel(
+                tr, te, b, lambda df: Riemann.diagonal_logeuclidean(df, descriptor=descriptor, pca=False)),
+            beta_grid=[None],
+            notes="ABLATION (flaw 3): diag(log C) only, off-diagonals removed. "
+                "R2(riemann_tangent_linear) - R2(this) = pure cross-channel covariance contribution.",
         ),
         MethodSpec(
             name=f"{descriptor}_grassmann_projection_linear",
@@ -393,11 +468,28 @@ def get_regression_methods(
             name=f"{descriptor}_grassmann_chordal_dist_laplacian",
             kind="distance",
             builder=lambda tr, te, b, **kw: _build_distance_kernel(
-                tr, te, b, lambda df: Grassmann.distance_matrix(df=df, descriptor=descriptor, k=grassmann_k, distance_type="chordal"), "laplacian", **kw
+                tr, te, b,
+                lambda df: Grassmann.distance_matrix(
+                    df=df, descriptor=descriptor, k=grassmann_k, distance_type="chordal"),
+                "laplacian", **kw
             ),
-            notes="Direct Chordal distance matrix. Should mathematically match projection_laplacian."
+            notes="FLAT rung: extrinsic chordal distance ||sin Theta||_2 — straight-line distance of "
+                "the projectors P=UU^T in Euclidean matrix space. Grassmann analog of the Frobenius "
+                "(covariance_euclidean) SPD rung. Flat-vs-curved partner of grassmann_geodesic.",
         ),
-        
+        MethodSpec(
+            name=f"{descriptor}_grassmann_geodesic_dist_laplacian",   # renamed for parity
+            kind="distance",
+            builder=lambda tr, te, b, **kw: _build_distance_kernel(
+                tr, te, b,
+                lambda df: Grassmann.distance_matrix(
+                    df=df, descriptor=descriptor, k=grassmann_k, distance_type="geodesic"),
+                "laplacian", **kw
+            ),
+            notes="CURVED rung: intrinsic geodesic ||Theta||_2 (principal-angle arc length) on G(k,D). "
+                "Identical subspaces and kernel to the chordal rung; only the metric curvature differs. "
+                "R2(this) - R2(chordal) = pure Grassmann curvature gain.",
+        ),
         MethodSpec(
             name=f"{descriptor}_avg_laplacian",
             kind="vector",
@@ -406,7 +498,35 @@ def get_regression_methods(
         MethodSpec(
             name=f"{descriptor}_avg_rbf",
             kind="vector",
-            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=f"{descriptor}_embedding", kernel_type="rbf"),
+            builder=lambda tr, te, b: _build_vector_rbf_tuned(tr, te, b, column=f"{descriptor}_embedding"),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="STEELMAN baseline: the universal nonlinear function of the first moment. Any geometry "
+                "claim must beat THIS, not avg_linear.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_covariance_flat_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: Riemann.flat_vectorized_spd_matrices(df, descriptor=descriptor, pca=False)),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="Flat covariance, tuned RBF. Pairs with avg_rbf (Δ_info) and tangent_rbf (Δ_curvature).",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_riemann_tangent_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: Riemann.vectorized_spd_matrices(df, descriptor=descriptor, pca=False)),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="Log-Euclidean tangent, tuned RBF. Curvature claim must survive HERE, not only linear.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_grassmann_projection_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: Grassmann.get_projection_features(
+                    df, descriptor=descriptor, k=grassmann_k, vectorization_type='isometric')),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="Grassmann chordal embedding, tuned RBF.",
         ),
         MethodSpec(
             name=f"{descriptor}_riemann_tangent_laplacian",
