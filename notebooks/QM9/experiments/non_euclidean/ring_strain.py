@@ -6,8 +6,9 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from typing import Any, Optional, Dict, List
 
+from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import pdist, squareform
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import adjusted_rand_score, silhouette_score
 from umap import UMAP
 
 # Assuming rdkit, REMatch, Wasserstein, Grassmann, and Riemann are imported globally
@@ -15,27 +16,29 @@ from rdkit import Chem
 from src.non_euclidean import Grassmann, Riemann, PersistentHomology
 from src.optimal_transport import REMatch, Wasserstein
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 def categorize_pure_carbocycle(smiles: str) -> str:
     """
-    Parses a SMILES string. 
+    Parses a SMILES string.
     Returns '3-ring', '6-ring', or 'Acyclic' ONLY if the structure is entirely Carbon/Hydrogen.
     Rejects heterocycles (rings with O, N, F, etc.) and mixed structures.
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None or "O" in smiles or "N" in smiles or "F" in smiles:
         return "Other"
-    
+
     ring_info = mol.GetRingInfo().AtomRings()
     if not ring_info:
         return "Acyclic"
-        
+
     for ring in ring_info:
         for atom_idx in ring:
             atom = mol.GetAtomWithIdx(atom_idx)
             if atom.GetAtomicNum() != 6:
                 return "Heterocycle"
-                
+
     sizes = set(len(ring) for ring in ring_info)
     if sizes == {3}:
         return "3-ring"
@@ -45,6 +48,28 @@ def categorize_pure_carbocycle(smiles: str) -> str:
         return "Mixed/Other"
 
 
+def one_nn_accuracy(dist_matrix: np.ndarray, labels: np.ndarray) -> float:
+    """
+    Leave-one-out 1-Nearest-Neighbour classification accuracy on a *precomputed*
+    distance matrix (matches the definition in thesis subsection 3.7: the fraction
+    of points whose nearest neighbour shares their class).
+
+    This is a UMAP-independent separability check: it operates directly on the raw
+    ambient distance matrix produced by each framework, so it measures the intrinsic
+    discriminability of the distance metric rather than the metric+UMAP composition.
+
+    Self-matches are excluded by masking the diagonal. Ties are broken by argmin
+    (first nearest neighbour), which is the standard convention.
+    """
+    d = np.asarray(dist_matrix, dtype=float).copy()
+    if d.shape[0] != d.shape[1]:
+        raise ValueError("one_nn_accuracy expects a square precomputed distance matrix.")
+    np.fill_diagonal(d, np.inf)
+    nn_idx = np.argmin(d, axis=1)
+    labels = np.asarray(labels)
+    return float(np.mean(labels[nn_idx] == labels))
+
+
 def optimize_rematch_alpha(df: pl.DataFrame, label_col: str = "ring_category") -> float:
     """
     Scans a logarithmic grid of alpha values to find the hyperparameter that
@@ -52,32 +77,32 @@ def optimize_rematch_alpha(df: pl.DataFrame, label_col: str = "ring_category") -
     """
     print("\n[+] Initiating REMatch alpha optimization for maximum class separation...")
     rematch = REMatch()
-    
+
     raw_labels = df.get_column(label_col).to_numpy()
     conditions = [raw_labels == "3-ring", raw_labels == "6-ring", raw_labels == "Acyclic"]
     choices = ["Strained", "Relaxed", "Acyclic"]
     legend_labels = np.select(conditions, choices, default="Other")
-    
+
     alpha_grid = np.logspace(-3.5, 1, num=50)
-    
+
     best_alpha = 0.1
     best_silhouette = -1.0
-    
+
     for alpha in alpha_grid:
         d_test = rematch.distance_matrix(df, alpha=alpha)
         if d_test is None:
             continue
-            
+
         try:
             current_sil = silhouette_score(d_test, legend_labels, metric="precomputed")
             print(f" -> Testing alpha = {alpha:.6f} | Ambient Silhouette Score: {current_sil:.4f}")
-            
+
             if current_sil > best_silhouette:
                 best_silhouette = current_sil
                 best_alpha = alpha
         except ValueError:
             continue
-            
+
     print("[+] Optimization Complete.")
     print(f"    Best Alpha: {best_alpha:.6f} (Max Ambient Silhouette: {best_silhouette:.4f})")
     return float(best_alpha)
@@ -86,7 +111,8 @@ def optimize_rematch_alpha(df: pl.DataFrame, label_col: str = "ring_category") -
 def calculate_spatial_metrics(dist_matrix: np.ndarray, legend_labels: np.ndarray, unique_classes: np.ndarray) -> Dict[str, float]:
     """Helper to compute clustering metrics given a precomputed distance matrix across N classes."""
     sil = silhouette_score(dist_matrix, legend_labels, metric="precomputed")
-    
+    nn_acc = one_nn_accuracy(dist_matrix, legend_labels)
+
     intra_dists = []
     for cls in unique_classes:
         idx = np.where(legend_labels == cls)[0]
@@ -106,12 +132,18 @@ def calculate_spatial_metrics(dist_matrix: np.ndarray, legend_labels: np.ndarray
     mean_inter = np.mean(inter_dists) if inter_dists else 1.0
 
     separation_ratio = mean_intra / mean_inter
-    
+
+    Z = linkage(squareform(dist_matrix), method="average")
+    hc_labels = fcluster(Z, t=len(unique_classes), criterion="maxclust")
+    ari = adjusted_rand_score(legend_labels, hc_labels)
+
     return {
-        "Silhouette": sil, 
-        "Intra-Class": mean_intra, 
-        "Inter-Class": mean_inter, 
-        "Sep-Ratio": separation_ratio
+        "Silhouette": sil,
+        "1-NN Acc": nn_acc,
+        "Intra-Class": mean_intra,
+        "Inter-Class": mean_inter,
+        "Sep-Ratio": separation_ratio,
+        "ARI": ari,
     }
 
 
@@ -121,7 +153,7 @@ def run_strain_topology_comparison(
     label_col: str = "ring_category"
 ) -> None:
     """
-    Computes topological summaries, saves standalone figures, and groups core 
+    Computes topological summaries, saves standalone figures, and groups core
     visual benchmarks into three distinct narrative-driven 1x3 composite figures.
     Runs UMAP across 5 distinct random states to generate statistical error bars.
     All outputs are saved to results/qm9/strain.
@@ -140,12 +172,12 @@ def run_strain_topology_comparison(
     post_umap_runs = {name: [] for name in matrices.keys()}
     umap_coordinates_cache = {}
 
-    # Define 5 random states for statistical validation
-    umap_seeds = [42, 13, 108, 2026, 888]
+    # Define 10 random states for statistical validation
+    umap_seeds = [42, 13, 108, 2026, 888, 534, 235, 2153, 551, 123]
 
     plt.style.use("seaborn-v0_8-whitegrid")
     palette = {
-        "Strained (3-Membered)": "#cc5e53", 
+        "Strained (3-Membered)": "#cc5e53",
         "Relaxed (6-Membered)": "#568bbd",
         "Acyclic (No Rings)": "#8ebd77"
     }
@@ -154,13 +186,13 @@ def run_strain_topology_comparison(
     for name, dist_matrix in matrices.items():
         # Ambient space is deterministic, calculate once
         pre_umap_metrics[name] = calculate_spatial_metrics(dist_matrix, legend_labels, unique_classes)
-        
+
         print(f"\n[+] Processing framework: {name}")
         for idx, seed in enumerate(umap_seeds):
             print(f"    -> Running UMAP with random_state={seed}... ", end="", flush=True)
-            reducer = UMAP(n_neighbors=5, metric="precomputed", random_state=seed)
+            reducer = UMAP(n_neighbors=5, metric="precomputed", random_state=seed, n_jobs=1)
             umap_coords = reducer.fit_transform(dist_matrix)
-            
+
             # Compute 2D Euclidean spatial metrics for this run
             d_umap = squareform(pdist(umap_coords, metric="euclidean"))
             run_metrics = calculate_spatial_metrics(d_umap, legend_labels, unique_classes)
@@ -170,7 +202,7 @@ def run_strain_topology_comparison(
             # Use the first seed as the baseline for visualization output
             if seed == umap_seeds[0]:
                 umap_coordinates_cache[name] = umap_coords
-                
+
                 # Generate and Save Individual Subplot Figure
                 fig_ind, ax_ind = plt.subplots(figsize=(6, 5), dpi=300)
                 sns.scatterplot(
@@ -185,7 +217,7 @@ def run_strain_topology_comparison(
                 ax_ind.legend(title="Topology Mapping", frameon=True, facecolor="white", edgecolor="#e2e8f0", loc="best")
                 sns.despine(ax=ax_ind)
                 plt.tight_layout()
-                
+
                 safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(",", "").replace("$", "").replace("\\", "")
                 fig_ind.savefig(os.path.join(output_dir, f"sub_{safe_name}.png"), dpi=300, bbox_inches="tight")
                 plt.close(fig_ind)
@@ -193,15 +225,15 @@ def run_strain_topology_comparison(
     # Helper function to plot a structured thematic group row using baseline coordinates
     def plot_thematic_group(group_keys: List[str], filename: str, figure_title: str):
         fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=300)
-        
+
         for idx, key in enumerate(group_keys):
             ax = axes[idx]
             actual_key = next((k for k in matrices.keys() if k.startswith(key)), None)
-            
+
             if actual_key is None:
                 ax.axis('off')
                 continue
-                
+
             coords = umap_coordinates_cache[actual_key]
             sns.scatterplot(
                 x=coords[:, 0], y=coords[:, 1],
@@ -215,7 +247,7 @@ def run_strain_topology_comparison(
             if ax.get_legend() is not None:
                 ax.get_legend().remove()
             sns.despine(ax=ax)
-            
+
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(
             handles, labels, title="Topology Mapping", title_fontsize=10, fontsize=9,
@@ -229,47 +261,51 @@ def run_strain_topology_comparison(
 
     # 2. Render 1x3 composite figures using the cached baseline mappings
     group_a = ["Averaged SOAP (Euclidean)", "Wasserstein ($W_2$)", "REMatch (Optimized"]
-    plot_thematic_group(group_a, "fig18a_transport_topologies.png", "Figure 18a: Limits of Flattening vs. Distribution Spaces")
+    plot_thematic_group(group_a, "fig18a_transport_topologies.png", "Limits of Flattening vs. Distribution Spaces")
 
     group_b = ["Riemann (Log-Euclidean)", "Riemann (Affine-Invariant)", "Grassmann (Geodesic"]
-    plot_thematic_group(group_b, "fig18b_curved_manifolds.png", "Figure 18b: Statistical Covariance Spaces and Curved Subspaces")
+    plot_thematic_group(group_b, "fig18b_curved_manifolds.png", "Statistical Covariance Spaces and Curved Subspaces")
 
     group_c = ["PH (Coords, Bottleneck)", "PH (Coords, Sliced", "PH (SOAP, Sliced"]
-    plot_thematic_group(group_c, "fig18c_persistent_homology.png", "Figure 18c: Topological Persistence Over Atomic Complexes vs. Smoothed Field Space")
+    plot_thematic_group(group_c, "fig18c_persistent_homology.png", "Topological Persistence Over Atomic Complexes vs. Smoothed Field Space")
 
     # 3. Output Evaluation Summaries to Terminal
-    print("\n" + "="*125)
-    print(" PRE-UMAP METRICS (True Ambient Space Distances)")
-    print("="*125)
-    print(f"{'Framework / Metric':<35} | {'Intra-Class (↓)':<15} | {'Inter-Class (↑)':<15} | {'Sep Ratio (↓)':<13} | {'Silhouette (↑)':<12}")
-    print("-" * 125)
+    print("\n" + "="*162)
+    print(" PRE-UMAP METRICS (True Ambient Space Distances) -- 1-NN is UMAP-independent")
+    print("="*162)
+    print(f"{'Framework / Metric':<35} | {'1-NN Acc (↑)':<12} | {'Intra-Class (↓)':<15} | {'Inter-Class (↑)':<15} | {'Sep Ratio (↓)':<13} | {'Silhouette (↑)':<12} | {'ARI HC-Avg (↑)':<14}")
+    print("-" * 162)
     for name, m in pre_umap_metrics.items():
-        print(f"{name:<35} | {m['Intra-Class']:<15.4f} | {m['Inter-Class']:<15.4f} | {m['Sep-Ratio']:<13.4f} | {m['Silhouette']:<12.4f}")
-    
-    print("\n" + "="*145)
-    print(" POST-UMAP METRICS (Statistical Aggregation across 5 Random States: mean ± std)")
-    print("="*145)
-    print(f"{'Framework / Metric':<35} | {'Intra-Class (↓)':<22} | {'Inter-Class (↑)':<22} | {'Sep Ratio (↓)':<20} | {'Silhouette (↑)':<20}")
-    print("-" * 145)
-    
+        print(f"{name:<35} | {m['1-NN Acc']:<12.4f} | {m['Intra-Class']:<15.4f} | {m['Inter-Class']:<15.4f} | {m['Sep-Ratio']:<13.4f} | {m['Silhouette']:<12.4f} | {m['ARI']:<14.4f}")
+
+    print("\n" + "="*190)
+    print(" POST-UMAP METRICS (Statistical Aggregation across 10 Random States: mean ± std)")
+    print("="*190)
+    print(f"{'Framework / Metric':<35} | {'1-NN Acc (↑)':<20} | {'Intra-Class (↓)':<22} | {'Inter-Class (↑)':<22} | {'Sep Ratio (↓)':<20} | {'Silhouette (↑)':<20} | {'ARI HC-Avg (↑)':<20}")
+    print("-" * 190)
+
     for name in matrices.keys():
         runs = post_umap_runs[name]
-        
+
         # Unpack accumulated metrics lists
+        nn_vals = [r["1-NN Acc"] for r in runs]
         sil_vals = [r["Silhouette"] for r in runs]
         intra_vals = [r["Intra-Class"] for r in runs]
         inter_vals = [r["Inter-Class"] for r in runs]
         sep_vals = [r["Sep-Ratio"] for r in runs]
-        
+        ari_vals = [r["ARI"] for r in runs]
+
         # Format strings as mean ± standard deviation
+        nn_str = f"{np.mean(nn_vals):.4f} ± {np.std(nn_vals):.4f}"
         intra_str = f"{np.mean(intra_vals):.4f} ± {np.std(intra_vals):.4f}"
         inter_str = f"{np.mean(inter_vals):.4f} ± {np.std(inter_vals):.4f}"
         sep_str = f"{np.mean(sep_vals):.4f} ± {np.std(sep_vals):.4f}"
         sil_str = f"{np.mean(sil_vals):.4f} ± {np.std(sil_vals):.4f}"
-        
-        print(f"{name:<35} | {intra_str:<22} | {inter_str:<22} | {sep_str:<20} | {sil_str:<20}")
-        
-    print("="*145 + "\n")
+        ari_str = f"{np.mean(ari_vals):.4f} ± {np.std(ari_vals):.4f}"
+
+        print(f"{name:<35} | {nn_str:<20} | {intra_str:<22} | {inter_str:<22} | {sep_str:<20} | {sil_str:<20} | {ari_str:<20}")
+
+    print("="*190 + "\n")
     print(f"[+] Successfully exported grouped composite grids and standalone panels to: {output_dir}")
 
 
@@ -292,7 +328,7 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     counts_3 = df_3_rings_all.group_by("formula").len().rename({"len": "count_3"})
     counts_6 = df_6_rings_all.group_by("formula").len().rename({"len": "count_6"})
     counts_0 = df_acyclic_all.group_by("formula").len().rename({"len": "count_0"})
-    
+
     formula_overlap = (
         counts_3
         .join(counts_6, on="formula", how="inner")
@@ -316,7 +352,7 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     df_3_sampled = df_3_rings_all.filter(pl.col("formula") == best_formula).sample(n=max_size, seed=42)
     df_6_sampled = df_6_rings_all.filter(pl.col("formula") == best_formula).sample(n=max_size, seed=42)
     df_0_sampled = df_acyclic_all.filter(pl.col("formula") == best_formula).sample(n=max_size, seed=42)
-    
+
     df_experiment = pl.concat([df_3_sampled, df_6_sampled, df_0_sampled])
 
     print("Computing Euclidean and Wasserstein distance spaces...")
@@ -333,7 +369,7 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     rematch = REMatch()
     d_rematch_high = rematch.distance_matrix(df_experiment, alpha=10.0)
     d_rematch_opt = rematch.distance_matrix(df_experiment, alpha=optimized_alpha)
-    
+
     if d_rematch_high is None or d_rematch_opt is None:
         print("Error: REMatch returned non-finite matrices during final evaluation blocks.")
         return
@@ -341,7 +377,7 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     riemann = Riemann()
     d_riemann_log = riemann.distance_matrix(df_experiment, "soap", distance_type="log-euclidean")
     d_riemann_airm = riemann.distance_matrix(df_experiment, "soap", distance_type="affine-invariant")
-    
+
     d_grassmann_geodesic = Grassmann().distance_matrix(df_experiment, "soap", distance_type="geodesic", k=grassmann_k)
     d_grassmann_chordal = Grassmann().distance_matrix(df_experiment, "soap", distance_type="chordal", k=grassmann_k)
 
@@ -368,8 +404,8 @@ def run_pipeline(df_base: pl.DataFrame, grassmann_k: int = 3):
     }
 
     run_strain_topology_comparison(
-        df=df_experiment, 
-        matrices=matrices, 
+        df=df_experiment,
+        matrices=matrices,
         label_col="ring_category"
     )
 

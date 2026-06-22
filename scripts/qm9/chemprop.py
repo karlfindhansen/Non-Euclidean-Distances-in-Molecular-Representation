@@ -71,9 +71,9 @@ class CheMeleonFingerprint:
                 logger.error(f"Failed to move model to device '{device}': {e}")
                 raise
 
-    def __call__(self, molecules: list[str | Mol]) -> np.ndarray:
+    def __call__(self, molecules: list[str | Mol], batch_size: int = 512) -> np.ndarray:
         logger.info(f"Generating CheMeleon fingerprints for {len(molecules)} molecules...")
-        
+
         valid_mols = []
         for idx, m in enumerate(molecules):
             mol = MolFromSmiles(m) if isinstance(m, str) else m
@@ -81,27 +81,32 @@ class CheMeleonFingerprint:
                 logger.warning(f"Molecule at index {idx} (input: {m}) could not be parsed and will be skipped.")
             else:
                 valid_mols.append(mol)
-                
+
         if not valid_mols:
             logger.error("No valid molecules provided for fingerprint generation.")
             return np.array([])
 
-        try:
-            bmg = BatchMolGraph([self.featurizer(m) for m in valid_mols])
-        except Exception as e:
-            logger.error(f"Failed to featurize molecules into BatchMolGraph: {e}")
-            raise
-            
-        bmg.to(device=self.model.device)
-        
-        with torch.no_grad():
+        all_fps = []
+        for i in range(0, len(valid_mols), batch_size):
+            batch = valid_mols[i:i + batch_size]
             try:
-                fps = self.model.fingerprint(bmg).numpy(force=True)
-                logger.success(f"Successfully generated {fps.shape[0]} fingerprints of dimension {fps.shape[1]}.")
-                return fps
+                bmg = BatchMolGraph([self.featurizer(m) for m in batch])
             except Exception as e:
-                logger.error(f"Error during model forward pass (fingerprint extraction): {e}")
+                logger.error(f"Failed to featurize molecules into BatchMolGraph: {e}")
                 raise
+
+            bmg.to(device=self.model.device)
+
+            with torch.no_grad():
+                try:
+                    all_fps.append(self.model.fingerprint(bmg).numpy(force=True))
+                except Exception as e:
+                    logger.error(f"Error during model forward pass (fingerprint extraction): {e}")
+                    raise
+
+        fps = np.concatenate(all_fps, axis=0)
+        logger.success(f"Successfully generated {fps.shape[0]} fingerprints of dimension {fps.shape[1]}.")
+        return fps
 
 
 if __name__ == "__main__":

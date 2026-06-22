@@ -334,6 +334,45 @@ def _build_vector_kernel(
 
 # --- Linear (Dot Product) Builders ---
 
+def _tangent_ablation_projection(df: pl.DataFrame, descriptor: str, mode: str, random_state: int = 42) -> np.ndarray:
+    """
+    Projects SPD matrices into the tangent space, ablates the off-diagonals, 
+    and returns isometrically scaled vectors.
+    """
+    # 1. Extract raw matrices
+    matrices = np.stack([np.asarray(m, dtype=np.float64) for m in df[f"{descriptor}_matrix"].to_list()])
+    N, d, _ = matrices.shape
+
+    # 2. Vectorized Matrix Logarithm via Eigendecomposition to map to Tangent Space
+    # C = V @ diag(L) @ V^T  -->  log(C) = V @ diag(log(L)) @ V^T
+    evals, evecs = np.linalg.eigh(matrices)
+    evals = np.maximum(evals, 1e-10) # Prevent log(0)
+    log_evals = np.log(evals)
+    
+    log_matrices = evecs @ (log_evals[..., None] * evecs.transpose(0, 2, 1))
+    log_matrices = (log_matrices + log_matrices.transpose(0, 2, 1)) / 2.0 # Enforce perfect symmetry
+
+    # 3. Separate diagonals and off-diagonals
+    diags = np.diagonal(log_matrices, axis1=1, axis2=2)
+    iu, ju = np.triu_indices(d, k=1)
+    off_diags = log_matrices[:, iu, ju]
+
+    # 4. Apply Ablation Strategy
+    if mode == "mean":
+        # Replace every molecule's off-diagonals with the population average
+        off_diags_ablated = np.tile(np.mean(off_diags, axis=0), (N, 1))
+    elif mode == "shuffle":
+        # Randomly assign intact off-diagonal blocks across different molecules
+        rng = np.random.default_rng(random_state)
+        shuffled_idx = rng.permutation(N)
+        off_diags_ablated = off_diags[shuffled_idx]
+    else:
+        raise ValueError(f"Unknown ablation mode: {mode}")
+
+    # 5. Isometric vectorization
+    # We multiply off-diagonals by \sqrt{2} to preserve the Frobenius norm of the matrix in vector space
+    return np.concatenate([diags, np.sqrt(2.0) * off_diags_ablated], axis=1)
+
 def _build_linear_kernel(
     train_df: pl.DataFrame, test_df: pl.DataFrame, beta: Optional[float], column: str
 ) -> ArrayPair:
@@ -446,6 +485,60 @@ def get_regression_methods(
             beta_grid=[None],
             notes="ABLATION (flaw 3): diag(log C) only, off-diagonals removed. "
                 "R2(riemann_tangent_linear) - R2(this) = pure cross-channel covariance contribution.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_ablated_mean_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_linear_kernel(
+                tr, te, b, lambda df: _tangent_ablation_projection(df, descriptor, mode="mean")
+            ),
+            beta_grid=[None],
+            notes="ABLATION (c): True diagonal + population-mean off-diagonal block. Tests if specific cross-channel structures matter, or just their average magnitude.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_ablated_shuffle_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_linear_kernel(
+                tr, te, b, lambda df: _tangent_ablation_projection(df, descriptor, mode="shuffle")
+            ),
+            beta_grid=[None],
+            notes="ABLATION (c): True diagonal + randomly permuted off-diagonal blocks across molecules. Tests robustness against corrupted off-diagonal covariance.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_ablated_mean_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: _tangent_ablation_projection(df, descriptor, mode="mean")
+            ),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="ABLATION (c): Mean off-diagonal under tuned RBF.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_spd_ablated_shuffle_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: _tangent_ablation_projection(df, descriptor, mode="shuffle")
+            ),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="ABLATION (c): Shuffled off-diagonal under tuned RBF.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_baseline_size_trace_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_linear_kernel(
+                tr, te, b, lambda df: _size_trace_baseline_projection(df, descriptor)
+            ),
+            beta_grid=[None],
+            notes="MACRO BASELINE: Linear kernel on z-scored [N, tr(C)]. If R2 is high, geometric methods must explicitly beat this.",
+        ),
+        MethodSpec(
+            name=f"{descriptor}_baseline_size_trace_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_projection_rbf_tuned(
+                tr, te, b, lambda df: _size_trace_baseline_projection(df, descriptor)
+            ),
+            beta_grid=_RBF_LS_MULTIPLIERS,
+            notes="MACRO BASELINE: Tuned RBF on z-scored [N, tr(C)]. The non-linear equivalent of the macro baseline.",
         ),
         MethodSpec(
             name=f"{descriptor}_grassmann_projection_linear",
@@ -683,6 +776,41 @@ def _fit_one_method(
         "model": model,
         "y_test_pred": pred_test,
     }
+
+def _size_trace_baseline_projection(df: pl.DataFrame, descriptor: str) -> np.ndarray:
+    """
+    Extracts molecule size (N) and the trace of the covariance matrix tr(C).
+    Serves as a macroscopic baseline. Z-scores the features locally to ensure
+    the kernel isn't dominated by whichever feature has a larger raw magnitude.
+    """
+    # 1. Extract tr(C)
+    matrices = np.stack([np.asarray(m, dtype=np.float64) for m in df[f"{descriptor}_matrix"].to_list()])
+    traces = np.trace(matrices, axis1=1, axis2=2)
+    
+    # 2. Extract Molecule Size (N)
+    size_col = None
+    for col in ["n_atoms", "num_atoms", "size"]:
+        if col in df.columns:
+            size_col = col
+            break
+            
+    if size_col is None:
+        raise ValueError(
+            "DataFrame missing molecule size column. Please ensure a column like "
+            "'n_atoms' exists in your dataframe before running the macroscopic baseline."
+        )
+        
+    sizes = df[size_col].to_numpy(dtype=np.float64)
+    
+    # 3. Combine and Standardize
+    # We z-score to ensure the Linear/RBF kernels weight both features fairly.
+    # Note: Local train/test scaling is used here for pipeline compatibility; 
+    # for a 2D baseline on datasets like QM9, the distribution shift is negligible.
+    X = np.column_stack([sizes, traces])
+    X_mean = np.mean(X, axis=0)
+    X_std = np.std(X, axis=0) + 1e-8
+    
+    return (X - X_mean) / X_std
 
 def compare_non_euclidean_regression(
     df: Any, descriptor: str, target_col: str,

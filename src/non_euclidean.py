@@ -107,8 +107,9 @@ class PersistentHomology:
                 dist_mat = frame.get_all_distances(mic=False)
                 
             # --- PATH B: High-Dimensional Feature Space (e.g., SOAP) ---
-            else:
-                col_name = "soap_matrix" if descriptor.lower() == "soap" else descriptor
+            elif descriptor.lower() == "mace" or descriptor.lower() == "soap" or descriptor.lower() == "acsf":
+                desc = descriptor.lower()
+                col_name = f"{desc}_matrix" if descriptor.lower() == f"{desc}" else descriptor
                 X = np.asarray(row[col_name], dtype=np.float64)
                 
                 if len(X) == 0:
@@ -116,6 +117,9 @@ class PersistentHomology:
                     continue
                     
                 dist_mat = cdist(X, X, metric='euclidean')
+            
+            else:
+                logger.warning(f"Descriptor: {descriptor} not defined")
 
             # --- Extract Persistence Topology ---
             raw_dgms = ripser(dist_mat, maxdim=max_homology_dim, distance_matrix=True)["dgms"]

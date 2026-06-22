@@ -14,7 +14,9 @@ Targets (looped):
 ║ Block        ║ Representation                 ║ Distance / Kernel                  ║
 ╠══════════════╬════════════════════════════════╬════════════════════════════════════╣
 ║ 1 Reference  ║ Morgan fingerprints (2D)       ║ Tanimoto, Euclidean                ║
+║              ║ One-hot atom encoding (2D)     ║ Tanimoto, Euclidean                ║
 ║              ║ ChemProp GNN embeddings (2D)   ║ Cosine, Euclidean                  ║
+║              ║ Transformer embeddings (2D)    ║ Cosine, Euclidean                  ║
 ╠══════════════╬════════════════════════════════╬════════════════════════════════════╣
 ║ 2 Control    ║ Trivial mean predictor         ║ —                                  ║
 ║              ║ Atom composition {H,C,N,O,F}   ║ RBF-KRR                            ║
@@ -211,12 +213,14 @@ def _build_cosine_rbf(
 def get_reference_methods(
     has_morgan: bool = True,
     has_chemprop: bool = True,
+    has_onehot: bool = True,
+    has_transformer: bool = True,
 ) -> List[MethodSpec]:
     """
     2D reference baselines.  These use 1D embedding vectors (not per-atom matrices)
     and the chemically standard distance metrics for each representation.
 
-    NOTE: each block uses a distinct column variable (morgan_col / chemprop_col).
+    NOTE: each block uses a distinct column variable (morgan_col / chemprop_col / …).
     Do NOT reuse one `col` name across blocks — the builder lambdas capture it by
     reference, so a reassigned `col` silently routes every method to the last value.
     """
@@ -252,6 +256,35 @@ def get_reference_methods(
             notes="Morgan fingerprints + linear (dot-product) kernel.",
         ))
 
+    if has_onehot:
+        onehot_col = "selfies_onehot"
+        methods.append(MethodSpec(
+            name="onehot_tanimoto_direct",
+            kind="kernel",
+            builder=lambda tr, te, _b, **_: _build_tanimoto_direct(tr, te, onehot_col),
+            beta_grid=[None],
+            notes="One-hot atom encoding with Tanimoto kernel (precomputed).",
+        ))
+        methods.append(MethodSpec(
+            name="onehot_tanimoto_laplacian",
+            kind="vector",
+            builder=lambda tr, te, b: _build_tanimoto_laplacian(tr, te, b, onehot_col),
+            notes="One-hot atom encoding + Tanimoto distance → Laplacian kernel.",
+        ))
+        methods.append(MethodSpec(
+            name="onehot_euclidean_laplacian",
+            kind="vector",
+            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=onehot_col, kernel_type="laplacian"),
+            notes="One-hot atom encoding + Euclidean distance → Laplacian kernel (Tanimoto ablation).",
+        ))
+        methods.append(MethodSpec(
+            name="onehot_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=onehot_col),
+            beta_grid=[None],
+            notes="One-hot atom encoding + linear (dot-product) kernel.",
+        ))
+
     if has_chemprop:
         chemprop_col = "chemprop_embedding"
         methods.append(MethodSpec(
@@ -278,6 +311,34 @@ def get_reference_methods(
             builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=chemprop_col),
             beta_grid=[None],
             notes="ChemProp GNN embedding + linear (dot-product) kernel.",
+        ))
+
+    if has_transformer:
+        transformer_col = "selfies_transformer"
+        methods.append(MethodSpec(
+            name="transformer_cosine_laplacian",
+            kind="vector",
+            builder=lambda tr, te, b: _build_cosine_laplacian(tr, te, b, transformer_col),
+            notes="Transformer embedding + Cosine distance → Laplacian kernel.",
+        ))
+        methods.append(MethodSpec(
+            name="transformer_cosine_rbf",
+            kind="vector",
+            builder=lambda tr, te, b: _build_cosine_rbf(tr, te, b, transformer_col),
+            notes="Transformer embedding + Cosine distance → RBF kernel.",
+        ))
+        methods.append(MethodSpec(
+            name="transformer_euclidean_laplacian",
+            kind="vector",
+            builder=lambda tr, te, b: _build_vector_kernel(tr, te, b, column=transformer_col, kernel_type="laplacian"),
+            notes="Transformer embedding + Euclidean distance → Laplacian (Cosine ablation).",
+        ))
+        methods.append(MethodSpec(
+            name="transformer_linear",
+            kind="vector",
+            builder=lambda tr, te, b: _build_linear_kernel(tr, te, b, column=transformer_col),
+            beta_grid=[None],
+            notes="Transformer embedding + linear (dot-product) kernel.",
         ))
 
     return methods
@@ -595,7 +656,7 @@ def _print_timing_report(all_rows: List[Dict[str, Any]], n_full_seeds: int, out_
 
 def main() -> None:
     # ── Defaults ───────────────────────────────────────────────────────────
-    DEFAULT_SEEDS = [42, 123, 456, 789, 1011]  # 10 seeds
+    DEFAULT_SEEDS = [42, 123, 456, 789, 1011, 1014, 1452, 1642, 1752, 1997]  # 10 seeds
 
     parser = argparse.ArgumentParser(description="Three-block QM9 regression benchmark.")
     parser.add_argument("--targets", nargs="+",
@@ -603,7 +664,7 @@ def main() -> None:
                         help="Target columns to loop over (electronic / geometric / directional).")
     parser.add_argument("--seeds", nargs="+", type=int, default=None,
                         help="Explicit list of split seeds. Overrides --n-seeds.")
-    parser.add_argument("--n-seeds", type=int, default=3,
+    parser.add_argument("--n-seeds", type=int, default=5,
                         help="Number of seeds to take from the default pool (if --seeds unset).")
     parser.add_argument("--sample-size", type=int, default=2000,
                         help="QM9 stratified sample size.")
@@ -613,7 +674,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Configuration ──────────────────────────────────────────────────────
-    DESCRIPTORS_3D   = ["soap", "mace"]   # 3D per-atom descriptors (Block 3)
+    DESCRIPTORS_3D   = ["acsf", "soap", "mace"]   # 3D per-atom descriptors (Block 3)
     DESCRIPTORS_2D   = ["onehot", "transformer", "morgan", "chemprop"]  # 2D vector descriptors
     ALL_DESCRIPTORS  = DESCRIPTORS_3D + DESCRIPTORS_2D
 
@@ -680,11 +741,15 @@ def main() -> None:
         raise ValueError(f"Too few molecules after joint-target filtering: {subset.height}.")
 
     # ── Detect which 2D descriptors are available ──────────────────────────
-    has_morgan   = "morgan_fingerprint"  in subset.columns
-    has_chemprop = "chemprop_embedding"  in subset.columns
-    has_atom_z   = "atomic_numbers"      in subset.columns
+    has_morgan      = "morgan_fingerprint"    in subset.columns
+    has_onehot      = "selfies_onehot"    in subset.columns
+    has_chemprop    = "chemprop_embedding"    in subset.columns
+    has_transformer = "selfies_transformer" in subset.columns
+    has_atom_z      = "atomic_numbers"        in subset.columns
     logger.info(
-        f"Available: morgan={has_morgan}, chemprop={has_chemprop}, atomic_numbers={has_atom_z}"
+        f"Available: morgan={has_morgan}, onehot={has_onehot}, "
+        f"chemprop={has_chemprop}, transformer={has_transformer}, "
+        f"atomic_numbers={has_atom_z}"
     )
 
     cache = DistanceMatrixCache(CACHE_DIR) if USE_CACHE else None
@@ -737,10 +802,15 @@ def main() -> None:
                 rows_by_target[target].append(r)
 
             # ── Block 1: Reference (2D baselines) ──────────────────────────
-            if has_morgan or has_chemprop:
+            if has_morgan or has_onehot or has_chemprop or has_transformer:
                 logger.info("  [Block 1 — Reference]")
                 ref_methods = _filter_disabled(
-                    get_reference_methods(has_morgan=has_morgan, has_chemprop=has_chemprop),
+                    get_reference_methods(
+                        has_morgan=has_morgan,
+                        has_onehot=has_onehot,
+                        has_chemprop=has_chemprop,
+                        has_transformer=has_transformer,
+                    ),
                     DISABLE_METHODS,
                 )
                 ref_rows = run_method_list(
