@@ -4,7 +4,7 @@ Upgraded Robustness Benchmark — Thesis Chapter 4
 Dual-perturbation stress test across all geometric frameworks evaluated in the thesis.
 
 Dataset   : Balanced C9H16 tripartite (30 strained 3-rings / 30 relaxed 6-rings / 30 acyclic)
-Frameworks: Average SOAP | W2 | REMatch | Riemann (AI) | Grassmann k={3,25} | PH-SW | MACE Avg
+Frameworks: Average SOAP | W1 | REMatch | Riemann (AI) | Grassmann k={3,25} | PH-SW | MACE Avg
 Modes     : A – Stochastic dihedral rotations (physically grounded conformational noise)
             B – Isotropic bounded jitter with hard-sphere repulsion threshold
 Metrics   : MRR (Mean Reciprocal Rank) + Npres (Neighbourhood Preservation Ratio)
@@ -269,14 +269,15 @@ def _compute_all_matrices(
     df: pl.DataFrame,
     k_grassmann: List[int],
     include_mace: bool,
+    rematch_gamma: float = 0.1,
 ) -> Dict[str, np.ndarray]:
     matrices: Dict[str, np.ndarray] = {}
 
     X_avg = np.vstack(df["average_soap"].to_list())
     matrices["Average SOAP"] = squareform(pdist(X_avg, metric="euclidean"))
 
-    matrices["Wasserstein W2"] = Wasserstein.distance_matrix(df, "soap", metric="sqeuclidean")
-    matrices["REMatch (γ=0.1)"] = REMatch.distance_matrix(df, "soap", metric="linear", alpha=0.1)
+    matrices["Wasserstein W1"] = Wasserstein.distance_matrix(df, "soap", metric="euclidean")
+    matrices[f"REMatch (γ={rematch_gamma:.3g})"] = REMatch.distance_matrix(df, "soap", metric="linear", alpha=rematch_gamma)
     matrices["Riemann (AI)"]    = Riemann.distance_matrix(df, "soap", distance_type="affine-invariant", pca=False)
 
     for k in k_grassmann:
@@ -349,6 +350,7 @@ def _config_hash(
     k_grassmann: List[int],
     sigma_levels: List[float],
     k_npres: int,
+    rematch_gamma: float = 0.1,
 ) -> str:
     payload = json.dumps(
         {
@@ -358,6 +360,7 @@ def _config_hash(
             "k_grassmann": sorted(k_grassmann),
             "sigma_levels": sigma_levels,
             "k_npres": k_npres,
+            "rematch_gamma": rematch_gamma,
         },
         sort_keys=True,
     )
@@ -545,6 +548,56 @@ def load_saved_results(
     return results
 
 
+def _optimize_rematch_gamma(
+    clean_records: List[Dict],
+    soap,
+    rng: np.random.Generator,
+    gamma_candidates: Optional[List[float]] = None,
+    opt_sigmas: Optional[List[float]] = None,
+    n_perturbations: int = 5,
+    k_npres: int = 5,
+) -> float:
+    """Grid-search γ (alpha) for REMatch over [1e-3, 1e2]; return best by combined MRR+Npres."""
+    if gamma_candidates is None:
+        gamma_candidates = np.logspace(-3, 2, 10).tolist()
+    if opt_sigmas is None:
+        opt_sigmas = [0.05, 0.10, 0.20, 0.30]
+
+    print(f"\nOptimizing REMatch γ over {len(gamma_candidates)} candidates …")
+    best_gamma, best_score = gamma_candidates[0], -1.0
+
+    for gamma in gamma_candidates:
+        scores = []
+        for sigma in opt_sigmas:
+            all_rec, _ = _build_sigma_records(
+                clean_records, sigma, n_perturbations, "jitter", soap, None, rng
+            )
+            df_s = pl.DataFrame(all_rec)
+            idx_clean = (
+                df_s.with_row_index().filter(pl.col("is_clean"))
+                .select("index").to_series().to_list()
+            )
+            idx_noisy = (
+                df_s.with_row_index().filter(~pl.col("is_clean"))
+                .select("index").to_series().to_list()
+            )
+            parent_idx_col = df_s["parent_idx"].to_list()
+            topology_col   = df_s["topology_class"].to_list()
+            
+            M     = REMatch.distance_matrix(df_s, "soap", metric="linear", alpha=gamma)
+            mrr   = compute_mrr(M, idx_noisy, idx_clean, parent_idx_col)
+            npres = compute_npres(M, idx_noisy, topology_col, k=k_npres)
+            scores.append((mrr + npres) / 2.0)
+
+        score = float(np.mean(scores))
+        print(f"    γ = {gamma:.4g}  →  score = {score:.4f}")
+        if score > best_score:
+            best_score, best_gamma = score, gamma
+
+    print(f"  → Best γ = {best_gamma:.4g}  (score = {best_score:.4f})")
+    return best_gamma
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  MAIN BENCHMARK LOOP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,16 +621,6 @@ def run_upgraded_robustness(
         cache = RobustnessCache(_DEFAULT_CACHE_DIR)
         print(f"Cache auto-created at {_DEFAULT_CACHE_DIR!r}")
 
-    cfg_hash = _config_hash(n_per_class, n_perturbations, seed, k_grassmann, sigma_levels, k_npres)
-    if cache is not None:
-        cache.save_config(cfg_hash, {
-            "n_per_class": n_per_class, "n_perturbations": n_perturbations,
-            "seed": seed, "k_grassmann": k_grassmann,
-            "sigma_levels": sigma_levels, "k_npres": k_npres,
-            "modes": modes, "include_mace": include_mace,
-        })
-        print(f"Cache active — config_hash={cfg_hash!r}  ({cache.cache_dir})")
-
     rng = np.random.default_rng(seed)
 
     # ── Dataset ──────────────────────────────────────────────────────────────
@@ -591,14 +634,6 @@ def run_upgraded_robustness(
             print("MACE calculator loaded.")
         except Exception as e:
             print(f"MACE unavailable ({e}). Skipping MACE framework.")
-
-    # ── Framework registry ────────────────────────────────────────────────────
-    frameworks = (
-        ["Average SOAP", "Wasserstein W2", "REMatch (γ=0.1)", "Riemann (AI)"]
-        + [f"Grassmann k={k}" for k in k_grassmann]
-        + ["PH–Sliced W"]
-        + (["MACE Average"] if (mace_calc is not None) else [])
-    )
 
     # ── Precompute clean reference records ────────────────────────────────────
     clean_records: List[Dict] = []
@@ -623,13 +658,39 @@ def run_upgraded_robustness(
             rec["average_mace"] = mace_mat.mean(axis=0).tolist()
         clean_records.append(rec)
 
+    # ── Optimise REMatch γ (separate rng so main benchmark is unaffected) ─────
+    opt_rng = np.random.default_rng(seed ^ 0xCAFEBABE)
+    rematch_gamma = _optimize_rematch_gamma(clean_records, soap, opt_rng, k_npres=k_npres)
+    rematch_label = f"REMatch (γ={rematch_gamma:.3g})"
+
+    # ── Config hash & cache ───────────────────────────────────────────────────
+    cfg_hash = _config_hash(n_per_class, n_perturbations, seed, k_grassmann, sigma_levels, k_npres, rematch_gamma)
+    if cache is not None:
+        cache.save_config(cfg_hash, {
+            "n_per_class": n_per_class, "n_perturbations": n_perturbations,
+            "seed": seed, "k_grassmann": k_grassmann,
+            "sigma_levels": sigma_levels, "k_npres": k_npres,
+            "modes": modes, "include_mace": include_mace,
+            "rematch_gamma": rematch_gamma,
+        })
+        print(f"Cache active — config_hash={cfg_hash!r}  ({cache.cache_dir})")
+
+    # ── Framework registry ────────────────────────────────────────────────────
+    frameworks = (
+        ["Average SOAP", "Wasserstein W1", rematch_label, "Riemann (AI)"]
+        + [f"Grassmann k={k}" for k in k_grassmann]
+        + ["PH–Sliced W"]
+        + (["MACE Average"] if (mace_calc is not None) else [])
+    )
+
     # ── Results storage ───────────────────────────────────────────────────────
     results: Dict[str, Any] = {
-        "sigma_levels": sigma_levels,
-        "frameworks":   frameworks,
-        "k_npres":      k_npres,
-        "modes":        modes,
-        "metrics":      {},
+        "sigma_levels":  sigma_levels,
+        "frameworks":    frameworks,
+        "k_npres":       k_npres,
+        "modes":         modes,
+        "rematch_gamma": rematch_gamma,
+        "metrics":       {},
     }
 
     for mode in modes:
@@ -703,7 +764,9 @@ def run_upgraded_robustness(
                 cache.save_idx(cfg_hash, mode, s_idx,
                                idx_clean, idx_noisy, parent_idx_col, topology_col)
 
-            matrices = _compute_all_matrices(df_sigma, k_grassmann, include_mace and mace_calc is not None)
+            matrices = _compute_all_matrices(
+                df_sigma, k_grassmann, include_mace and mace_calc is not None, rematch_gamma
+            )
 
             for fw in frameworks:
                 if fw in matrices:
@@ -738,25 +801,25 @@ def run_upgraded_robustness(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PALETTE = {
-    "Average SOAP":    "#64748b",
-    "Wasserstein W2":  "#b45309",
-    "REMatch (γ=0.1)": "#6d28d9",
-    "Riemann (AI)":    "#dc2626",
-    "Grassmann k=3":   "#1d4ed8",
-    "Grassmann k=25":  "#0ea5e9",
-    "PH–Sliced W":     "#059669",
-    "MACE Average":    "#d97706",
+    "Average SOAP":   "#64748b",
+    "Wasserstein W1": "#b45309",
+    "REMatch":        "#6d28d9",
+    "Riemann (AI)":   "#dc2626",
+    "Grassmann k=3":  "#1d4ed8",
+    "Grassmann k=25": "#0ea5e9",
+    "PH–Sliced W":    "#059669",
+    "MACE Average":   "#d97706",
 }
 
 _LINESTYLE = {
-    "Average SOAP":    "--",
-    "Wasserstein W2":  "--",
-    "REMatch (γ=0.1)": "--",
-    "Riemann (AI)":    "-",
-    "Grassmann k=3":   "-",
-    "Grassmann k=25":  "-",
-    "PH–Sliced W":     "-",
-    "MACE Average":    "-.",
+    "Average SOAP":   "--",
+    "Wasserstein W1": "--",
+    "REMatch":        "--",
+    "Riemann (AI)":   "-",
+    "Grassmann k=3":  "-",
+    "Grassmann k=25": "-",
+    "PH–Sliced W":    "-",
+    "MACE Average":   "-.",
 }
 
 _LINEWIDTH = {
@@ -773,6 +836,16 @@ _METRIC_LABELS = {
     "mrr":   "Mean Reciprocal Rank (MRR)",
     "npres": "Neighbourhood Preservation Ratio ($N_{\\mathrm{pres}}$)",
 }
+
+
+def _fw_style(fw: str, mapping: dict, default: Any) -> Any:
+    """Exact-key lookup, falling back to prefix match for dynamic labels like 'REMatch (γ=...)'."""
+    if fw in mapping:
+        return mapping[fw]
+    for k, v in mapping.items():
+        if fw.startswith(k):
+            return v
+    return default
 
 
 def plot_metric_vs_sigma(results: Dict[str, Any], save_path: Optional[str] = None) -> None:
@@ -803,9 +876,9 @@ def plot_metric_vs_sigma(results: Dict[str, Any], save_path: Optional[str] = Non
 
             for fw in frameworks:
                 vals = metrics_data[mode][fw][metric]
-                color = _PALETTE.get(fw, "#000000")
-                ls    = _LINESTYLE.get(fw, "-")
-                lw    = _LINEWIDTH.get(fw, 1.6)
+                color = _fw_style(fw, _PALETTE, "#000000")
+                ls    = _fw_style(fw, _LINESTYLE, "-")
+                lw    = _fw_style(fw, _LINEWIDTH, 1.6)
 
                 ax.plot(
                     sigma_levels, vals,
